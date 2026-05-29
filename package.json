@@ -1,0 +1,106 @@
+{
+  "name": "claude-luxure",
+  "displayName": "Claude Luxure",
+  "description": "Cursor-like UI for Claude Code CLI — drag-drop files, paste images, Agent/Plan modes, inline diff accept/reject",
+  "version": "0.1.0",
+  "publisher": "claude-luxure",
+  "license": "MIT",
+  "icon": "media/icon.png",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "AI",
+    "Chat"
+  ],
+  "activationEvents": [
+    "onView:claude-luxure.chatView",
+    "onCommand:claude-luxure.acceptChange",
+    "onCommand:claude-luxure.rejectChange",
+    "onCommand:claude-luxure.acceptAllChanges",
+    "onCommand:claude-luxure.rejectAllChanges"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "claude-luxure",
+          "title": "Claude Luxure",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "claude-luxure": [
+        {
+          "type": "webview",
+          "id": "claude-luxure.chatView",
+          "name": "Chat"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "claude-luxure.acceptChange",
+        "title": "Claude Luxure: Accept Change"
+      },
+      {
+        "command": "claude-luxure.rejectChange",
+        "title": "Claude Luxure: Reject Change"
+      },
+      {
+        "command": "claude-luxure.acceptAllChanges",
+        "title": "Claude Luxure: Accept All Changes"
+      },
+      {
+        "command": "claude-luxure.rejectAllChanges",
+        "title": "Claude Luxure: Reject All Changes"
+      },
+      {
+        "command": "claude-luxure.addToChat",
+        "title": "Add to Claude Luxure"
+      }
+    ],
+    "menus": {
+      "explorer/context": [
+        {
+          "command": "claude-luxure.addToChat",
+          "group": "navigation"
+        }
+      ],
+      "editor/title/context": [
+        {
+          "command": "claude-luxure.addToChat",
+          "group": "navigation"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "claude-luxure.addToChat",
+          "group": "navigation"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run build",
+    "build": "npm run build:webview && npm run build:ext",
+    "build:ext": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --sourcemap",
+    "build:webview": "cd webview-ui && npm run build",
+    "watch:ext": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --sourcemap --watch",
+    "watch:webview": "cd webview-ui && npm run dev",
+    "dev": "concurrently \"npm run watch:ext\" \"npm run watch:webview\"",
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "concurrently": "^9.1.0",
+    "esbuild": "^0.24.0",
+    "typescript": "^5.7.0"
+  },
+  "dependencies": {
+    "diff": "^7.0.0"
+  }
+}
