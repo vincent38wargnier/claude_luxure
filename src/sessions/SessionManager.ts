@@ -115,29 +115,53 @@ export class SessionManager {
       const stream = fs.createReadStream(filePath, { encoding: "utf-8" });
       const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
       const messages: Array<{ role: string; content: string; timestamp: string }> = [];
+      let lastAssistantText = "";
 
       rl.on("line", (line) => {
         try {
           const entry = JSON.parse(line);
+
           if (entry.type === "user" && entry.message?.content) {
-            const content = typeof entry.message.content === "string"
-              ? entry.message.content
-              : JSON.stringify(entry.message.content);
-            messages.push({ role: "user", content, timestamp: entry.timestamp || "" });
+            if (typeof entry.message.content === "string") {
+              messages.push({ role: "user", content: entry.message.content, timestamp: entry.timestamp || "" });
+            } else if (Array.isArray(entry.message.content)) {
+              const textParts = entry.message.content
+                .filter((b: any) => b.type === "text" && b.text)
+                .map((b: any) => b.text);
+              if (textParts.length > 0) {
+                messages.push({ role: "user", content: textParts.join("\n"), timestamp: entry.timestamp || "" });
+              }
+            }
           }
+
           if (entry.type === "assistant" && entry.message?.content) {
             let text = "";
+            const toolCalls: string[] = [];
+
             if (Array.isArray(entry.message.content)) {
               for (const block of entry.message.content) {
                 if (block.type === "text" && block.text) {
                   text += block.text;
                 }
+                if (block.type === "tool_use") {
+                  const name = block.name as string;
+                  const input = block.input as Record<string, unknown>;
+                  toolCalls.push(this.formatToolCall(name, input));
+                }
               }
             } else if (typeof entry.message.content === "string") {
               text = entry.message.content;
             }
-            if (text) {
-              messages.push({ role: "assistant", content: text, timestamp: entry.timestamp || "" });
+
+            if (text && text !== lastAssistantText) {
+              lastAssistantText = text;
+              let content = text;
+              if (toolCalls.length > 0) {
+                content = toolCalls.join("\n") + "\n\n" + text;
+              }
+              messages.push({ role: "assistant", content, timestamp: entry.timestamp || "" });
+            } else if (!text && toolCalls.length > 0) {
+              messages.push({ role: "assistant", content: toolCalls.join("\n"), timestamp: entry.timestamp || "" });
             }
           }
         } catch {
@@ -145,8 +169,38 @@ export class SessionManager {
         }
       });
 
-      rl.on("close", () => resolve(messages));
+      rl.on("close", () => {
+        const deduped = this.deduplicateMessages(messages);
+        resolve(deduped);
+      });
       rl.on("error", () => resolve([]));
     });
+  }
+
+  private formatToolCall(name: string, input: Record<string, unknown>): string {
+    const filePath = (input.file_path || input.path || "") as string;
+    const shortPath = filePath.split("/").slice(-2).join("/");
+    if (name === "Read" || name === "read_file") return `> Read \`${shortPath}\``;
+    if (name === "Write" || name === "write_to_file" || name === "WriteToFile") return `> Wrote \`${shortPath}\``;
+    if (name === "Edit" || name === "edit_file" || name === "EditFile") return `> Edited \`${shortPath}\``;
+    if (name === "Bash" || name === "bash") return `> Ran \`${String(input.command || "").slice(0, 80)}\``;
+    if (name === "Grep" || name === "grep") return `> Searched for \`${input.pattern || ""}\``;
+    if (name === "Glob" || name === "glob") return `> Found files matching \`${input.pattern || input.glob_pattern || ""}\``;
+    if (name === "LS" || name === "ls") return `> Listed \`${input.path || input.directory || "."}\``;
+    return `> Used \`${name}\``;
+  }
+
+  private deduplicateMessages(messages: Array<{ role: string; content: string; timestamp: string }>): Array<{ role: string; content: string; timestamp: string }> {
+    const result: typeof messages = [];
+    for (const msg of messages) {
+      const last = result[result.length - 1];
+      if (last && last.role === msg.role && last.content === msg.content) continue;
+      if (last && last.role === msg.role && msg.role === "assistant" && msg.content.includes(last.content)) {
+        result[result.length - 1] = msg;
+        continue;
+      }
+      result.push(msg);
+    }
+    return result;
   }
 }

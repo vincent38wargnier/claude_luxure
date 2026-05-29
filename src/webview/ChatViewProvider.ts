@@ -7,8 +7,10 @@ import { DiffManager } from "../diff/DiffManager";
 import { SnapshotManager } from "../diff/SnapshotManager";
 import { SessionManager } from "../sessions/SessionManager";
 import {
+  ActivityEvent,
   ChatMessage,
   ContextInfo,
+  EffortLevel,
   ExtensionMessage,
   ExtensionState,
   Mode,
@@ -25,6 +27,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private messages: ChatMessage[] = [];
   private mode: Mode = "agent";
   private model: string | undefined;
+  private effort: EffortLevel | undefined;
   private currentStreamText = "";
   private streamingMessageId: string | null = null;
   private snapshotManager = new SnapshotManager();
@@ -48,6 +51,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         status: "pending",
       });
     });
+    this.model = this.context.workspaceState.get<string>("claude-luxure.model");
+    this.effort = this.context.workspaceState.get<EffortLevel>("claude-luxure.effort");
     this.fetchAccountInfo();
     this.restoreLastSession();
   }
@@ -292,8 +297,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       case "changeModel":
         this.model = message.model;
         this.lastContext = undefined;
+        this.context.workspaceState.update("claude-luxure.model", this.model);
         if (this.bridge) {
           this.bridge.restart({ model: this.model });
+        }
+        this.sendState();
+        break;
+
+      case "changeEffort":
+        this.effort = message.effort;
+        this.context.workspaceState.update("claude-luxure.effort", this.effort);
+        if (this.bridge) {
+          this.bridge.restart({ effort: this.effort });
         }
         this.sendState();
         break;
@@ -415,6 +430,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       cwd: workspacePath,
       mode: this.mode,
       model: this.model,
+      effort: this.effort,
       sessionId: this.currentSessionId,
     });
 
@@ -488,6 +504,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       log("INFO", "Context update:", ctx.model, `${ctx.inputTokens}/${ctx.contextWindow}`);
       this.lastContext = ctx;
       this.postMessage({ type: "contextUpdate", context: ctx });
+    });
+
+    this.bridge.on("activity", (activity: ActivityEvent) => {
+      this.postMessage({ type: "activity", activity });
     });
 
     this.bridge.on("controlRequest", (event: ClaudeEvent) => {
@@ -646,6 +666,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       state: {
         mode: this.mode,
         model: this.model,
+        effort: this.effort,
         messages: this.messages,
         cliStatus: this.bridge?.status || "stopped",
         pendingDiffs: this.diffManager.getPendingDiffs(),

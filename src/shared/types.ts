@@ -1,4 +1,13 @@
 export type Mode = "agent" | "plan";
+export type EffortLevel = "low" | "medium" | "high" | "xhigh" | "max";
+
+export const EFFORT_LEVELS: { id: EffortLevel; label: string; short: string }[] = [
+  { id: "low", label: "Low", short: "Lo" },
+  { id: "medium", label: "Medium", short: "Med" },
+  { id: "high", label: "High", short: "Hi" },
+  { id: "xhigh", label: "Extra High", short: "XHi" },
+  { id: "max", label: "Max", short: "Max" },
+];
 
 export interface ChatMessage {
   id: string;
@@ -38,6 +47,12 @@ export interface AccountInfo {
   subscriptionType?: string;
 }
 
+export type ActivityEvent =
+  | { type: "tool_use"; toolName: string; toolInput: Record<string, unknown> }
+  | { type: "tool_result"; toolUseId: string; content: string }
+  | { type: "thinking"; text: string }
+  | { type: "thinking_delta"; text: string };
+
 export const AVAILABLE_MODELS = [
   { id: "claude-sonnet-4-20250514", alias: "sonnet", label: "Sonnet 4" },
   { id: "claude-opus-4-20250514", alias: "opus", label: "Opus 4" },
@@ -57,6 +72,7 @@ export type WebviewMessage =
   | { type: "cancelRequest" }
   | { type: "mode"; mode: Mode }
   | { type: "changeModel"; model: string }
+  | { type: "changeEffort"; effort: EffortLevel }
   | { type: "newConversation" }
   | { type: "switchSession"; sessionId: string }
   | { type: "closeTab"; sessionId: string }
@@ -79,6 +95,7 @@ export type ExtensionMessage =
   | { type: "diffUpdate"; filePath: string; diff: string; status: "pending" | "accepted" | "rejected" }
   | { type: "costUpdate"; cost: CostInfo }
   | { type: "contextUpdate"; context: ContextInfo }
+  | { type: "activity"; activity: ActivityEvent }
   | { type: "accountInfo"; account: AccountInfo }
   | { type: "sessionList"; sessions: SessionInfo[] }
   | { type: "openTabs"; tabIds: string[] }
@@ -87,6 +104,7 @@ export type ExtensionMessage =
 export interface ExtensionState {
   mode: Mode;
   model?: string;
+  effort?: EffortLevel;
   messages: ChatMessage[];
   cliStatus: "starting" | "ready" | "busy" | "error" | "stopped";
   pendingDiffs: { filePath: string; diff: string }[];

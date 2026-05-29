@@ -8,8 +8,10 @@ import type {
   CostInfo,
   ContextInfo,
   AccountInfo,
+  ActivityEvent,
   SessionInfo,
   Mode,
+  EffortLevel,
 } from "./types";
 
 const initialState: ExtensionState = {
@@ -27,6 +29,7 @@ export default function App() {
   const [contextInfo, setContextInfo] = useState<ContextInfo | null>(null);
   const [accountInfo, setAccountInfo] = useState<AccountInfo | null>(null);
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
+  const [activities, setActivities] = useState<ActivityEvent[]>([]);
   const [openTabIds, setOpenTabIds] = useState<string[]>([]);
   const [externalFiles, setExternalFiles] = useState<string[]>([]);
   const streamRef = useRef("");
@@ -60,6 +63,11 @@ export default function App() {
         setIsStreaming(false);
         setStreamingText("");
         streamRef.current = "";
+        setActivities([]);
+        break;
+
+      case "activity":
+        setActivities((prev) => [...prev.slice(-20), msg.activity]);
         break;
 
       case "error":
@@ -156,6 +164,10 @@ export default function App() {
     vscode.postMessage({ type: "changeModel", model });
   }, []);
 
+  const handleEffortChange = useCallback((effort: EffortLevel) => {
+    vscode.postMessage({ type: "changeEffort", effort });
+  }, []);
+
   const handleNewConversation = useCallback(() => {
     vscode.postMessage({ type: "newConversation" });
     setCost(null);
@@ -198,6 +210,7 @@ export default function App() {
         messages={state.messages}
         mode={state.mode}
         model={state.model}
+        effort={state.effort}
         sessionId={state.sessionId}
         sessions={sessions}
         openTabIds={openTabIds}
@@ -208,6 +221,7 @@ export default function App() {
         pendingDiffs={state.pendingDiffs}
         streamingText={streamingText}
         isStreaming={isStreaming}
+        activities={activities}
         cost={cost}
         contextInfo={contextInfo}
         accountEmail={state.accountEmail}
@@ -216,6 +230,7 @@ export default function App() {
         onCancel={handleCancel}
         onModeChange={handleModeChange}
         onModelChange={handleModelChange}
+        onEffortChange={handleEffortChange}
         onNewConversation={handleNewConversation}
         onSwitchSession={handleSwitchSession}
         onCloseTab={handleCloseTab}

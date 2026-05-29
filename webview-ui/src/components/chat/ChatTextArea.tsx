@@ -8,8 +8,8 @@ import {
   ChevronRight,
 } from "lucide-react";
 import vscode from "../../vscode";
-import type { Mode, ContextInfo } from "../../types";
-import { AVAILABLE_MODELS } from "../../types";
+import type { Mode, EffortLevel, ContextInfo } from "../../types";
+import { AVAILABLE_MODELS, EFFORT_LEVELS } from "../../types";
 import ModeSelector from "./ModeSelector";
 import ModelSelector from "./ModelSelector";
 import ContextMenu from "./ContextMenu";
@@ -18,6 +18,7 @@ import Thumbnails from "../common/Thumbnails";
 interface ChatTextAreaProps {
   mode: Mode;
   model?: string;
+  effort?: EffortLevel;
   cliStatus: string;
   isStreaming: boolean;
   fileCount?: number;
@@ -32,6 +33,7 @@ interface ChatTextAreaProps {
   onCancel: () => void;
   onModeChange: (mode: Mode) => void;
   onModelChange: (model: string) => void;
+  onEffortChange: (effort: EffortLevel) => void;
   onReview?: () => void;
 }
 
@@ -89,6 +91,71 @@ function renderHighlightedText(text: string) {
   return parts;
 }
 
+function EffortSelector({
+  effort,
+  onChange,
+}: {
+  effort?: EffortLevel;
+  onChange: (e: EffortLevel) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const handle = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener("mousedown", handle);
+    return () => document.removeEventListener("mousedown", handle);
+  }, [open]);
+
+  const current = EFFORT_LEVELS.find((e) => e.id === effort) || EFFORT_LEVELS[2];
+
+  return (
+    <div ref={ref} className="relative">
+      <button
+        onClick={() => setOpen(!open)}
+        className="flex items-center gap-1 px-1.5 py-0.5 rounded text-[11px] text-vscode-descriptionFg hover:text-vscode-fg hover:bg-[rgba(255,255,255,0.05)] transition-colors"
+      >
+        <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" className="opacity-60">
+          <path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z" />
+        </svg>
+        <span>{current.short}</span>
+        <svg width="8" height="5" viewBox="0 0 8 5" className={`ml-0.5 opacity-40 transition-transform ${open ? "rotate-180" : ""}`}>
+          <path d="M1 1l3 3 3-3" stroke="currentColor" strokeWidth="1.2" fill="none" strokeLinecap="round" />
+        </svg>
+      </button>
+
+      {open && (
+        <div className="absolute bottom-full left-0 mb-1 min-w-[120px] bg-[var(--vscode-dropdown-background,var(--vscode-input-background))] border border-[rgba(255,255,255,0.08)] rounded-md shadow-xl overflow-hidden z-50">
+          {EFFORT_LEVELS.map((e) => {
+            const isSelected = e.id === (effort || "high");
+            return (
+              <button
+                key={e.id}
+                onClick={() => { onChange(e.id); setOpen(false); }}
+                className={`flex items-center gap-2 w-full px-2.5 py-1.5 text-[11px] text-left transition-colors ${
+                  isSelected
+                    ? "bg-[rgba(255,255,255,0.06)] text-vscode-fg"
+                    : "text-vscode-descriptionFg hover:bg-[rgba(255,255,255,0.04)] hover:text-vscode-fg"
+                }`}
+              >
+                <span className="flex-1">{e.label}</span>
+                {isSelected && (
+                  <svg width="12" height="12" viewBox="0 0 12 12" className="text-vscode-fg">
+                    <path d="M2 6l3 3 5-5" stroke="currentColor" strokeWidth="1.5" fill="none" strokeLinecap="round" strokeLinejoin="round" />
+                  </svg>
+                )}
+              </button>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function ContextBadge({ context }: { context: ContextInfo }) {
   const totalTokens =
     context.inputTokens +
@@ -126,6 +193,7 @@ function ContextBadge({ context }: { context: ContextInfo }) {
 export default function ChatTextArea({
   mode,
   model,
+  effort,
   cliStatus,
   isStreaming,
   fileCount = 0,
@@ -140,6 +208,7 @@ export default function ChatTextArea({
   onCancel,
   onModeChange,
   onModelChange,
+  onEffortChange,
   onReview,
 }: ChatTextAreaProps) {
   const [inputValue, setInputValue] = useState("");
@@ -534,6 +603,8 @@ export default function ChatTextArea({
           <ModeSelector mode={mode} onChange={onModeChange} />
           <span className="text-[10px] text-vscode-descriptionFg opacity-30 select-none">|</span>
           <ModelSelector model={model} onChange={onModelChange} />
+          <span className="text-[10px] text-vscode-descriptionFg opacity-30 select-none">|</span>
+          <EffortSelector effort={effort} onChange={onEffortChange} />
           {contextInfo && (
             <>
               <span className="text-[10px] text-vscode-descriptionFg opacity-30 select-none">|</span>

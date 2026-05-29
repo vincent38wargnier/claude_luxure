@@ -108,6 +108,11 @@ export default function MessageRow({
   }
 
   if (isUser) {
+    const cleanContent = content
+      .replace(/<file path="[^"]*">\n[\s\S]*?\n<\/file>/g, "")
+      .replace(/\[{"tool_use_id".*$/s, "")
+      .trim();
+    if (!cleanContent && !message.images?.length) return null;
     return (
       <div className="mx-2">
         {message.images && message.images.length > 0 && (
@@ -115,7 +120,7 @@ export default function MessageRow({
         )}
         <div className="bg-[var(--vscode-input-background)] rounded-lg px-3 py-2.5">
           <div className="text-sm text-vscode-fg whitespace-pre-wrap">
-            {content}
+            {cleanContent}
           </div>
         </div>
       </div>

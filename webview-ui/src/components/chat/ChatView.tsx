@@ -1,14 +1,52 @@
 import { useRef, useEffect, useState, useCallback } from "react";
-import type { ChatMessage, CostInfo, ContextInfo, SessionInfo, Mode, PendingDiff } from "../../types";
+import type { ChatMessage, CostInfo, ContextInfo, ActivityEvent, SessionInfo, Mode, EffortLevel, PendingDiff } from "../../types";
 import MessageRow from "./MessageRow";
 import ChatTextArea from "./ChatTextArea";
 import TabBar from "./TabBar";
 import DiffPanel from "../common/DiffPanel";
 
+function formatToolActivity(activity: ActivityEvent): string {
+  if (activity.type === "tool_use") {
+    const name = activity.toolName;
+    const input = activity.toolInput;
+    if (name === "Read" || name === "read_file") return `Reading ${input.file_path || input.path || "file"}`;
+    if (name === "Write" || name === "write_to_file" || name === "WriteToFile") return `Writing ${input.file_path || input.path || "file"}`;
+    if (name === "Edit" || name === "edit_file" || name === "EditFile") return `Editing ${input.file_path || input.path || "file"}`;
+    if (name === "Bash" || name === "bash") return `Running: ${String(input.command || "").slice(0, 60)}`;
+    if (name === "Grep" || name === "grep") return `Searching for "${String(input.pattern || "").slice(0, 40)}"`;
+    if (name === "Glob" || name === "glob") return `Finding files: ${input.pattern || input.glob_pattern || ""}`;
+    if (name === "LS" || name === "ls") return `Listing ${input.path || input.directory || "."}`;
+    if (name === "View") return `Viewing ${input.file_path || input.path || "file"}`;
+    return `${name}`;
+  }
+  if (activity.type === "thinking" || activity.type === "thinking_delta") return "Thinking...";
+  if (activity.type === "tool_result") return "Processing result...";
+  return "";
+}
+
+function ActivityIndicator({ activities }: { activities: ActivityEvent[] }) {
+  const last = activities[activities.length - 1];
+  if (!last) return null;
+  const label = formatToolActivity(last);
+  if (!label) return null;
+
+  return (
+    <div className="px-4 py-2 flex items-center gap-2 text-[12px] text-vscode-descriptionFg animate-pulse">
+      <div className="flex gap-0.5">
+        <div className="w-1.5 h-1.5 rounded-full bg-[#f59e0b] animate-bounce" style={{ animationDelay: "0ms" }} />
+        <div className="w-1.5 h-1.5 rounded-full bg-[#f59e0b] animate-bounce" style={{ animationDelay: "150ms" }} />
+        <div className="w-1.5 h-1.5 rounded-full bg-[#f59e0b] animate-bounce" style={{ animationDelay: "300ms" }} />
+      </div>
+      <span className="truncate opacity-70">{label}</span>
+    </div>
+  );
+}
+
 interface ChatViewProps {
   messages: ChatMessage[];
   mode: Mode;
   model?: string;
+  effort?: EffortLevel;
   sessionId?: string;
   sessions: SessionInfo[];
   openTabIds: string[];
@@ -16,6 +54,7 @@ interface ChatViewProps {
   pendingDiffs: PendingDiff[];
   streamingText: string;
   isStreaming: boolean;
+  activities: ActivityEvent[];
   cost: CostInfo | null;
   contextInfo: ContextInfo | null;
   accountEmail?: string;
@@ -27,6 +66,7 @@ interface ChatViewProps {
   onCancel: () => void;
   onModeChange: (mode: Mode) => void;
   onModelChange: (model: string) => void;
+  onEffortChange: (effort: EffortLevel) => void;
   onNewConversation: () => void;
   onSwitchSession: (sessionId: string) => void;
   onCloseTab: (sessionId: string) => void;
@@ -41,6 +81,7 @@ export default function ChatView({
   messages,
   mode,
   model,
+  effort,
   sessionId,
   sessions,
   openTabIds,
@@ -48,6 +89,7 @@ export default function ChatView({
   pendingDiffs,
   streamingText,
   isStreaming,
+  activities,
   cost,
   contextInfo,
   accountEmail,
@@ -59,6 +101,7 @@ export default function ChatView({
   onCancel,
   onModeChange,
   onModelChange,
+  onEffortChange,
   onNewConversation,
   onSwitchSession,
   onCloseTab,
@@ -123,6 +166,10 @@ export default function ChatView({
           );
         })}
 
+        {isStreaming && activities.length > 0 && !streamingText && (
+          <ActivityIndicator activities={activities} />
+        )}
+
         <div ref={messagesEndRef} />
       </div>
 
@@ -150,6 +197,7 @@ export default function ChatView({
       <ChatTextArea
         mode={mode}
         model={model}
+        effort={effort}
         cliStatus={cliStatus}
         isStreaming={isStreaming}
         fileCount={0}
@@ -164,6 +212,7 @@ export default function ChatView({
         onCancel={onCancel}
         onModeChange={onModeChange}
         onModelChange={onModelChange}
+        onEffortChange={onEffortChange}
         onReview={handleReview}
       />
     </div>

@@ -1,7 +1,7 @@
 import { spawn, ChildProcess } from "child_process";
 import { EventEmitter } from "events";
 import * as readline from "readline";
-import type { Mode } from "../shared/types";
+import type { Mode, EffortLevel } from "../shared/types";
 
 export interface ClaudeEvent {
   type: string;
@@ -13,6 +13,7 @@ export interface ClaudeBridgeOptions {
   cwd: string;
   mode?: Mode;
   model?: string;
+  effort?: EffortLevel;
   sessionId?: string;
 }
 
@@ -68,6 +69,10 @@ export class ClaudeBridge extends EventEmitter {
 
     if (this.options.model) {
       args.push("--model", this.options.model);
+    }
+
+    if (this.options.effort) {
+      args.push("--effort", this.options.effort);
     }
 
     if (this.options.mode === "plan") {
@@ -183,14 +188,56 @@ export class ClaudeBridge extends EventEmitter {
           if (block.type === "text" && block.text) {
             this.emit("assistantText", block.text);
           }
+          if (block.type === "tool_use") {
+            this.emit("activity", {
+              type: "tool_use",
+              toolName: block.name as string,
+              toolInput: block.input as Record<string, unknown>,
+            });
+          }
+          if (block.type === "thinking") {
+            this.emit("activity", {
+              type: "thinking",
+              text: (block.thinking as string) || "",
+            });
+          }
+        }
+      }
+    }
+
+    if (event.type === "tool_result" || (event.type === "user" && (event as any).message?.content)) {
+      const content = (event as any).message?.content;
+      if (Array.isArray(content)) {
+        for (const block of content) {
+          if (block.type === "tool_result") {
+            this.emit("activity", {
+              type: "tool_result",
+              toolUseId: block.tool_use_id,
+              content: typeof block.content === "string" ? block.content?.slice(0, 200) : "",
+            });
+          }
         }
       }
     }
 
     if (event.type === "stream_event") {
-      const delta = (event as any).event?.delta;
+      const ev = (event as any).event;
+      const delta = ev?.delta;
       if (delta?.type === "text_delta" && delta.text) {
         this.emit("textDelta", delta.text);
+      }
+      if (delta?.type === "thinking_delta" && delta.thinking) {
+        this.emit("activity", {
+          type: "thinking_delta",
+          text: delta.thinking as string,
+        });
+      }
+      if (ev?.type === "content_block_start" && ev?.content_block?.type === "tool_use") {
+        this.emit("activity", {
+          type: "tool_use",
+          toolName: ev.content_block.name as string,
+          toolInput: ev.content_block.input || {},
+        });
       }
       this.emit("streamEvent", event);
     }
@@ -273,6 +320,7 @@ export class ClaudeBridge extends EventEmitter {
       if (options.cwd) { this.cwd = options.cwd; }
       if (options.mode !== undefined) { this.options.mode = options.mode; }
       if (options.model !== undefined) { this.options.model = options.model; }
+      if (options.effort !== undefined) { this.options.effort = options.effort; }
       if (options.sessionId !== undefined) { this._sessionId = options.sessionId; }
     }
     this.start();
