@@ -11,6 +11,7 @@ interface ChatViewProps {
   model?: string;
   sessionId?: string;
   sessions: SessionInfo[];
+  openTabIds: string[];
   cliStatus: string;
   pendingDiffs: PendingDiff[];
   streamingText: string;
@@ -28,6 +29,7 @@ interface ChatViewProps {
   onModelChange: (model: string) => void;
   onNewConversation: () => void;
   onSwitchSession: (sessionId: string) => void;
+  onCloseTab: (sessionId: string) => void;
   onListSessions: () => void;
   onAcceptChange: (filePath: string) => void;
   onRejectChange: (filePath: string) => void;
@@ -41,6 +43,7 @@ export default function ChatView({
   model,
   sessionId,
   sessions,
+  openTabIds,
   cliStatus,
   pendingDiffs,
   streamingText,
@@ -58,6 +61,7 @@ export default function ChatView({
   onModelChange,
   onNewConversation,
   onSwitchSession,
+  onCloseTab,
   onListSessions,
   onAcceptChange,
   onRejectChange,
@@ -80,8 +84,10 @@ export default function ChatView({
       {/* Tab bar */}
       <TabBar
         sessions={sessions}
+        openTabIds={openTabIds}
         currentSessionId={sessionId}
         onSelect={onSwitchSession}
+        onClose={onCloseTab}
         onNewChat={onNewConversation}
         onListSessions={onListSessions}
       />

@@ -59,6 +59,7 @@ export type WebviewMessage =
   | { type: "changeModel"; model: string }
   | { type: "newConversation" }
   | { type: "switchSession"; sessionId: string }
+  | { type: "closeTab"; sessionId: string }
   | { type: "listSessions" }
   | { type: "acceptChange"; filePath: string }
   | { type: "rejectChange"; filePath: string }
@@ -80,6 +81,7 @@ export type ExtensionMessage =
   | { type: "contextUpdate"; context: ContextInfo }
   | { type: "accountInfo"; account: AccountInfo }
   | { type: "sessionList"; sessions: SessionInfo[] }
+  | { type: "openTabs"; tabIds: string[] }
   | { type: "cliStatus"; status: "starting" | "ready" | "busy" | "error" | "stopped" };
 
 export interface ExtensionState {

@@ -27,6 +27,7 @@ export default function App() {
   const [contextInfo, setContextInfo] = useState<ContextInfo | null>(null);
   const [accountInfo, setAccountInfo] = useState<AccountInfo | null>(null);
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
+  const [openTabIds, setOpenTabIds] = useState<string[]>([]);
   const [externalFiles, setExternalFiles] = useState<string[]>([]);
   const streamRef = useRef("");
 
@@ -90,6 +91,10 @@ export default function App() {
 
       case "sessionList":
         setSessions(msg.sessions);
+        break;
+
+      case "openTabs":
+        setOpenTabIds(msg.tabIds);
         break;
 
       case "cliStatus":
@@ -163,6 +168,10 @@ export default function App() {
     setContextInfo(null);
   }, []);
 
+  const handleCloseTab = useCallback((sessionId: string) => {
+    vscode.postMessage({ type: "closeTab", sessionId });
+  }, []);
+
   const handleListSessions = useCallback(() => {
     vscode.postMessage({ type: "listSessions" });
   }, []);
@@ -191,6 +200,7 @@ export default function App() {
         model={state.model}
         sessionId={state.sessionId}
         sessions={sessions}
+        openTabIds={openTabIds}
         cliStatus={state.cliStatus}
         workspacePath={state.workspacePath}
         externalFiles={externalFiles}
@@ -208,6 +218,7 @@ export default function App() {
         onModelChange={handleModelChange}
         onNewConversation={handleNewConversation}
         onSwitchSession={handleSwitchSession}
+        onCloseTab={handleCloseTab}
         onListSessions={handleListSessions}
         onAcceptChange={handleAcceptChange}
         onRejectChange={handleRejectChange}

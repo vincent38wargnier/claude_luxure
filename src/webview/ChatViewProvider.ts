@@ -33,6 +33,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private accountOrg: string | undefined;
   private lastContext: ContextInfo | undefined;
   private currentSessionId: string | undefined;
+  private openTabIds: string[] = [];
   private sessionManager: SessionManager | undefined;
 
   constructor(
@@ -78,9 +79,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   private restoreLastSession(): void {
+    this.openTabIds = this.context.workspaceState.get<string[]>("claude-luxure.openTabs") || [];
     const lastSessionId = this.context.workspaceState.get<string>("claude-luxure.lastSessionId");
     if (lastSessionId) {
       this.currentSessionId = lastSessionId;
+      if (!this.openTabIds.includes(lastSessionId)) {
+        this.openTabIds.unshift(lastSessionId);
+      }
       const cached = this.context.workspaceState.get<ChatMessage[]>(`claude-luxure.messages.${lastSessionId}`);
       if (cached && cached.length > 0) {
         this.messages = cached.map((m) => ({ ...m, isStreaming: false }));
@@ -97,6 +102,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       );
       this.context.workspaceState.update("claude-luxure.lastSessionId", this.currentSessionId);
     }
+    this.context.workspaceState.update("claude-luxure.openTabs", this.openTabIds);
   }
 
   private getSessionManager(): SessionManager | undefined {
@@ -125,6 +131,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.streamingMessageId = null;
     this.lastContext = undefined;
 
+    if (!this.openTabIds.includes(sessionId)) {
+      this.openTabIds.unshift(sessionId);
+    }
+
     const cached = this.context.workspaceState.get<ChatMessage[]>(`claude-luxure.messages.${sessionId}`);
     if (cached && cached.length > 0) {
       this.messages = cached.map((m) => ({ ...m, isStreaming: false }));
@@ -144,7 +154,28 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
 
     this.context.workspaceState.update("claude-luxure.lastSessionId", sessionId);
+    this.persistSession();
     this.sendState();
+    this.sendOpenTabs();
+  }
+
+  private handleCloseTab(sessionId: string): void {
+    this.openTabIds = this.openTabIds.filter((id) => id !== sessionId);
+    if (this.currentSessionId === sessionId) {
+      if (this.openTabIds.length > 0) {
+        this.handleSwitchSession(this.openTabIds[0]);
+        return;
+      } else {
+        this.handleNewConversation();
+        return;
+      }
+    }
+    this.persistSession();
+    this.sendOpenTabs();
+  }
+
+  private sendOpenTabs(): void {
+    this.postMessage({ type: "openTabs", tabIds: this.openTabIds });
   }
 
   private handleNewConversation(): void {
@@ -159,6 +190,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.lastContext = undefined;
 
     this.sendState();
+    this.sendOpenTabs();
   }
 
   resolveWebviewView(
@@ -229,6 +261,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       case "ready":
         log("INFO", "Webview ready, sending state");
         this.sendState();
+        this.sendOpenTabs();
         this.handleListSessions();
         break;
 
@@ -291,6 +324,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
       case "switchSession":
         await this.handleSwitchSession(message.sessionId);
+        break;
+
+      case "closeTab":
+        this.handleCloseTab(message.sessionId);
         break;
 
       case "listSessions":
@@ -385,6 +422,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       log("INFO", "CLI status:", status);
       if (status === "ready" && this.bridge?.sessionId && !this.currentSessionId) {
         this.currentSessionId = this.bridge.sessionId;
+        if (!this.openTabIds.includes(this.currentSessionId)) {
+          this.openTabIds.unshift(this.currentSessionId);
+          this.sendOpenTabs();
+        }
         this.context.workspaceState.update("claude-luxure.lastSessionId", this.currentSessionId);
         log("INFO", "Session ID captured:", this.currentSessionId);
       }
