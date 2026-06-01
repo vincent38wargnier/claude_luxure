@@ -10,6 +10,7 @@ import {
   ActivityEvent,
   ChatMessage,
   ContextInfo,
+  CostInfo,
   EffortLevel,
   ExtensionMessage,
   ExtensionState,
@@ -19,25 +20,53 @@ import {
 import { extractMentions, resolveFromMention } from "../utils/path-mentions";
 import { log } from "../utils/logger";
 
+interface SessionRuntime {
+  sessionId?: string;
+  draftId?: string;
+  messages: ChatMessage[];
+  bridge?: ClaudeBridge;
+  streamingMessageId: string | null;
+  currentStreamText: string;
+  lastContext?: ContextInfo;
+  cost?: CostInfo;
+  cliStatus: ExtensionState["cliStatus"];
+  sessionName?: string;
+}
+
+function createEmptyRuntime(): SessionRuntime {
+  return {
+    messages: [],
+    streamingMessageId: null,
+    currentStreamText: "",
+    cliStatus: "stopped",
+  };
+}
+
+function isDraftKey(key: string): boolean {
+  return key.startsWith("draft-");
+}
+
+function sessionNameFromText(text: string): string {
+  const line = text.split("\n")[0].trim();
+  return line.slice(0, 80) || "New chat";
+}
+
 export class ChatViewProvider implements vscode.WebviewViewProvider {
   public static readonly viewId = "claude-luxure.chatView";
 
   private webview: vscode.Webview | undefined;
-  private bridge: ClaudeBridge | undefined;
-  private messages: ChatMessage[] = [];
+  private runtimes = new Map<string, SessionRuntime>();
+  private activeKey = "";
   private mode: Mode = "agent";
   private model: string | undefined;
   private effort: EffortLevel | undefined;
-  private currentStreamText = "";
-  private streamingMessageId: string | null = null;
   private snapshotManager = new SnapshotManager();
   private diffManager = new DiffManager(this.snapshotManager);
   private accountEmail: string | undefined;
   private accountOrg: string | undefined;
-  private lastContext: ContextInfo | undefined;
-  private currentSessionId: string | undefined;
   private openTabIds: string[] = [];
   private sessionManager: SessionManager | undefined;
+  private diffWatchStarted = false;
 
   constructor(
     private readonly context: vscode.ExtensionContext,
@@ -55,6 +84,75 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.effort = this.context.workspaceState.get<EffortLevel>("claude-luxure.effort");
     this.fetchAccountInfo();
     this.restoreLastSession();
+  }
+
+  private getActiveRuntime(): SessionRuntime {
+    if (!this.activeKey) {
+      const draftKey = this.createDraftRuntime();
+      this.activeKey = draftKey;
+      if (!this.openTabIds.includes(draftKey)) {
+        this.openTabIds.unshift(draftKey);
+      }
+    }
+    let runtime = this.runtimes.get(this.activeKey);
+    if (!runtime) {
+      runtime = createEmptyRuntime();
+      if (isDraftKey(this.activeKey)) {
+        runtime.draftId = this.activeKey;
+      } else {
+        runtime.sessionId = this.activeKey;
+      }
+      this.runtimes.set(this.activeKey, runtime);
+    }
+    return runtime;
+  }
+
+  private createDraftRuntime(): string {
+    const draftKey = `draft-${generateId()}`;
+    this.runtimes.set(draftKey, createEmptyRuntime());
+    this.runtimes.get(draftKey)!.draftId = draftKey;
+    return draftKey;
+  }
+
+  private isActiveKey(key: string): boolean {
+    return key === this.activeKey;
+  }
+
+  private getRunningSessionIds(): string[] {
+    const ids: string[] = [];
+    for (const [key, runtime] of this.runtimes) {
+      if (runtime.streamingMessageId) {
+        ids.push(runtime.sessionId || key);
+      }
+    }
+    return ids;
+  }
+
+  private findBridgeForSessionId(sessionId: string): ClaudeBridge | undefined {
+    for (const runtime of this.runtimes.values()) {
+      if (runtime.sessionId === sessionId && runtime.bridge && runtime.bridge.status !== "stopped") {
+        return runtime.bridge;
+      }
+    }
+    return undefined;
+  }
+
+  private migrateDraftToSession(draftKey: string, sessionId: string, runtime: SessionRuntime): void {
+    this.runtimes.delete(draftKey);
+    runtime.sessionId = sessionId;
+    delete runtime.draftId;
+    this.runtimes.set(sessionId, runtime);
+
+    const tabIdx = this.openTabIds.indexOf(draftKey);
+    if (tabIdx >= 0) {
+      this.openTabIds[tabIdx] = sessionId;
+    } else if (!this.openTabIds.includes(sessionId)) {
+      this.openTabIds.unshift(sessionId);
+    }
+
+    if (this.activeKey === draftKey) {
+      this.activeKey = sessionId;
+    }
   }
 
   private fetchAccountInfo(): void {
@@ -77,7 +175,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           },
         });
         this.sendState();
-      } catch (parseErr) {
+      } catch {
         log("WARN", "Failed to parse account info:", stdout.slice(0, 200));
       }
     });
@@ -86,28 +184,58 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private restoreLastSession(): void {
     this.openTabIds = this.context.workspaceState.get<string[]>("claude-luxure.openTabs") || [];
     const lastSessionId = this.context.workspaceState.get<string>("claude-luxure.lastSessionId");
+
     if (lastSessionId) {
-      this.currentSessionId = lastSessionId;
       if (!this.openTabIds.includes(lastSessionId)) {
         this.openTabIds.unshift(lastSessionId);
       }
+
+      const runtime = createEmptyRuntime();
+      runtime.sessionId = lastSessionId;
       const cached = this.context.workspaceState.get<ChatMessage[]>(`claude-luxure.messages.${lastSessionId}`);
       if (cached && cached.length > 0) {
-        this.messages = cached.map((m) => ({ ...m, isStreaming: false }));
+        runtime.messages = cached.map((m) => ({ ...m, isStreaming: false }));
         log("INFO", `Restored ${cached.length} messages for session ${lastSessionId}`);
+      }
+      this.runtimes.set(lastSessionId, runtime);
+      this.activeKey = lastSessionId;
+    } else if (this.openTabIds.length > 0) {
+      this.activeKey = this.openTabIds[0];
+      if (!this.runtimes.has(this.activeKey)) {
+        const runtime = createEmptyRuntime();
+        if (isDraftKey(this.activeKey)) {
+          runtime.draftId = this.activeKey;
+        } else {
+          runtime.sessionId = this.activeKey;
+          const cached = this.context.workspaceState.get<ChatMessage[]>(
+            `claude-luxure.messages.${this.activeKey}`
+          );
+          if (cached) {
+            runtime.messages = cached.map((m) => ({ ...m, isStreaming: false }));
+          }
+        }
+        this.runtimes.set(this.activeKey, runtime);
       }
     }
   }
 
-  private persistSession(): void {
-    if (this.currentSessionId && this.messages.length > 0) {
+  private persistRuntime(key: string, runtime: SessionRuntime): void {
+    const persistId = runtime.sessionId;
+    if (persistId && runtime.messages.length > 0) {
       this.context.workspaceState.update(
-        `claude-luxure.messages.${this.currentSessionId}`,
-        this.messages.filter((m) => !m.isStreaming)
+        `claude-luxure.messages.${persistId}`,
+        runtime.messages.filter((m) => !m.isStreaming)
       );
-      this.context.workspaceState.update("claude-luxure.lastSessionId", this.currentSessionId);
+      this.context.workspaceState.update("claude-luxure.lastSessionId", persistId);
     }
     this.context.workspaceState.update("claude-luxure.openTabs", this.openTabIds);
+  }
+
+  private persistActiveSession(): void {
+    const runtime = this.runtimes.get(this.activeKey);
+    if (runtime) {
+      this.persistRuntime(this.activeKey, runtime);
+    }
   }
 
   private getSessionManager(): SessionManager | undefined {
@@ -126,57 +254,85 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.postMessage({ type: "sessionList", sessions });
   }
 
-  private async handleSwitchSession(sessionId: string): Promise<void> {
-    this.persistSession();
-    this.bridge?.stop();
-    this.bridge = undefined;
+  private async loadRuntimeMessages(key: string, runtime: SessionRuntime): Promise<void> {
+    if (isDraftKey(key)) {
+      runtime.messages = [];
+      return;
+    }
 
-    this.currentSessionId = sessionId;
-    this.currentStreamText = "";
-    this.streamingMessageId = null;
-    this.lastContext = undefined;
+    runtime.sessionId = key;
+    const cached = this.context.workspaceState.get<ChatMessage[]>(`claude-luxure.messages.${key}`);
+    if (cached && cached.length > 0) {
+      runtime.messages = cached.map((m) => ({ ...m, isStreaming: false }));
+      return;
+    }
+
+    const mgr = this.getSessionManager();
+    if (mgr) {
+      const rawMsgs = await mgr.getSessionMessages(key);
+      runtime.messages = rawMsgs.map((m, i) => ({
+        id: `restored-${i}-${Date.now()}`,
+        role: m.role as "user" | "assistant",
+        content: m.content,
+        timestamp: new Date(m.timestamp).getTime() || Date.now(),
+      }));
+    } else {
+      runtime.messages = [];
+    }
+  }
+
+  private async handleSwitchSession(sessionId: string): Promise<void> {
+    this.persistActiveSession();
 
     if (!this.openTabIds.includes(sessionId)) {
       this.openTabIds.unshift(sessionId);
     }
 
-    const cached = this.context.workspaceState.get<ChatMessage[]>(`claude-luxure.messages.${sessionId}`);
-    if (cached && cached.length > 0) {
-      this.messages = cached.map((m) => ({ ...m, isStreaming: false }));
-    } else {
-      const mgr = this.getSessionManager();
-      if (mgr) {
-        const rawMsgs = await mgr.getSessionMessages(sessionId);
-        this.messages = rawMsgs.map((m, i) => ({
-          id: `restored-${i}-${Date.now()}`,
-          role: m.role as "user" | "assistant",
-          content: m.content,
-          timestamp: new Date(m.timestamp).getTime() || Date.now(),
-        }));
-      } else {
-        this.messages = [];
-      }
+    this.activeKey = sessionId;
+
+    if (!this.runtimes.has(sessionId)) {
+      const runtime = createEmptyRuntime();
+      runtime.sessionId = sessionId;
+      await this.loadRuntimeMessages(sessionId, runtime);
+      this.runtimes.set(sessionId, runtime);
     }
 
     this.context.workspaceState.update("claude-luxure.lastSessionId", sessionId);
-    this.persistSession();
+    this.persistActiveSession();
     this.sendState();
     this.sendOpenTabs();
   }
 
-  private handleCloseTab(sessionId: string): void {
-    this.openTabIds = this.openTabIds.filter((id) => id !== sessionId);
-    if (this.currentSessionId === sessionId) {
+  private stopRuntimeBridge(key: string, runtime: SessionRuntime): void {
+    runtime.bridge?.stop();
+    runtime.bridge = undefined;
+    runtime.cliStatus = "stopped";
+    if (runtime.streamingMessageId) {
+      this.finalizeStreamingMessage(key, runtime, false);
+    }
+  }
+
+  private handleCloseTab(tabId: string): void {
+    const runtime = this.runtimes.get(tabId);
+    if (runtime) {
+      this.stopRuntimeBridge(tabId, runtime);
+      this.runtimes.delete(tabId);
+    }
+
+    this.openTabIds = this.openTabIds.filter((id) => id !== tabId);
+
+    if (this.activeKey === tabId) {
       if (this.openTabIds.length > 0) {
-        this.handleSwitchSession(this.openTabIds[0]);
-        return;
-      } else {
-        this.handleNewConversation();
+        void this.handleSwitchSession(this.openTabIds[0]);
         return;
       }
+      this.handleNewConversation();
+      return;
     }
-    this.persistSession();
+
+    this.persistActiveSession();
     this.sendOpenTabs();
+    this.sendState();
   }
 
   private sendOpenTabs(): void {
@@ -184,15 +340,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   private handleNewConversation(): void {
-    this.persistSession();
-    this.bridge?.stop();
-    this.bridge = undefined;
+    this.persistActiveSession();
 
-    this.currentSessionId = undefined;
-    this.messages = [];
-    this.currentStreamText = "";
-    this.streamingMessageId = null;
-    this.lastContext = undefined;
+    const draftKey = this.createDraftRuntime();
+    this.openTabIds.unshift(draftKey);
+    this.activeKey = draftKey;
 
     this.sendState();
     this.sendOpenTabs();
@@ -279,27 +431,36 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         );
         break;
 
-      case "cancelRequest":
-        this.bridge?.stop();
-        if (this.streamingMessageId) {
-          this.finalizeStreamingMessage();
+      case "cancelRequest": {
+        const runtime = this.getActiveRuntime();
+        this.stopRuntimeBridge(this.activeKey, runtime);
+        if (this.isActiveKey(this.activeKey)) {
+          this.postMessage({ type: "streamEnd" });
+          this.sendState();
         }
         break;
+      }
 
       case "mode":
         this.mode = message.mode;
-        if (this.bridge) {
-          this.bridge.restart({ mode: this.mode });
+        {
+          const runtime = this.getActiveRuntime();
+          if (runtime.bridge) {
+            runtime.bridge.restart({ mode: this.mode });
+          }
         }
         this.sendState();
         break;
 
       case "changeModel":
         this.model = message.model;
-        this.lastContext = undefined;
         this.context.workspaceState.update("claude-luxure.model", this.model);
-        if (this.bridge) {
-          this.bridge.restart({ model: this.model });
+        {
+          const runtime = this.getActiveRuntime();
+          runtime.lastContext = undefined;
+          if (runtime.bridge) {
+            runtime.bridge.restart({ model: this.model });
+          }
         }
         this.sendState();
         break;
@@ -307,8 +468,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       case "changeEffort":
         this.effort = message.effort;
         this.context.workspaceState.update("claude-luxure.effort", this.effort);
-        if (this.bridge) {
-          this.bridge.restart({ effort: this.effort });
+        {
+          const runtime = this.getActiveRuntime();
+          if (runtime.bridge) {
+            runtime.bridge.restart({ effort: this.effort });
+          }
         }
         this.sendState();
         break;
@@ -363,10 +527,24 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private async handleSendMessage(
     text: string,
     images?: string[],
-    mentions?: string[]
+    _mentions?: string[]
   ): Promise<void> {
-    if (!this.bridge || this.bridge.status === "stopped") {
-      await this.startBridge();
+    const runtimeKey = this.activeKey || this.createDraftRuntime();
+    if (!this.activeKey) {
+      this.activeKey = runtimeKey;
+      if (!this.openTabIds.includes(runtimeKey)) {
+        this.openTabIds.unshift(runtimeKey);
+        this.sendOpenTabs();
+      }
+    }
+    const runtime = this.getActiveRuntime();
+
+    if (!runtime.sessionName && !runtime.sessionId) {
+      runtime.sessionName = sessionNameFromText(text);
+    }
+
+    if (!runtime.bridge || runtime.bridge.status === "stopped") {
+      await this.startBridge(runtimeKey, runtime);
     }
 
     const workspacePath = this.getWorkspacePath();
@@ -378,7 +556,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         const absPath = resolveFromMention(mention, workspacePath);
         try {
           const content = fs.readFileSync(absPath, "utf-8");
-          const label = mention;
           resolvedText = resolvedText.replace(
             mention,
             `\n<file path="${absPath}">\n${content}\n</file>\n`
@@ -396,145 +573,205 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       images,
       timestamp: Date.now(),
     };
-    this.messages.push(userMessage);
-    this.postMessage({ type: "message", message: userMessage });
+    runtime.messages.push(userMessage);
+    if (this.isActiveKey(runtimeKey)) {
+      this.postMessage({ type: "message", message: userMessage });
+    }
 
-    this.bridge?.sendMessage(resolvedText, images);
+    runtime.bridge?.sendMessage(resolvedText, images);
 
-    this.streamingMessageId = generateId();
-    this.currentStreamText = "";
+    runtime.streamingMessageId = generateId();
+    runtime.currentStreamText = "";
     const assistantMessage: ChatMessage = {
-      id: this.streamingMessageId,
+      id: runtime.streamingMessageId,
       role: "assistant",
       content: "",
       timestamp: Date.now(),
       isStreaming: true,
     };
-    this.messages.push(assistantMessage);
-    this.postMessage({ type: "message", message: assistantMessage });
+    runtime.messages.push(assistantMessage);
+    if (this.isActiveKey(runtimeKey)) {
+      this.postMessage({ type: "message", message: assistantMessage });
+    }
+    this.sendState();
   }
 
-  private async startBridge(): Promise<void> {
-    log("INFO", "startBridge called");
+  private async startBridge(runtimeKey: string, runtime: SessionRuntime): Promise<void> {
+    log("INFO", "startBridge called for", runtimeKey);
     const workspacePath = this.getWorkspacePath();
-    log("INFO", "workspacePath:", workspacePath);
     if (!workspacePath) {
-      this.postMessage({
-        type: "error",
-        error: "No workspace folder open",
-      });
+      this.postMessage({ type: "error", error: "No workspace folder open" });
       return;
     }
 
-    this.bridge = new ClaudeBridge({
+    if (runtime.sessionId) {
+      const existing = this.findBridgeForSessionId(runtime.sessionId);
+      if (existing && existing.status !== "stopped") {
+        runtime.bridge = existing;
+        runtime.cliStatus = existing.status;
+        return;
+      }
+    }
+
+    const bridge = new ClaudeBridge({
       cwd: workspacePath,
       mode: this.mode,
       model: this.model,
       effort: this.effort,
-      sessionId: this.currentSessionId,
+      sessionId: runtime.sessionId,
+      sessionName: runtime.sessionName,
     });
 
-    this.bridge.on("status", (status: string) => {
-      log("INFO", "CLI status:", status);
-      if (status === "ready" && this.bridge?.sessionId && !this.currentSessionId) {
-        this.currentSessionId = this.bridge.sessionId;
-        if (!this.openTabIds.includes(this.currentSessionId)) {
-          this.openTabIds.unshift(this.currentSessionId);
-          this.sendOpenTabs();
+    runtime.bridge = bridge;
+    this.attachBridgeHandlers(runtimeKey, runtime, bridge);
+
+    if (!this.diffWatchStarted) {
+      this.diffManager.startWatching(workspacePath);
+      this.diffWatchStarted = true;
+    }
+
+    await bridge.start();
+  }
+
+  private attachBridgeHandlers(
+    runtimeKey: string,
+    runtime: SessionRuntime,
+    bridge: ClaudeBridge
+  ): void {
+    const isActive = () => this.isActiveKey(runtimeKey);
+
+    bridge.on("status", (status: string) => {
+      log("INFO", "CLI status:", status, "session:", runtimeKey);
+      runtime.cliStatus = status as ExtensionState["cliStatus"];
+
+      if (status === "ready" && bridge.sessionId) {
+        const newSessionId = bridge.sessionId;
+        if (isDraftKey(runtimeKey)) {
+          this.migrateDraftToSession(runtimeKey, newSessionId, runtime);
+          runtimeKey = newSessionId;
+        } else if (!runtime.sessionId) {
+          runtime.sessionId = newSessionId;
+          if (!this.openTabIds.includes(newSessionId)) {
+            this.openTabIds.unshift(newSessionId);
+            this.sendOpenTabs();
+          }
         }
-        this.context.workspaceState.update("claude-luxure.lastSessionId", this.currentSessionId);
-        log("INFO", "Session ID captured:", this.currentSessionId);
+        this.context.workspaceState.update("claude-luxure.lastSessionId", newSessionId);
+        log("INFO", "Session ID captured:", newSessionId);
       }
-      this.postMessage({
-        type: "cliStatus",
-        status: status as ExtensionState["cliStatus"],
-      });
+
+      if (
+        (status === "stopped" || status === "error") &&
+        runtime.streamingMessageId
+      ) {
+        this.finalizeStreamingMessage(runtimeKey, runtime, isActive());
+      }
+
+      if (isActive()) {
+        this.postMessage({
+          type: "cliStatus",
+          status: runtime.cliStatus,
+        });
+        this.sendState();
+      }
     });
 
-    this.bridge.on("textDelta", (text: string) => {
-      this.currentStreamText += text;
-      this.postMessage({ type: "streamToken", text });
+    bridge.on("exit", () => {
+      if (runtime.streamingMessageId) {
+        this.finalizeStreamingMessage(runtimeKey, runtime, isActive());
+      }
+    });
 
-      if (this.streamingMessageId) {
-        const msg = this.messages.find(
-          (m) => m.id === this.streamingMessageId
-        );
+    bridge.on("textDelta", (text: string) => {
+      runtime.currentStreamText += text;
+      if (runtime.streamingMessageId) {
+        const msg = runtime.messages.find((m) => m.id === runtime.streamingMessageId);
         if (msg) {
-          msg.content = this.currentStreamText;
+          msg.content = runtime.currentStreamText;
         }
+      }
+      if (isActive()) {
+        this.postMessage({ type: "streamToken", text });
       }
     });
 
-    this.bridge.on("assistant", (event: ClaudeEvent) => {
+    bridge.on("assistant", (event: ClaudeEvent) => {
       this.handleAssistantEvent(event);
     });
 
-    this.bridge.on("assistantText", (text: string) => {
+    bridge.on("assistantText", (text: string) => {
       log("INFO", "assistantText received, length:", text.length);
-      if (this.streamingMessageId && !this.currentStreamText) {
-        this.currentStreamText = text;
-        this.postMessage({ type: "streamToken", text });
-        if (this.streamingMessageId) {
-          const msg = this.messages.find(
-            (m) => m.id === this.streamingMessageId
-          );
+      if (runtime.streamingMessageId && !runtime.currentStreamText) {
+        runtime.currentStreamText = text;
+        if (runtime.streamingMessageId) {
+          const msg = runtime.messages.find((m) => m.id === runtime.streamingMessageId);
           if (msg) {
             msg.content = text;
           }
         }
+        if (isActive()) {
+          this.postMessage({ type: "streamToken", text });
+        }
       }
     });
 
-    this.bridge.on("result", (event: ClaudeEvent) => {
+    bridge.on("result", (event: ClaudeEvent) => {
       log("INFO", "result received, finalizing message");
-      this.finalizeStreamingMessage();
+      this.finalizeStreamingMessage(runtimeKey, runtime, isActive());
       if (event.total_cost_usd !== undefined) {
-        this.postMessage({
-          type: "costUpdate",
-          cost: {
-            inputTokens: (event.total_input_tokens as number) || 0,
-            outputTokens: (event.total_output_tokens as number) || 0,
-            totalCostUsd: (event.total_cost_usd as number) || 0,
-          },
-        });
+        runtime.cost = {
+          inputTokens: (event.total_input_tokens as number) || 0,
+          outputTokens: (event.total_output_tokens as number) || 0,
+          totalCostUsd: (event.total_cost_usd as number) || 0,
+        };
+        if (isActive()) {
+          this.postMessage({ type: "costUpdate", cost: runtime.cost });
+        }
       }
     });
 
-    this.bridge.on("contextUpdate", (ctx: ContextInfo) => {
+    bridge.on("contextUpdate", (ctx: ContextInfo) => {
       log("INFO", "Context update:", ctx.model, `${ctx.inputTokens}/${ctx.contextWindow}`);
-      this.lastContext = ctx;
-      this.postMessage({ type: "contextUpdate", context: ctx });
+      runtime.lastContext = ctx;
+      if (isActive()) {
+        this.postMessage({ type: "contextUpdate", context: ctx });
+        this.sendState();
+      }
     });
 
-    this.bridge.on("activity", (activity: ActivityEvent) => {
-      this.postMessage({ type: "activity", activity });
+    bridge.on("activity", (activity: ActivityEvent) => {
+      if (isActive()) {
+        this.postMessage({ type: "activity", activity });
+      }
     });
 
-    this.bridge.on("controlRequest", (event: ClaudeEvent) => {
-      this.handleControlRequest(event);
+    bridge.on("controlRequest", (event: ClaudeEvent) => {
+      this.handleControlRequest(runtime, event);
     });
 
-    this.bridge.on("error", (err: string) => {
+    bridge.on("error", (err: string) => {
       log("ERROR", "CLI error:", err);
-      this.postMessage({ type: "error", error: err });
+      if (runtime.streamingMessageId) {
+        this.finalizeStreamingMessage(runtimeKey, runtime, isActive());
+      }
+      if (isActive()) {
+        this.postMessage({ type: "error", error: err });
+      }
       this.outputChannel.appendLine(`[ERROR] ${err}`);
     });
 
-    this.bridge.on("stderr", (text: string) => {
+    bridge.on("stderr", (text: string) => {
       log("STDERR", text);
       this.outputChannel.appendLine(`[stderr] ${text}`);
     });
 
-    this.bridge.on("event", (event: ClaudeEvent) => {
+    bridge.on("event", (event: ClaudeEvent) => {
       log("EVENT", event.type, event.subtype || "");
     });
 
-    this.bridge.on("rawOutput", (text: string) => {
+    bridge.on("rawOutput", (text: string) => {
       log("RAW", text.slice(0, 200));
     });
-
-    this.diffManager.startWatching(workspacePath);
-    await this.bridge.start();
   }
 
   private handleAssistantEvent(event: ClaudeEvent): void {
@@ -556,7 +793,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  private handleControlRequest(event: ClaudeEvent): void {
+  private handleControlRequest(runtime: SessionRuntime, event: ClaudeEvent): void {
     const subtype = event.subtype as string;
 
     if (subtype === "can_use_tool") {
@@ -567,7 +804,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         this.snapshotManager.capture(toolInput.file_path as string);
       }
 
-      this.bridge?.sendControlResponse({
+      runtime.bridge?.sendControlResponse({
         type: "control_response",
         subtype: "can_use_tool",
         request_id: (event as any).request_id,
@@ -594,29 +831,39 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     return writeTools.includes(name);
   }
 
-  private finalizeStreamingMessage(): void {
-    if (this.streamingMessageId) {
-      const msg = this.messages.find(
-        (m) => m.id === this.streamingMessageId
-      );
-      if (msg) {
-        msg.isStreaming = false;
-        msg.content = this.currentStreamText;
-      }
-      this.streamingMessageId = null;
-      this.currentStreamText = "";
-      this.postMessage({ type: "streamEnd" });
+  private finalizeStreamingMessage(
+    runtimeKey: string,
+    runtime: SessionRuntime,
+    notifyWebview: boolean
+  ): void {
+    if (!runtime.streamingMessageId) {
+      return;
+    }
 
-      if (this.bridge?.sessionId) {
-        this.currentSessionId = this.bridge.sessionId;
-      }
-      this.persistSession();
+    const msg = runtime.messages.find((m) => m.id === runtime.streamingMessageId);
+    if (msg) {
+      msg.isStreaming = false;
+      msg.content = runtime.currentStreamText;
+    }
+    runtime.streamingMessageId = null;
+    runtime.currentStreamText = "";
+
+    if (runtime.bridge?.sessionId && !runtime.sessionId) {
+      runtime.sessionId = runtime.bridge.sessionId;
+    }
+
+    this.persistRuntime(runtimeKey, runtime);
+
+    if (notifyWebview) {
+      this.postMessage({ type: "streamEnd" });
 
       const pendingDiffs = this.diffManager.getPendingDiffs();
       for (const diff of pendingDiffs) {
         this.diffManager.openDiffEditor(diff.filePath);
       }
 
+      this.sendState();
+    } else {
       this.sendState();
     }
   }
@@ -661,16 +908,23 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   private sendState(): void {
+    const runtime = this.getActiveRuntime();
     this.postMessage({
       type: "state",
       state: {
         mode: this.mode,
         model: this.model,
         effort: this.effort,
-        messages: this.messages,
-        cliStatus: this.bridge?.status || "stopped",
+        messages: runtime.messages,
+        cliStatus: runtime.bridge?.status || runtime.cliStatus || "stopped",
         pendingDiffs: this.diffManager.getPendingDiffs(),
-        sessionId: this.currentSessionId || this.bridge?.sessionId,
+        sessionId: runtime.sessionId,
+        activeTabId: this.activeKey,
+        isStreaming: !!runtime.streamingMessageId,
+        streamingText: runtime.currentStreamText,
+        runningSessionIds: this.getRunningSessionIds(),
+        cost: runtime.cost,
+        contextInfo: runtime.lastContext,
         workspacePath: this.getWorkspacePath(),
         accountEmail: this.accountEmail,
         accountOrg: this.accountOrg,
@@ -683,8 +937,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   dispose(): void {
-    this.persistSession();
-    this.bridge?.stop();
+    for (const [key, runtime] of this.runtimes) {
+      this.persistRuntime(key, runtime);
+      runtime.bridge?.stop();
+    }
     this.diffManager.dispose();
   }
 }

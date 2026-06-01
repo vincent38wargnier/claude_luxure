@@ -109,6 +109,12 @@ export interface ExtensionState {
   cliStatus: "starting" | "ready" | "busy" | "error" | "stopped";
   pendingDiffs: { filePath: string; diff: string }[];
   sessionId?: string;
+  activeTabId?: string;
+  isStreaming?: boolean;
+  streamingText?: string;
+  runningSessionIds?: string[];
+  cost?: CostInfo;
+  contextInfo?: ContextInfo;
   workspacePath?: string;
   accountEmail?: string;
   accountOrg?: string;

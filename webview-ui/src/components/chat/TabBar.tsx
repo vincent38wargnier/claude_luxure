@@ -4,7 +4,8 @@ import type { SessionInfo } from "../../types";
 interface TabBarProps {
   sessions: SessionInfo[];
   openTabIds: string[];
-  currentSessionId?: string;
+  currentTabId?: string;
+  runningSessionIds: string[];
   onSelect: (sessionId: string) => void;
   onClose: (sessionId: string) => void;
   onNewChat: () => void;
@@ -16,9 +17,13 @@ function truncate(text: string, max: number): string {
   return text.slice(0, max).trimEnd() + "\u2026";
 }
 
+function isDraftTab(id: string): boolean {
+  return id.startsWith("draft-");
+}
+
 function groupByTime(sessions: SessionInfo[]): { label: string; items: SessionInfo[] }[] {
-  const now = Date.now();
-  const todayStart = new Date(); todayStart.setHours(0, 0, 0, 0);
+  const todayStart = new Date();
+  todayStart.setHours(0, 0, 0, 0);
   const weekAgo = todayStart.getTime() - 7 * 86400000;
 
   const today: SessionInfo[] = [];
@@ -41,7 +46,8 @@ function groupByTime(sessions: SessionInfo[]): { label: string; items: SessionIn
 export default function TabBar({
   sessions,
   openTabIds,
-  currentSessionId,
+  currentTabId,
+  runningSessionIds,
   onSelect,
   onClose,
   onNewChat,
@@ -61,7 +67,10 @@ export default function TabBar({
       }
     };
     const t = setTimeout(() => document.addEventListener("mousedown", handle), 30);
-    return () => { clearTimeout(t); document.removeEventListener("mousedown", handle); };
+    return () => {
+      clearTimeout(t);
+      document.removeEventListener("mousedown", handle);
+    };
   }, [showHistory]);
 
   useEffect(() => {
@@ -74,9 +83,20 @@ export default function TabBar({
     return m;
   }, [sessions]);
 
-  const tabSessions = openTabIds
-    .map((id) => sessionMap.get(id))
-    .filter((s): s is SessionInfo => !!s);
+  const runningSet = useMemo(() => new Set(runningSessionIds), [runningSessionIds]);
+
+  const tabs = useMemo(() => {
+    return openTabIds.map((id) => {
+      const session = sessionMap.get(id);
+      if (session) {
+        return { id, label: truncate(session.firstMessage, 22), isDraft: false };
+      }
+      if (isDraftTab(id)) {
+        return { id, label: "New chat", isDraft: true };
+      }
+      return { id, label: truncate(id.slice(0, 8), 22), isDraft: false };
+    });
+  }, [openTabIds, sessionMap]);
 
   const filteredSessions = useMemo(() => {
     if (!search.trim()) return sessions;
@@ -88,30 +108,37 @@ export default function TabBar({
 
   return (
     <div className="flex items-center border-b border-[rgba(255,255,255,0.06)] bg-[rgba(0,0,0,0.15)] min-h-[32px]">
-      {/* Scrollable tabs */}
       <div className="flex-1 flex items-center overflow-x-auto no-scrollbar">
-        {tabSessions.map((session) => {
-          const isCurrent = session.id === currentSessionId;
+        {tabs.map((tab) => {
+          const isCurrent = tab.id === currentTabId;
+          const running = runningSet.has(tab.id);
+
           return (
             <div
-              key={session.id}
+              key={tab.id}
               className={`group relative flex items-center gap-1 pl-3 pr-1 py-1.5 text-[11px] whitespace-nowrap border-r border-[rgba(255,255,255,0.04)] transition-colors shrink-0 cursor-pointer ${
                 isCurrent
                   ? "bg-[var(--vscode-editor-background)] text-vscode-fg"
                   : "text-vscode-descriptionFg hover:text-vscode-fg hover:bg-[rgba(255,255,255,0.03)]"
               }`}
-              onClick={() => onSelect(session.id)}
+              onClick={() => onSelect(tab.id)}
             >
               {isCurrent && (
                 <div className="absolute bottom-0 left-0 right-0 h-[2px] bg-[#60a5fa]" />
               )}
-              <span className="truncate max-w-[130px]">
-                {truncate(session.firstMessage, 22)}
+              {running && !isCurrent && (
+                <span
+                  className="w-1.5 h-1.5 rounded-full bg-[#f59e0b] shrink-0 animate-pulse"
+                  title="Running in background"
+                />
+              )}
+              <span className={`truncate max-w-[130px] ${tab.isDraft ? "italic opacity-70" : ""}`}>
+                {tab.label}
               </span>
               <button
                 onClick={(e) => {
                   e.stopPropagation();
-                  onClose(session.id);
+                  onClose(tab.id);
                 }}
                 className="ml-0.5 p-0.5 rounded opacity-0 group-hover:opacity-60 hover:!opacity-100 hover:bg-[rgba(255,255,255,0.1)] transition-all"
                 title="Close tab"
@@ -125,7 +152,6 @@ export default function TabBar({
         })}
       </div>
 
-      {/* Action buttons */}
       <div className="flex items-center shrink-0 border-l border-[rgba(255,255,255,0.06)] px-1 gap-0.5">
         <button
           onClick={onNewChat}
@@ -159,7 +185,6 @@ export default function TabBar({
 
           {showHistory && (
             <div className="absolute top-full right-0 mt-1 w-[280px] max-h-[400px] bg-[var(--vscode-dropdown-background,var(--vscode-input-background))] border border-[rgba(255,255,255,0.1)] rounded-lg shadow-2xl z-50 flex flex-col overflow-hidden">
-              {/* Search */}
               <div className="px-2 py-1.5 border-b border-[rgba(255,255,255,0.06)]">
                 <input
                   ref={searchRef}
@@ -171,7 +196,6 @@ export default function TabBar({
                 />
               </div>
 
-              {/* Grouped list */}
               <div className="flex-1 overflow-y-auto">
                 {groups.length === 0 ? (
                   <div className="px-3 py-6 text-center text-[11px] text-vscode-descriptionFg opacity-50">
@@ -184,8 +208,9 @@ export default function TabBar({
                         {group.label}
                       </div>
                       {group.items.map((session) => {
-                        const isCurrent = session.id === currentSessionId;
+                        const isCurrent = session.id === currentTabId;
                         const isOpen = openTabIds.includes(session.id);
+                        const isRunning = runningSet.has(session.id);
                         return (
                           <button
                             key={session.id}
@@ -200,6 +225,9 @@ export default function TabBar({
                                 : "hover:bg-[rgba(255,255,255,0.04)]"
                             }`}
                           >
+                            {isRunning && (
+                              <span className="w-1.5 h-1.5 rounded-full bg-[#f59e0b] shrink-0 animate-pulse" />
+                            )}
                             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="shrink-0 opacity-40">
                               <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
                             </svg>

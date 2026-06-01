@@ -4,10 +4,6 @@ import ChatView from "./components/chat/ChatView";
 import type {
   ExtensionState,
   ExtensionMessage,
-  ChatMessage,
-  CostInfo,
-  ContextInfo,
-  AccountInfo,
   ActivityEvent,
   SessionInfo,
   Mode,
@@ -19,27 +15,29 @@ const initialState: ExtensionState = {
   messages: [],
   cliStatus: "stopped",
   pendingDiffs: [],
+  isStreaming: false,
+  streamingText: "",
+  runningSessionIds: [],
 };
 
 export default function App() {
   const [state, setState] = useState<ExtensionState>(initialState);
-  const [streamingText, setStreamingText] = useState("");
-  const [isStreaming, setIsStreaming] = useState(false);
-  const [cost, setCost] = useState<CostInfo | null>(null);
-  const [contextInfo, setContextInfo] = useState<ContextInfo | null>(null);
-  const [accountInfo, setAccountInfo] = useState<AccountInfo | null>(null);
+  const [liveStreamingText, setLiveStreamingText] = useState("");
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
   const [activities, setActivities] = useState<ActivityEvent[]>([]);
   const [openTabIds, setOpenTabIds] = useState<string[]>([]);
   const [externalFiles, setExternalFiles] = useState<string[]>([]);
-  const streamRef = useRef("");
+  const activeTabRef = useRef<string | undefined>();
 
   const handleMessage = useCallback((event: MessageEvent) => {
     const msg = event.data as ExtensionMessage;
 
     switch (msg.type) {
       case "state":
+        activeTabRef.current = msg.state.activeTabId;
         setState(msg.state);
+        setLiveStreamingText(msg.state.streamingText || "");
+        setActivities([]);
         break;
 
       case "message":
@@ -47,23 +45,20 @@ export default function App() {
           ...prev,
           messages: [...prev.messages, msg.message],
         }));
-        if (msg.message.role === "assistant" && msg.message.isStreaming) {
-          setIsStreaming(true);
-          streamRef.current = "";
-          setStreamingText("");
-        }
         break;
 
       case "streamToken":
-        streamRef.current += msg.text;
-        setStreamingText(streamRef.current);
+        setLiveStreamingText((prev) => prev + msg.text);
         break;
 
       case "streamEnd":
-        setIsStreaming(false);
-        setStreamingText("");
-        streamRef.current = "";
+        setLiveStreamingText("");
         setActivities([]);
+        setState((prev) => ({
+          ...prev,
+          isStreaming: false,
+          streamingText: "",
+        }));
         break;
 
       case "activity":
@@ -86,15 +81,14 @@ export default function App() {
         break;
 
       case "costUpdate":
-        setCost(msg.cost);
+        setState((prev) => ({ ...prev, cost: msg.cost }));
         break;
 
       case "contextUpdate":
-        setContextInfo(msg.context);
+        setState((prev) => ({ ...prev, contextInfo: msg.context }));
         break;
 
       case "accountInfo":
-        setAccountInfo(msg.account);
         break;
 
       case "sessionList":
@@ -170,14 +164,10 @@ export default function App() {
 
   const handleNewConversation = useCallback(() => {
     vscode.postMessage({ type: "newConversation" });
-    setCost(null);
-    setContextInfo(null);
   }, []);
 
   const handleSwitchSession = useCallback((sessionId: string) => {
     vscode.postMessage({ type: "switchSession", sessionId });
-    setCost(null);
-    setContextInfo(null);
   }, []);
 
   const handleCloseTab = useCallback((sessionId: string) => {
@@ -204,6 +194,9 @@ export default function App() {
     vscode.postMessage({ type: "rejectAllChanges" });
   }, []);
 
+  const isStreaming = state.isStreaming ?? false;
+  const streamingText = isStreaming ? liveStreamingText : "";
+
   return (
     <div className="flex flex-col h-screen overflow-hidden">
       <ChatView
@@ -212,8 +205,10 @@ export default function App() {
         model={state.model}
         effort={state.effort}
         sessionId={state.sessionId}
+        activeTabId={state.activeTabId}
         sessions={sessions}
         openTabIds={openTabIds}
+        runningSessionIds={state.runningSessionIds || []}
         cliStatus={state.cliStatus}
         workspacePath={state.workspacePath}
         externalFiles={externalFiles}
@@ -222,8 +217,8 @@ export default function App() {
         streamingText={streamingText}
         isStreaming={isStreaming}
         activities={activities}
-        cost={cost}
-        contextInfo={contextInfo}
+        cost={state.cost ?? null}
+        contextInfo={state.contextInfo ?? null}
         accountEmail={state.accountEmail}
         accountOrg={state.accountOrg}
         onSend={handleSend}

@@ -48,8 +48,10 @@ interface ChatViewProps {
   model?: string;
   effort?: EffortLevel;
   sessionId?: string;
+  activeTabId?: string;
   sessions: SessionInfo[];
   openTabIds: string[];
+  runningSessionIds: string[];
   cliStatus: string;
   pendingDiffs: PendingDiff[];
   streamingText: string;
@@ -83,8 +85,10 @@ export default function ChatView({
   model,
   effort,
   sessionId,
+  activeTabId,
   sessions,
   openTabIds,
+  runningSessionIds,
   cliStatus,
   pendingDiffs,
   streamingText,
@@ -128,7 +132,8 @@ export default function ChatView({
       <TabBar
         sessions={sessions}
         openTabIds={openTabIds}
-        currentSessionId={sessionId}
+        currentTabId={activeTabId || sessionId}
+        runningSessionIds={runningSessionIds}
         onSelect={onSwitchSession}
         onClose={onCloseTab}
         onNewChat={onNewConversation}

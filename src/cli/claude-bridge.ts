@@ -15,6 +15,8 @@ export interface ClaudeBridgeOptions {
   model?: string;
   effort?: EffortLevel;
   sessionId?: string;
+  forkSession?: boolean;
+  sessionName?: string;
 }
 
 const PLAN_MODE_SYSTEM_PROMPT = `You are in PLAN MODE. You must ONLY:
@@ -65,6 +67,13 @@ export class ClaudeBridge extends EventEmitter {
 
     if (this._sessionId) {
       args.push("--resume", this._sessionId);
+      if (this.options.forkSession) {
+        args.push("--fork-session");
+      }
+    }
+
+    if (this.options.sessionName) {
+      args.push("--name", this.options.sessionName);
     }
 
     if (this.options.model) {
@@ -322,6 +331,8 @@ export class ClaudeBridge extends EventEmitter {
       if (options.model !== undefined) { this.options.model = options.model; }
       if (options.effort !== undefined) { this.options.effort = options.effort; }
       if (options.sessionId !== undefined) { this._sessionId = options.sessionId; }
+      if (options.forkSession !== undefined) { this.options.forkSession = options.forkSession; }
+      if (options.sessionName !== undefined) { this.options.sessionName = options.sessionName; }
     }
     this.start();
   }
