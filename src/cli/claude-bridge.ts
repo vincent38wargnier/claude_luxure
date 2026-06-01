@@ -161,8 +161,16 @@ export class ClaudeBridge extends EventEmitter {
       if (event.session_id) {
         this._sessionId = event.session_id as string;
       }
+      const slashCommands = (event as any).slash_commands;
+      if (Array.isArray(slashCommands)) {
+        this.emit("slashCommands", slashCommands as string[]);
+      }
       this._status = "ready";
       this.emit("status", this._status);
+    }
+
+    if (event.type === "system" && event.subtype === "compact_boundary") {
+      this.emit("compactBoundary", event);
     }
 
     if (event.type === "result") {

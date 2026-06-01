@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import vscode from "./vscode";
 import ChatView from "./components/chat/ChatView";
+import SkillsPanel from "./components/skills/SkillsPanel";
 import type {
   ExtensionState,
   ExtensionMessage,
@@ -8,6 +9,8 @@ import type {
   SessionInfo,
   Mode,
   EffortLevel,
+  SkillInfo,
+  SkillScope,
 } from "./types";
 
 const initialState: ExtensionState = {
@@ -27,7 +30,15 @@ export default function App() {
   const [activities, setActivities] = useState<ActivityEvent[]>([]);
   const [openTabIds, setOpenTabIds] = useState<string[]>([]);
   const [externalFiles, setExternalFiles] = useState<string[]>([]);
+  const [skillsOpen, setSkillsOpen] = useState(false);
+  const [skills, setSkills] = useState<SkillInfo[]>([]);
+  const [selectedSkillId, setSelectedSkillId] = useState<string | null>(null);
+  const [editorContent, setEditorContent] = useState("");
+  const [savedEditorContent, setSavedEditorContent] = useState("");
+  const [skillsError, setSkillsError] = useState<string | null>(null);
+  const [savedFlash, setSavedFlash] = useState(false);
   const activeTabRef = useRef<string | undefined>();
+  const editorContentRef = useRef("");
 
   const handleMessage = useCallback((event: MessageEvent) => {
     const msg = event.data as ExtensionMessage;
@@ -99,6 +110,10 @@ export default function App() {
         setOpenTabIds(msg.tabIds);
         break;
 
+      case "slashCommands":
+        setState((prev) => ({ ...prev, slashCommands: msg.commands }));
+        break;
+
       case "cliStatus":
         setState((prev) => ({ ...prev, cliStatus: msg.status }));
         break;
@@ -124,6 +139,29 @@ export default function App() {
           }
           return { ...prev, pendingDiffs: newDiffs };
         });
+        break;
+
+      case "skillsList":
+        setSkills(msg.skills);
+        setSkillsError(null);
+        break;
+
+      case "skillContent":
+        setSelectedSkillId(msg.skillId);
+        editorContentRef.current = msg.content;
+        setEditorContent(msg.content);
+        setSavedEditorContent(msg.content);
+        setSkillsError(null);
+        break;
+
+      case "skillsError":
+        setSkillsError(msg.error);
+        break;
+
+      case "skillsSaved":
+        setSavedEditorContent(editorContentRef.current);
+        setSavedFlash(true);
+        setTimeout(() => setSavedFlash(false), 2000);
         break;
     }
   }, []);
@@ -194,11 +232,70 @@ export default function App() {
     vscode.postMessage({ type: "rejectAllChanges" });
   }, []);
 
+  const handleEditorChange = useCallback((content: string) => {
+    editorContentRef.current = content;
+    setEditorContent(content);
+  }, []);
+
+  const handleListSkills = useCallback(() => {
+    vscode.postMessage({ type: "listSkills" });
+  }, []);
+
+  const handleSelectSkill = useCallback((skillId: string) => {
+    vscode.postMessage({ type: "readSkill", skillId });
+  }, []);
+
+  const handleSaveSkill = useCallback(() => {
+    if (!selectedSkillId) return;
+    vscode.postMessage({
+      type: "saveSkill",
+      skillId: selectedSkillId,
+      content: editorContentRef.current,
+    });
+  }, [selectedSkillId]);
+
+  const handleCreateSkill = useCallback((scope: SkillScope, name: string) => {
+    vscode.postMessage({ type: "createSkill", scope, name });
+  }, []);
+
+  const handleDeleteSkill = useCallback(() => {
+    if (!selectedSkillId) return;
+    if (!window.confirm("Delete this skill? This cannot be undone.")) return;
+    vscode.postMessage({ type: "deleteSkill", skillId: selectedSkillId });
+    setSelectedSkillId(null);
+    setEditorContent("");
+    setSavedEditorContent("");
+    editorContentRef.current = "";
+  }, [selectedSkillId]);
+
+  const handleOpenSkillInEditor = useCallback((filePath: string) => {
+    vscode.postMessage({ type: "openFile", filePath });
+  }, []);
+
   const isStreaming = state.isStreaming ?? false;
+  const skillsDirty = editorContent !== savedEditorContent;
   const streamingText = isStreaming ? liveStreamingText : "";
 
   return (
-    <div className="flex flex-col h-screen overflow-hidden">
+    <div className="relative flex flex-col h-screen overflow-hidden">
+      <SkillsPanel
+        open={skillsOpen}
+        skills={skills}
+        selectedSkillId={selectedSkillId}
+        editorContent={editorContent}
+        dirty={skillsDirty}
+        error={skillsError}
+        savedFlash={savedFlash}
+        hasWorkspace={!!state.workspacePath}
+        onClose={() => setSkillsOpen(false)}
+        onSelectSkill={handleSelectSkill}
+        onEditorChange={handleEditorChange}
+        onListSkills={handleListSkills}
+        onSave={handleSaveSkill}
+        onDelete={handleDeleteSkill}
+        onCreate={handleCreateSkill}
+        onOpenInEditor={handleOpenSkillInEditor}
+      />
       <ChatView
         messages={state.messages}
         mode={state.mode}
@@ -221,6 +318,8 @@ export default function App() {
         contextInfo={state.contextInfo ?? null}
         accountEmail={state.accountEmail}
         accountOrg={state.accountOrg}
+        slashCommands={state.slashCommands}
+        contextSummarized={state.contextSummarized}
         onSend={handleSend}
         onCancel={handleCancel}
         onModeChange={handleModeChange}
@@ -234,6 +333,7 @@ export default function App() {
         onRejectChange={handleRejectChange}
         onAcceptAll={handleAcceptAll}
         onRejectAll={handleRejectAll}
+        onOpenSkills={() => setSkillsOpen(true)}
       />
     </div>
   );

@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback, useEffect } from "react";
+import { useState, useRef, useCallback, useEffect, useMemo } from "react";
 import TextareaAutosize from "react-textarea-autosize";
 import {
   Square,
@@ -13,7 +13,12 @@ import { AVAILABLE_MODELS, EFFORT_LEVELS } from "../../types";
 import ModeSelector from "./ModeSelector";
 import ModelSelector from "./ModelSelector";
 import ContextMenu from "./ContextMenu";
+import SlashCommandMenu from "./SlashCommandMenu";
 import Thumbnails from "../common/Thumbnails";
+import {
+  mergeCliCommands,
+  type CliCommand,
+} from "../../../../src/shared/cli-commands";
 
 interface ChatTextAreaProps {
   mode: Mode;
@@ -27,6 +32,7 @@ interface ChatTextAreaProps {
   accountEmail?: string;
   accountOrg?: string;
   workspacePath?: string;
+  slashCommands?: string[];
   externalFiles?: string[];
   onClearExternalFiles?: () => void;
   onSend: (text: string, images?: string[], mentions?: string[]) => void;
@@ -35,6 +41,7 @@ interface ChatTextAreaProps {
   onModelChange: (model: string) => void;
   onEffortChange: (effort: EffortLevel) => void;
   onReview?: () => void;
+  onOpenSkills?: () => void;
 }
 
 const MAX_IMAGES = 10;
@@ -202,6 +209,7 @@ export default function ChatTextArea({
   accountEmail,
   accountOrg,
   workspacePath,
+  slashCommands,
   externalFiles,
   onClearExternalFiles,
   onSend,
@@ -210,17 +218,37 @@ export default function ChatTextArea({
   onModelChange,
   onEffortChange,
   onReview,
+  onOpenSkills,
 }: ChatTextAreaProps) {
   const [inputValue, setInputValue] = useState("");
   const [selectedImages, setSelectedImages] = useState<string[]>([]);
   const [isDragOver, setIsDragOver] = useState(false);
   const [showContextMenu, setShowContextMenu] = useState(false);
+  const [showSlashMenu, setShowSlashMenu] = useState(false);
   const [contextMenuQuery, setContextMenuQuery] = useState("");
+  const [slashMenuQuery, setSlashMenuQuery] = useState("");
   const [contextMenuFiles, setContextMenuFiles] = useState<string[]>([]);
   const [contextMenuIndex, setContextMenuIndex] = useState(0);
+  const [slashMenuIndex, setSlashMenuIndex] = useState(0);
   const [mentionStartPos, setMentionStartPos] = useState(-1);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const highlightRef = useRef<HTMLDivElement>(null);
+
+  const cliCommands = useMemo(
+    () => mergeCliCommands(slashCommands),
+    [slashCommands]
+  );
+
+  const filteredSlashCommands = useMemo(() => {
+    const q = slashMenuQuery.toLowerCase();
+    if (!q) return cliCommands;
+    return cliCommands.filter(
+      (cmd) =>
+        cmd.name.slice(1).toLowerCase().startsWith(q) ||
+        cmd.name.toLowerCase().includes(q) ||
+        cmd.description.toLowerCase().includes(q)
+    );
+  }, [cliCommands, slashMenuQuery]);
 
   // Merge external files at cursor position
   useEffect(() => {
@@ -295,11 +323,56 @@ export default function ChatTextArea({
 
     setInputValue("");
     setSelectedImages([]);
+    setInputValue("");
+    setSelectedImages([]);
     setShowContextMenu(false);
+    setShowSlashMenu(false);
   }, [inputValue, selectedImages, onSend]);
+
+  const insertSlashCommand = useCallback((command: CliCommand) => {
+    setInputValue(`${command.name} `);
+    setShowSlashMenu(false);
+    setSlashMenuQuery("");
+
+    setTimeout(() => {
+      if (textareaRef.current) {
+        const pos = command.name.length + 1;
+        textareaRef.current.selectionStart = pos;
+        textareaRef.current.selectionEnd = pos;
+        textareaRef.current.focus();
+      }
+    }, 0);
+  }, []);
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
+      if (showSlashMenu) {
+        if (e.key === "ArrowDown") {
+          e.preventDefault();
+          setSlashMenuIndex((prev) =>
+            Math.min(prev + 1, filteredSlashCommands.length - 1)
+          );
+          return;
+        }
+        if (e.key === "ArrowUp") {
+          e.preventDefault();
+          setSlashMenuIndex((prev) => Math.max(prev - 1, 0));
+          return;
+        }
+        if (e.key === "Enter" || e.key === "Tab") {
+          e.preventDefault();
+          if (filteredSlashCommands[slashMenuIndex]) {
+            insertSlashCommand(filteredSlashCommands[slashMenuIndex]);
+          }
+          return;
+        }
+        if (e.key === "Escape") {
+          e.preventDefault();
+          setShowSlashMenu(false);
+          return;
+        }
+      }
+
       if (showContextMenu) {
         if (e.key === "ArrowDown") {
           e.preventDefault();
@@ -344,6 +417,9 @@ export default function ChatTextArea({
       }
     },
     [
+      showSlashMenu,
+      filteredSlashCommands,
+      slashMenuIndex,
       showContextMenu,
       contextMenuFiles,
       contextMenuIndex,
@@ -351,6 +427,7 @@ export default function ChatTextArea({
       isStreaming,
       handleSend,
       onCancel,
+      insertSlashCommand,
     ]
   );
 
@@ -361,6 +438,19 @@ export default function ChatTextArea({
 
       const cursorPos = e.target.selectionStart;
       const textBeforeCursor = value.slice(0, cursorPos);
+
+      const slashMatch = value.match(/^\/([\w-]*)$/);
+      if (slashMatch && cursorPos === value.length) {
+        setShowSlashMenu(true);
+        setSlashMenuQuery(slashMatch[1]);
+        setSlashMenuIndex(0);
+        setShowContextMenu(false);
+        setContextMenuQuery("");
+        return;
+      }
+
+      setShowSlashMenu(false);
+      setSlashMenuQuery("");
 
       const atMatch = textBeforeCursor.match(/@([\w./\-\\]*)$/);
       if (atMatch) {
@@ -543,6 +633,15 @@ export default function ChatTextArea({
         onDragLeave={handleDragLeave}
         onDrop={handleDrop}
       >
+        <SlashCommandMenu
+          query={slashMenuQuery}
+          commands={cliCommands}
+          visible={showSlashMenu}
+          selectedIndex={slashMenuIndex}
+          onSelect={insertSlashCommand}
+          onClose={() => setShowSlashMenu(false)}
+        />
+
         <ContextMenu
           query={contextMenuQuery}
           files={contextMenuFiles}
@@ -583,8 +682,8 @@ export default function ChatTextArea({
             onScroll={syncScroll}
             placeholder={
               mode === "plan"
-                ? "Describe what to analyze..."
-                : "Ask Claude anything... (@ to mention files)"
+                ? "Describe what to analyze... (/ for commands)"
+                : "Ask Claude anything... (/ commands, @ files)"
             }
             className="relative w-full bg-transparent text-[13px] resize-none outline-none min-h-[20px] max-h-[160px] leading-relaxed placeholder:text-vscode-descriptionFg"
             style={{
@@ -600,6 +699,19 @@ export default function ChatTextArea({
       {/* Bottom bar */}
       <div className="flex items-center justify-between px-3 py-1.5 border-t border-[rgba(255,255,255,0.04)]">
         <div className="flex items-center gap-1.5">
+          {onOpenSkills && (
+            <>
+              <button
+                type="button"
+                onClick={onOpenSkills}
+                className="text-[11px] text-vscode-descriptionFg hover:text-vscode-fg transition-colors px-1"
+                title="Manage Claude skills"
+              >
+                Skills
+              </button>
+              <span className="text-[10px] text-vscode-descriptionFg opacity-30 select-none">|</span>
+            </>
+          )}
           <ModeSelector mode={mode} onChange={onModeChange} />
           <span className="text-[10px] text-vscode-descriptionFg opacity-30 select-none">|</span>
           <ModelSelector model={model} onChange={onModelChange} />

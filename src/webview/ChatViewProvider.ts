@@ -19,6 +19,13 @@ import {
 } from "../shared/types";
 import { extractMentions, resolveFromMention } from "../utils/path-mentions";
 import { log } from "../utils/logger";
+import {
+  isCompactCommand,
+  isSlashCommand,
+  resolveSlashCommand,
+} from "../shared/cli-commands";
+import { SkillsManager } from "../skills/SkillsManager";
+import type { SkillScope } from "../shared/types";
 
 interface SessionRuntime {
   sessionId?: string;
@@ -31,6 +38,7 @@ interface SessionRuntime {
   cost?: CostInfo;
   cliStatus: ExtensionState["cliStatus"];
   sessionName?: string;
+  contextSummarized?: boolean;
 }
 
 function createEmptyRuntime(): SessionRuntime {
@@ -47,6 +55,9 @@ function isDraftKey(key: string): boolean {
 }
 
 function sessionNameFromText(text: string): string {
+  if (isSlashCommand(text)) {
+    return "New chat";
+  }
   const line = text.split("\n")[0].trim();
   return line.slice(0, 80) || "New chat";
 }
@@ -67,6 +78,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private openTabIds: string[] = [];
   private sessionManager: SessionManager | undefined;
   private diffWatchStarted = false;
+  private slashCommands: string[] = [];
+  private skillsManager = new SkillsManager();
 
   constructor(
     private readonly context: vscode.ExtensionContext,
@@ -192,6 +205,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
       const runtime = createEmptyRuntime();
       runtime.sessionId = lastSessionId;
+      runtime.contextSummarized = this.loadContextSummarized(lastSessionId);
       const cached = this.context.workspaceState.get<ChatMessage[]>(`claude-luxure.messages.${lastSessionId}`);
       if (cached && cached.length > 0) {
         runtime.messages = cached.map((m) => ({ ...m, isStreaming: false }));
@@ -207,6 +221,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           runtime.draftId = this.activeKey;
         } else {
           runtime.sessionId = this.activeKey;
+          runtime.contextSummarized = this.loadContextSummarized(this.activeKey);
           const cached = this.context.workspaceState.get<ChatMessage[]>(
             `claude-luxure.messages.${this.activeKey}`
           );
@@ -227,8 +242,23 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         runtime.messages.filter((m) => !m.isStreaming)
       );
       this.context.workspaceState.update("claude-luxure.lastSessionId", persistId);
+      this.context.workspaceState.update(
+        `claude-luxure.contextSummarized.${persistId}`,
+        runtime.contextSummarized ?? false
+      );
     }
     this.context.workspaceState.update("claude-luxure.openTabs", this.openTabIds);
+  }
+
+  private loadContextSummarized(key: string): boolean {
+    if (isDraftKey(key)) {
+      return false;
+    }
+    return (
+      this.context.workspaceState.get<boolean>(
+        `claude-luxure.contextSummarized.${key}`
+      ) ?? false
+    );
   }
 
   private persistActiveSession(): void {
@@ -261,6 +291,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
 
     runtime.sessionId = key;
+    runtime.contextSummarized = this.loadContextSummarized(key);
     const cached = this.context.workspaceState.get<ChatMessage[]>(`claude-luxure.messages.${key}`);
     if (cached && cached.length > 0) {
       runtime.messages = cached.map((m) => ({ ...m, isStreaming: false }));
@@ -521,6 +552,113 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         const doc = await vscode.workspace.openTextDocument(message.filePath);
         await vscode.window.showTextDocument(doc, { preview: true });
         break;
+
+      case "listSkills":
+        this.handleListSkills();
+        break;
+
+      case "readSkill":
+        this.handleReadSkill(message.skillId);
+        break;
+
+      case "saveSkill":
+        await this.handleSaveSkill(message.skillId, message.content);
+        break;
+
+      case "createSkill":
+        await this.handleCreateSkill(message.scope, message.name);
+        break;
+
+      case "deleteSkill":
+        await this.handleDeleteSkill(message.skillId);
+        break;
+    }
+  }
+
+  private handleListSkills(): void {
+    try {
+      const skills = this.skillsManager.listSkills(this.getWorkspacePath());
+      this.postMessage({ type: "skillsList", skills });
+    } catch (err) {
+      this.postSkillsError(err);
+    }
+  }
+
+  private handleReadSkill(skillId: string): void {
+    try {
+      const content = this.skillsManager.readSkill(
+        skillId,
+        this.getWorkspacePath()
+      );
+      this.postMessage({ type: "skillContent", skillId, content });
+    } catch (err) {
+      this.postSkillsError(err);
+    }
+  }
+
+  private async handleSaveSkill(
+    skillId: string,
+    content: string
+  ): Promise<void> {
+    try {
+      this.skillsManager.writeSkill(
+        skillId,
+        content,
+        this.getWorkspacePath()
+      );
+      await this.reloadCliSkills();
+      const skills = this.skillsManager.listSkills(this.getWorkspacePath());
+      this.postMessage({ type: "skillsList", skills });
+      this.postMessage({ type: "skillsSaved", skillId });
+    } catch (err) {
+      this.postSkillsError(err);
+    }
+  }
+
+  private async handleCreateSkill(
+    scope: SkillScope,
+    name: string
+  ): Promise<void> {
+    try {
+      const skill = this.skillsManager.createSkill(
+        scope,
+        name,
+        this.getWorkspacePath()
+      );
+      await this.reloadCliSkills();
+      const skills = this.skillsManager.listSkills(this.getWorkspacePath());
+      this.postMessage({ type: "skillsList", skills });
+      this.postMessage({ type: "skillContent", skillId: skill.id, content: this.skillsManager.readSkill(skill.id, this.getWorkspacePath()) });
+      this.postMessage({ type: "skillsSaved", skillId: skill.id });
+    } catch (err) {
+      this.postSkillsError(err);
+    }
+  }
+
+  private async handleDeleteSkill(skillId: string): Promise<void> {
+    try {
+      this.skillsManager.deleteSkill(skillId, this.getWorkspacePath());
+      await this.reloadCliSkills();
+      const skills = this.skillsManager.listSkills(this.getWorkspacePath());
+      this.postMessage({ type: "skillsList", skills });
+    } catch (err) {
+      this.postSkillsError(err);
+    }
+  }
+
+  private postSkillsError(err: unknown): void {
+    const error = err instanceof Error ? err.message : String(err);
+    this.postMessage({ type: "skillsError", error });
+  }
+
+  private async reloadCliSkills(): Promise<void> {
+    const runtime = this.getActiveRuntime();
+    const bridge = runtime.bridge;
+    if (
+      bridge &&
+      (bridge.status === "ready" || bridge.status === "busy")
+    ) {
+      bridge.sendMessage("/reload-skills");
     }
   }
 
@@ -539,7 +677,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
     const runtime = this.getActiveRuntime();
 
-    if (!runtime.sessionName && !runtime.sessionId) {
+    if (!runtime.sessionName && !runtime.sessionId && !isSlashCommand(text)) {
       runtime.sessionName = sessionNameFromText(text);
     }
 
@@ -547,10 +685,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       await this.startBridge(runtimeKey, runtime);
     }
 
+    const { displayText, cliText } = resolveSlashCommand(text);
     const workspacePath = this.getWorkspacePath();
-    let resolvedText = text;
+    let resolvedText = cliText;
 
-    if (workspacePath) {
+    if (workspacePath && !isSlashCommand(text)) {
       const fileMentions = extractMentions(text);
       for (const mention of fileMentions) {
         const absPath = resolveFromMention(mention, workspacePath);
@@ -569,7 +708,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const userMessage: ChatMessage = {
       id: generateId(),
       role: "user",
-      content: text,
+      content: displayText,
       images,
       timestamp: Date.now(),
     };
@@ -593,6 +732,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (this.isActiveKey(runtimeKey)) {
       this.postMessage({ type: "message", message: assistantMessage });
     }
+
     this.sendState();
   }
 
@@ -639,6 +779,28 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     bridge: ClaudeBridge
   ): void {
     const isActive = () => this.isActiveKey(runtimeKey);
+
+    bridge.on("slashCommands", (commands: string[]) => {
+      this.slashCommands = commands;
+      this.postMessage({ type: "slashCommands", commands });
+      if (isActive()) {
+        this.sendState();
+      }
+    });
+
+    bridge.on("compactBoundary", (event: ClaudeEvent) => {
+      const meta = (event as any).compact_metadata;
+      log(
+        "INFO",
+        "Compact boundary reached for session:",
+        runtimeKey,
+        meta ? `pre_tokens=${meta.pre_tokens} trigger=${meta.trigger}` : ""
+      );
+      runtime.contextSummarized = true;
+      if (isActive()) {
+        this.sendState();
+      }
+    });
 
     bridge.on("status", (status: string) => {
       log("INFO", "CLI status:", status, "session:", runtimeKey);
@@ -845,6 +1007,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       msg.isStreaming = false;
       msg.content = runtime.currentStreamText;
     }
+
+    const lastUserMessage = [...runtime.messages]
+      .reverse()
+      .find((m) => m.role === "user");
+    if (lastUserMessage && isCompactCommand(lastUserMessage.content)) {
+      runtime.contextSummarized = true;
+    }
+
     runtime.streamingMessageId = null;
     runtime.currentStreamText = "";
 
@@ -928,6 +1098,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         workspacePath: this.getWorkspacePath(),
         accountEmail: this.accountEmail,
         accountOrg: this.accountOrg,
+        slashCommands: this.slashCommands,
+        contextSummarized: runtime.contextSummarized ?? false,
       },
     });
   }

@@ -61,6 +61,8 @@ interface ChatViewProps {
   contextInfo: ContextInfo | null;
   accountEmail?: string;
   accountOrg?: string;
+  slashCommands?: string[];
+  contextSummarized?: boolean;
   workspacePath?: string;
   externalFiles?: string[];
   onClearExternalFiles?: () => void;
@@ -77,6 +79,7 @@ interface ChatViewProps {
   onRejectChange: (filePath: string) => void;
   onAcceptAll: () => void;
   onRejectAll: () => void;
+  onOpenSkills?: () => void;
 }
 
 export default function ChatView({
@@ -98,6 +101,8 @@ export default function ChatView({
   contextInfo,
   accountEmail,
   accountOrg,
+  slashCommands,
+  contextSummarized,
   workspacePath,
   externalFiles,
   onClearExternalFiles,
@@ -114,6 +119,7 @@ export default function ChatView({
   onRejectChange,
   onAcceptAll,
   onRejectAll,
+  onOpenSkills,
 }: ChatViewProps) {
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const [showReview, setShowReview] = useState(false);
@@ -175,6 +181,16 @@ export default function ChatView({
           <ActivityIndicator activities={activities} />
         )}
 
+        {contextSummarized && !isStreaming && messages.length > 0 && (
+          <div className="px-4 py-3 flex items-center gap-3 select-none">
+            <div className="flex-1 h-px bg-[rgba(255,255,255,0.06)]" />
+            <span className="text-[11px] text-vscode-descriptionFg opacity-45 shrink-0">
+              Context summarized
+            </span>
+            <div className="flex-1 h-px bg-[rgba(255,255,255,0.06)]" />
+          </div>
+        )}
+
         <div ref={messagesEndRef} />
       </div>
 
@@ -210,6 +226,7 @@ export default function ChatView({
         contextInfo={contextInfo}
         accountEmail={accountEmail}
         accountOrg={accountOrg}
+        slashCommands={slashCommands}
         workspacePath={workspacePath}
         externalFiles={externalFiles}
         onClearExternalFiles={onClearExternalFiles}
@@ -219,6 +236,7 @@ export default function ChatView({
         onModelChange={onModelChange}
         onEffortChange={onEffortChange}
         onReview={handleReview}
+        onOpenSkills={onOpenSkills}
       />
     </div>
   );

@@ -101,7 +101,7 @@ export default function MessageRow({
 
   if (isSystem) {
     return (
-      <div className="mx-2 px-2.5 py-1.5 text-xs text-[#f87171] bg-[rgba(239,68,68,0.06)] rounded border border-[rgba(239,68,68,0.1)]">
+      <div className="mx-2 px-2.5 py-1.5 text-xs text-vscode-descriptionFg bg-[rgba(255,255,255,0.03)] rounded border border-[rgba(255,255,255,0.06)]">
         {content}
       </div>
     );

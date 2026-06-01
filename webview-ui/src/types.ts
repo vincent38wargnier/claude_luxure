@@ -81,6 +81,8 @@ export interface ExtensionState {
   workspacePath?: string;
   accountEmail?: string;
   accountOrg?: string;
+  slashCommands?: string[];
+  contextSummarized?: boolean;
 }
 
 export interface SessionInfo {
@@ -89,6 +91,17 @@ export interface SessionInfo {
   timestamp: string;
   messageCount: number;
   modifiedAt: number;
+}
+
+export type SkillScope = "global" | "project";
+
+export interface SkillInfo {
+  id: string;
+  scope: SkillScope;
+  command: string;
+  name: string;
+  description?: string;
+  path: string;
 }
 
 export type WebviewMessage =
@@ -107,7 +120,12 @@ export type WebviewMessage =
   | { type: "rejectAllChanges" }
   | { type: "searchFiles"; query: string }
   | { type: "openFile"; filePath: string }
-  | { type: "ready" };
+  | { type: "ready" }
+  | { type: "listSkills" }
+  | { type: "readSkill"; skillId: string }
+  | { type: "saveSkill"; skillId: string; content: string }
+  | { type: "createSkill"; scope: SkillScope; name: string }
+  | { type: "deleteSkill"; skillId: string };
 
 export type ExtensionMessage =
   | { type: "state"; state: ExtensionState }
@@ -123,4 +141,9 @@ export type ExtensionMessage =
   | { type: "accountInfo"; account: AccountInfo }
   | { type: "sessionList"; sessions: SessionInfo[] }
   | { type: "openTabs"; tabIds: string[] }
-  | { type: "cliStatus"; status: ExtensionState["cliStatus"] };
+  | { type: "cliStatus"; status: ExtensionState["cliStatus"] }
+  | { type: "slashCommands"; commands: string[] }
+  | { type: "skillsList"; skills: SkillInfo[] }
+  | { type: "skillContent"; skillId: string; content: string }
+  | { type: "skillsError"; error: string }
+  | { type: "skillsSaved"; skillId: string };
