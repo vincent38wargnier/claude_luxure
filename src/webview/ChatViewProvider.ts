@@ -27,13 +27,27 @@ import {
 import { SkillsManager } from "../skills/SkillsManager";
 import type { SkillScope } from "../shared/types";
 
+const ROOT_FORK_ANCHOR = "ROOT";
+
+interface ForkVersion {
+  sessionId?: string;
+  tail: ChatMessage[];
+}
+
+interface ForkGroup {
+  versions: ForkVersion[];
+  activeIndex: number;
+}
+
 interface SessionRuntime {
   sessionId?: string;
   draftId?: string;
+  forks?: Record<string, ForkGroup>;
   messages: ChatMessage[];
   bridge?: ClaudeBridge;
   streamingMessageId: string | null;
   currentStreamText: string;
+  currentActivities: ActivityEvent[];
   lastContext?: ContextInfo;
   cost?: CostInfo;
   cliStatus: ExtensionState["cliStatus"];
@@ -46,6 +60,7 @@ function createEmptyRuntime(): SessionRuntime {
     messages: [],
     streamingMessageId: null,
     currentStreamText: "",
+    currentActivities: [],
     cliStatus: "stopped",
   };
 }
@@ -62,10 +77,46 @@ function sessionNameFromText(text: string): string {
   return line.slice(0, 80) || "New chat";
 }
 
+/**
+ * Render prior conversation turns as a context block for a rewound (edited)
+ * conversation. After an edit we start a fresh CLI session, so earlier turns are
+ * replayed as text. Any file edits from those turns are already on disk, so the
+ * model can re-read files as needed rather than relying on transcript surgery.
+ */
+function renderSeedHistory(messages: ChatMessage[]): string {
+  const turns: string[] = [];
+  for (const m of messages) {
+    if (m.role !== "user" && m.role !== "assistant") {
+      continue;
+    }
+    const body = (m.content || "").trim();
+    const imageNote =
+      m.images && m.images.length > 0
+        ? ` _[${m.images.length} image(s) omitted]_`
+        : "";
+    if (!body && !imageNote) {
+      continue;
+    }
+    const label = m.role === "user" ? "User" : "Assistant";
+    turns.push(`### ${label}\n${body}${imageNote}`);
+  }
+  if (turns.length === 0) {
+    return "";
+  }
+  return [
+    "<previous_conversation>",
+    "The user rewound to an earlier point in our conversation. The exchange below already happened and is provided only as context; any file changes from it are already saved on disk. Continue naturally from here in response to the new message that follows — do not greet, summarize, or repeat this history unless asked.",
+    "",
+    turns.join("\n\n"),
+    "</previous_conversation>",
+  ].join("\n");
+}
+
 export class ChatViewProvider implements vscode.WebviewViewProvider {
   public static readonly viewId = "claude-luxure.chatView";
 
   private webview: vscode.Webview | undefined;
+  private webviewView: vscode.WebviewView | undefined;
   private runtimes = new Map<string, SessionRuntime>();
   private activeKey = "";
   private mode: Mode = "agent";
@@ -335,11 +386,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   private stopRuntimeBridge(key: string, runtime: SessionRuntime): void {
-    runtime.bridge?.stop();
+    const bridge = runtime.bridge;
     runtime.bridge = undefined;
     runtime.cliStatus = "stopped";
     if (runtime.streamingMessageId) {
       this.finalizeStreamingMessage(key, runtime, false);
+    }
+    if (bridge) {
+      // Detach our handlers BEFORE killing. The process exits asynchronously and
+      // would otherwise emit "exit"/"stopped" that mutate this runtime after it has
+      // moved on to a new bridge (e.g. after an edit), prematurely finalizing the
+      // new turn's streaming message and swallowing the response.
+      bridge.removeAllListeners();
+      bridge.stop();
     }
   }
 
@@ -381,12 +440,21 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.sendOpenTabs();
   }
 
+  async reveal(): Promise<void> {
+    if (this.webviewView) {
+      this.webviewView.show(true);
+      return;
+    }
+    await vscode.commands.executeCommand(`${ChatViewProvider.viewId}.focus`);
+  }
+
   resolveWebviewView(
     webviewView: vscode.WebviewView,
     _context: vscode.WebviewViewResolveContext,
     _token: vscode.CancellationToken
   ): void {
     log("INFO", "resolveWebviewView called — panel opening");
+    this.webviewView = webviewView;
     this.webview = webviewView.webview;
 
     webviewView.webview.options = {
@@ -407,6 +475,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     );
 
     webviewView.onDidDispose(() => {
+      this.webviewView = undefined;
       this.webview = undefined;
     });
   }
@@ -460,6 +529,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           message.images,
           message.mentions
         );
+        break;
+
+      case "editMessage":
+        log("INFO", "editMessage:", message.messageId);
+        await this.handleEditMessage(
+          message.messageId,
+          message.text,
+          message.images
+        );
+        break;
+
+      case "switchFork":
+        await this.handleSwitchFork(message.anchorId, message.index);
         break;
 
       case "cancelRequest": {
@@ -548,9 +630,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         await this.handleFileSearch(message.query);
         break;
 
-      case "openFile":
+      case "openFile": {
         const doc = await vscode.workspace.openTextDocument(message.filePath);
         await vscode.window.showTextDocument(doc, { preview: true });
+        break;
+      }
+
+      case "openDiff":
+        await this.handleOpenDiff(message.filePath);
         break;
 
       case "listSkills":
@@ -662,29 +749,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  private async handleSendMessage(
-    text: string,
-    images?: string[],
-    _mentions?: string[]
-  ): Promise<void> {
-    const runtimeKey = this.activeKey || this.createDraftRuntime();
-    if (!this.activeKey) {
-      this.activeKey = runtimeKey;
-      if (!this.openTabIds.includes(runtimeKey)) {
-        this.openTabIds.unshift(runtimeKey);
-        this.sendOpenTabs();
-      }
-    }
-    const runtime = this.getActiveRuntime();
-
-    if (!runtime.sessionName && !runtime.sessionId && !isSlashCommand(text)) {
-      runtime.sessionName = sessionNameFromText(text);
-    }
-
-    if (!runtime.bridge || runtime.bridge.status === "stopped") {
-      await this.startBridge(runtimeKey, runtime);
-    }
-
+  private resolveMessageForCli(text: string): {
+    displayText: string;
+    resolvedText: string;
+  } {
     const { displayText, cliText } = resolveSlashCommand(text);
     const workspacePath = this.getWorkspacePath();
     let resolvedText = cliText;
@@ -705,6 +773,198 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       }
     }
 
+    return { displayText, resolvedText };
+  }
+
+  /**
+   * Rewind the conversation to an earlier message (Cursor-style edit-and-continue).
+   *
+   * Rather than surgically forking the CLI's internal transcript files (an
+   * undocumented, version-fragile format that even the built-in /rewind mishandles),
+   * we own the history ourselves: editing a message truncates everything from it
+   * onward, starts a fresh CLI session, and seeds that session with the prior turns
+   * rendered as context — then sends the edited message. This uses only documented
+   * primitives (spawn + send), so it can't break on a CLI update.
+   */
+  private async handleEditMessage(
+    messageId: string,
+    text: string,
+    images?: string[]
+  ): Promise<void> {
+    if (!this.activeKey) {
+      return;
+    }
+
+    const runtime = this.getActiveRuntime();
+    const messageIndex = runtime.messages.findIndex((m) => m.id === messageId);
+    if (messageIndex < 0 || runtime.messages[messageIndex].role !== "user") {
+      return;
+    }
+
+    // The shared prefix stays; the rest is the branch we're leaving — preserved as
+    // a fork version so the user can switch back to it with the ‹ › control.
+    const anchorId =
+      messageIndex > 0
+        ? runtime.messages[messageIndex - 1].id
+        : ROOT_FORK_ANCHOR;
+    const priorMessages = runtime.messages.slice(0, messageIndex);
+    const leavingTail = runtime.messages.slice(messageIndex);
+
+    if (!runtime.forks) {
+      runtime.forks = {};
+    }
+    let group = runtime.forks[anchorId];
+    if (!group) {
+      // First edit here: capture the existing branch as version 0.
+      group = {
+        versions: [{ sessionId: runtime.sessionId, tail: leavingTail }],
+        activeIndex: 0,
+      };
+      runtime.forks[anchorId] = group;
+    } else {
+      // Sync the branch we're leaving back into its slot before forking again.
+      group.versions[group.activeIndex] = {
+        sessionId: runtime.sessionId,
+        tail: leavingTail,
+      };
+    }
+    // The edit is a new version; its session id is captured when we later leave it.
+    group.versions.push({ sessionId: undefined, tail: [] });
+    group.activeIndex = group.versions.length - 1;
+
+    this.stopRuntimeBridge(this.activeKey, runtime);
+
+    // Rewind onto a fresh session; the fork registry rides along on the runtime.
+    this.resetRuntimeToFreshSession(runtime);
+    runtime.messages = [...priorMessages];
+    runtime.contextSummarized = false;
+    runtime.streamingMessageId = null;
+    runtime.currentStreamText = "";
+
+    this.postMessage({ type: "streamEnd" });
+    this.sendOpenTabs();
+    this.sendState();
+
+    await this.handleSendMessage(text, images, undefined, priorMessages);
+  }
+
+  private async handleSwitchFork(
+    anchorId: string,
+    index: number
+  ): Promise<void> {
+    if (!this.activeKey) {
+      return;
+    }
+    const runtime = this.getActiveRuntime();
+    const group = runtime.forks?.[anchorId];
+    if (
+      !group ||
+      index < 0 ||
+      index >= group.versions.length ||
+      index === group.activeIndex ||
+      runtime.streamingMessageId
+    ) {
+      return;
+    }
+
+    // Fork point: right after the anchor message (or the very start).
+    let forkPoint = 0;
+    if (anchorId !== ROOT_FORK_ANCHOR) {
+      const anchorIdx = runtime.messages.findIndex((m) => m.id === anchorId);
+      if (anchorIdx < 0) {
+        return;
+      }
+      forkPoint = anchorIdx + 1;
+    }
+    const prefix = runtime.messages.slice(0, forkPoint);
+
+    // Save the branch we're leaving (it may have grown), then adopt the target.
+    group.versions[group.activeIndex] = {
+      sessionId: runtime.sessionId,
+      tail: runtime.messages.slice(forkPoint),
+    };
+    group.activeIndex = index;
+    const target = group.versions[index];
+
+    this.stopRuntimeBridge(this.activeKey, runtime);
+    this.rekeyRuntime(runtime, target.sessionId);
+    runtime.messages = [...prefix, ...target.tail];
+    runtime.streamingMessageId = null;
+    runtime.currentStreamText = "";
+
+    this.postMessage({ type: "streamEnd" });
+    this.sendOpenTabs();
+    this.sendState();
+  }
+
+  /**
+   * Detach the active runtime from its CLI session id and re-key it as a fresh
+   * draft, preserving its in-memory messages. The next startBridge creates a new
+   * session and the "ready" handler migrates the draft key to the real id.
+   */
+  private resetRuntimeToFreshSession(runtime: SessionRuntime): void {
+    this.rekeyRuntime(runtime, undefined);
+  }
+
+  /**
+   * Re-key the active runtime to a different session id (or a fresh draft when
+   * undefined), preserving its in-memory state (messages, fork registry). Used by
+   * edit (fresh session) and fork switching (adopt an existing version's session).
+   */
+  private rekeyRuntime(runtime: SessionRuntime, newSessionId?: string): void {
+    const oldKey = this.activeKey;
+    const newKey = newSessionId || `draft-${generateId()}`;
+
+    runtime.sessionId = newSessionId;
+    runtime.bridge = undefined;
+    runtime.cliStatus = "stopped";
+    if (newSessionId) {
+      delete runtime.draftId;
+    } else {
+      runtime.draftId = newKey;
+    }
+
+    if (newKey !== oldKey) {
+      this.runtimes.delete(oldKey);
+      this.runtimes.set(newKey, runtime);
+      const tabIdx = this.openTabIds.indexOf(oldKey);
+      if (tabIdx >= 0) {
+        this.openTabIds[tabIdx] = newKey;
+      } else {
+        this.openTabIds.unshift(newKey);
+      }
+      if (this.activeKey === oldKey) {
+        this.activeKey = newKey;
+      }
+    }
+  }
+
+  private async handleSendMessage(
+    text: string,
+    images?: string[],
+    _mentions?: string[],
+    seedHistory?: ChatMessage[]
+  ): Promise<void> {
+    const runtimeKey = this.activeKey || this.createDraftRuntime();
+    if (!this.activeKey) {
+      this.activeKey = runtimeKey;
+      if (!this.openTabIds.includes(runtimeKey)) {
+        this.openTabIds.unshift(runtimeKey);
+        this.sendOpenTabs();
+      }
+    }
+    const runtime = this.getActiveRuntime();
+
+    if (!runtime.sessionName && !runtime.sessionId && !isSlashCommand(text)) {
+      runtime.sessionName = sessionNameFromText(text);
+    }
+
+    if (!runtime.bridge || runtime.bridge.status === "stopped") {
+      await this.startBridge(runtimeKey, runtime);
+    }
+
+    const { displayText, resolvedText } = this.resolveMessageForCli(text);
+
     const userMessage: ChatMessage = {
       id: generateId(),
       role: "user",
@@ -717,10 +977,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       this.postMessage({ type: "message", message: userMessage });
     }
 
-    runtime.bridge?.sendMessage(resolvedText, images);
+    const seed =
+      seedHistory && seedHistory.length > 0 ? renderSeedHistory(seedHistory) : "";
+    const outgoingText = seed ? `${seed}\n\n${resolvedText}` : resolvedText;
+    runtime.bridge?.sendMessage(outgoingText, images);
 
     runtime.streamingMessageId = generateId();
     runtime.currentStreamText = "";
+    runtime.currentActivities = [];
     const assistantMessage: ChatMessage = {
       id: runtime.streamingMessageId,
       role: "assistant",
@@ -779,6 +1043,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     bridge: ClaudeBridge
   ): void {
     const isActive = () => this.isActiveKey(runtimeKey);
+    const thisBridge = bridge;
+    // A bridge whose runtime has moved on (e.g. an edit swapped in a new session)
+    // must never mutate that runtime — its late exit/stream events would otherwise
+    // corrupt the live turn (clearing streamingMessageId, swallowing the reply).
+    const isStale = () => runtime.bridge !== thisBridge;
 
     bridge.on("slashCommands", (commands: string[]) => {
       this.slashCommands = commands;
@@ -803,6 +1072,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     });
 
     bridge.on("status", (status: string) => {
+      if (isStale()) {
+        return;
+      }
       log("INFO", "CLI status:", status, "session:", runtimeKey);
       runtime.cliStatus = status as ExtensionState["cliStatus"];
 
@@ -811,6 +1083,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         if (isDraftKey(runtimeKey)) {
           this.migrateDraftToSession(runtimeKey, newSessionId, runtime);
           runtimeKey = newSessionId;
+          this.sendOpenTabs();
         } else if (!runtime.sessionId) {
           runtime.sessionId = newSessionId;
           if (!this.openTabIds.includes(newSessionId)) {
@@ -839,12 +1112,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     });
 
     bridge.on("exit", () => {
+      if (isStale()) {
+        return;
+      }
       if (runtime.streamingMessageId) {
         this.finalizeStreamingMessage(runtimeKey, runtime, isActive());
       }
     });
 
     bridge.on("textDelta", (text: string) => {
+      if (isStale()) {
+        return;
+      }
       runtime.currentStreamText += text;
       if (runtime.streamingMessageId) {
         const msg = runtime.messages.find((m) => m.id === runtime.streamingMessageId);
@@ -862,6 +1141,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     });
 
     bridge.on("assistantText", (text: string) => {
+      if (isStale()) {
+        return;
+      }
       log("INFO", "assistantText received, length:", text.length);
       if (runtime.streamingMessageId && !runtime.currentStreamText) {
         runtime.currentStreamText = text;
@@ -878,6 +1160,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     });
 
     bridge.on("result", (event: ClaudeEvent) => {
+      if (isStale()) {
+        return;
+      }
       log("INFO", "result received, finalizing message");
       this.finalizeStreamingMessage(runtimeKey, runtime, isActive());
       if (event.total_cost_usd !== undefined) {
@@ -902,6 +1187,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     });
 
     bridge.on("activity", (activity: ActivityEvent) => {
+      this.appendActivity(runtime, activity);
       if (isActive()) {
         this.postMessage({ type: "activity", activity });
       }
@@ -912,6 +1198,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     });
 
     bridge.on("error", (err: string) => {
+      if (isStale()) {
+        return;
+      }
       log("ERROR", "CLI error:", err);
       if (runtime.streamingMessageId) {
         this.finalizeStreamingMessage(runtimeKey, runtime, isActive());
@@ -993,6 +1282,51 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     return writeTools.includes(name);
   }
 
+  private appendActivity(runtime: SessionRuntime, e: ActivityEvent): void {
+    if (!runtime.currentActivities) {
+      runtime.currentActivities = [];
+    }
+    const acts = runtime.currentActivities;
+    if (e.type === "tool_result") {
+      return;
+    }
+    if (e.type === "thinking" || e.type === "thinking_delta") {
+      const last = acts[acts.length - 1];
+      if (!last || (last.type !== "thinking" && last.type !== "thinking_delta")) {
+        acts.push({ type: "thinking", text: "" });
+      }
+      return;
+    }
+    if (e.type === "tool_use") {
+      const input = e.toolInput || {};
+      const hasInput = Object.keys(input).length > 0;
+      if (hasInput) {
+        // Fill the placeholder emitted at content_block_start (empty input).
+        const placeholder = acts.find(
+          (a) =>
+            a.type === "tool_use" &&
+            a.toolName === e.toolName &&
+            Object.keys(a.toolInput || {}).length === 0
+        );
+        if (placeholder && placeholder.type === "tool_use") {
+          placeholder.toolInput = input;
+          return;
+        }
+        // Skip exact duplicates (assistant event re-emits completed tool calls).
+        const dup = acts.find(
+          (a) =>
+            a.type === "tool_use" &&
+            a.toolName === e.toolName &&
+            JSON.stringify(a.toolInput) === JSON.stringify(input)
+        );
+        if (dup) {
+          return;
+        }
+      }
+      acts.push({ type: "tool_use", toolName: e.toolName, toolInput: input });
+    }
+  }
+
   private finalizeStreamingMessage(
     runtimeKey: string,
     runtime: SessionRuntime,
@@ -1006,7 +1340,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (msg) {
       msg.isStreaming = false;
       msg.content = runtime.currentStreamText;
+      if (runtime.currentActivities.length > 0) {
+        msg.activities = runtime.currentActivities;
+      }
     }
+    runtime.currentActivities = [];
 
     const lastUserMessage = [...runtime.messages]
       .reverse()
@@ -1062,6 +1400,48 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
+  /**
+   * Open a file in VS Code's native diff editor (HEAD ↔ working tree), so the
+   * user sees exactly what changed — git-diff style. Falls back to opening the
+   * file if git/diff isn't available.
+   */
+  private async handleOpenDiff(filePath: string): Promise<void> {
+    const ws = this.getWorkspacePath();
+    const absPath = path.isAbsolute(filePath)
+      ? filePath
+      : ws
+      ? path.join(ws, filePath)
+      : filePath;
+    const fileUri = vscode.Uri.file(absPath);
+    const fileName = path.basename(absPath);
+    try {
+      const gitExt = vscode.extensions.getExtension("vscode.git");
+      if (gitExt && !gitExt.isActive) {
+        await gitExt.activate();
+      }
+      // The built-in Git extension serves HEAD content via the `git:` scheme.
+      const headUri = fileUri.with({
+        scheme: "git",
+        query: JSON.stringify({ path: fileUri.fsPath, ref: "HEAD" }),
+      });
+      await vscode.commands.executeCommand(
+        "vscode.diff",
+        headUri,
+        fileUri,
+        `${fileName} (HEAD ↔ Working Tree)`,
+        { preview: true }
+      );
+    } catch (err) {
+      log("WARN", "openDiff failed; opening file instead:", String(err));
+      try {
+        const doc = await vscode.workspace.openTextDocument(fileUri);
+        await vscode.window.showTextDocument(doc, { preview: true });
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+
   private getWorkspacePath(): string | undefined {
     return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
   }
@@ -1077,6 +1457,41 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.webview?.postMessage(message);
   }
 
+  /** Attach fork-switcher metadata to the active version's fork-point messages. */
+  private decorateForks(runtime: SessionRuntime): ChatMessage[] {
+    const forks = runtime.forks;
+    if (!forks) {
+      return runtime.messages;
+    }
+    const result = runtime.messages.slice();
+    for (const anchorId of Object.keys(forks)) {
+      const group = forks[anchorId];
+      if (group.versions.length < 2) {
+        continue;
+      }
+      let pointIdx = -1;
+      if (anchorId === ROOT_FORK_ANCHOR) {
+        pointIdx = 0;
+      } else {
+        const anchorIdx = result.findIndex((m) => m.id === anchorId);
+        if (anchorIdx >= 0) {
+          pointIdx = anchorIdx + 1;
+        }
+      }
+      if (pointIdx >= 0 && pointIdx < result.length) {
+        result[pointIdx] = {
+          ...result[pointIdx],
+          forkInfo: {
+            anchorId,
+            index: group.activeIndex,
+            total: group.versions.length,
+          },
+        };
+      }
+    }
+    return result;
+  }
+
   private sendState(): void {
     const runtime = this.getActiveRuntime();
     this.postMessage({
@@ -1085,7 +1500,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         mode: this.mode,
         model: this.model,
         effort: this.effort,
-        messages: runtime.messages,
+        messages: this.decorateForks(runtime),
         cliStatus: runtime.bridge?.status || runtime.cliStatus || "stopped",
         pendingDiffs: this.diffManager.getPendingDiffs(),
         sessionId: runtime.sessionId,

@@ -1,7 +1,11 @@
 import { spawn, ChildProcess } from "child_process";
 import { EventEmitter } from "events";
 import * as readline from "readline";
-import type { Mode, EffortLevel } from "../shared/types";
+import type { ContextInfo, Mode, EffortLevel } from "../shared/types";
+import {
+  contextTokensUsed,
+  resolveContextWindow,
+} from "../shared/context-window";
 
 export interface ClaudeEvent {
   type: string;
@@ -26,11 +30,48 @@ const PLAN_MODE_SYSTEM_PROMPT = `You are in PLAN MODE. You must ONLY:
 4. NEVER use Write, Edit, Bash, or any tool that modifies files
 Present your analysis and proposed changes clearly in markdown.`;
 
+function buildContextInfo(
+  usage: Record<string, unknown>,
+  model: string,
+  reportedWindow?: number
+): ContextInfo {
+  const inputTokens =
+    (usage.input_tokens as number) || (usage.inputTokens as number) || 0;
+  const outputTokens =
+    (usage.output_tokens as number) || (usage.outputTokens as number) || 0;
+  const cacheReadTokens =
+    (usage.cache_read_input_tokens as number) ||
+    (usage.cacheReadInputTokens as number) ||
+    0;
+  const cacheCreationTokens =
+    (usage.cache_creation_input_tokens as number) ||
+    (usage.cacheCreationInputTokens as number) ||
+    0;
+
+  const used = contextTokensUsed({
+    inputTokens,
+    cacheReadTokens,
+    cacheCreationTokens,
+  });
+  const contextWindow = resolveContextWindow(model, reportedWindow, used);
+
+  return {
+    inputTokens,
+    outputTokens,
+    cacheReadTokens,
+    cacheCreationTokens,
+    contextWindow,
+    model,
+  };
+}
+
 export class ClaudeBridge extends EventEmitter {
   private proc: ChildProcess | null = null;
   private rl: readline.Interface | null = null;
   private _status: "starting" | "ready" | "busy" | "error" | "stopped" = "stopped";
   private _sessionId: string | undefined;
+  private _lastContextWindow = 200000;
+  private _lastModel = "";
   private cwd: string;
 
   get status() {
@@ -161,6 +202,11 @@ export class ClaudeBridge extends EventEmitter {
       if (event.session_id) {
         this._sessionId = event.session_id as string;
       }
+      const initModel = (event as { model?: string }).model;
+      if (initModel) {
+        this._lastModel = initModel;
+        this._lastContextWindow = resolveContextWindow(initModel);
+      }
       const slashCommands = (event as any).slash_commands;
       if (Array.isArray(slashCommands)) {
         this.emit("slashCommands", slashCommands as string[]);
@@ -184,14 +230,19 @@ export class ClaudeBridge extends EventEmitter {
         const primary = models.find(m => !m.includes("haiku")) || models[0];
         if (primary && modelUsage[primary]) {
           const mu = modelUsage[primary];
-          this.emit("contextUpdate", {
-            inputTokens: mu.inputTokens || 0,
-            outputTokens: mu.outputTokens || 0,
-            cacheReadTokens: mu.cacheReadInputTokens || 0,
-            cacheCreationTokens: mu.cacheCreationInputTokens || 0,
-            contextWindow: mu.contextWindow || 200000,
-            model: primary,
-          });
+          this._lastModel = primary;
+          const ctx = buildContextInfo(
+            {
+              input_tokens: mu.inputTokens,
+              output_tokens: mu.outputTokens,
+              cache_read_input_tokens: mu.cacheReadInputTokens,
+              cache_creation_input_tokens: mu.cacheCreationInputTokens,
+            },
+            primary,
+            mu.contextWindow
+          );
+          this._lastContextWindow = ctx.contextWindow;
+          this.emit("contextUpdate", ctx);
         }
       }
     }
@@ -240,6 +291,25 @@ export class ClaudeBridge extends EventEmitter {
     if (event.type === "stream_event") {
       const ev = (event as any).event;
       const delta = ev?.delta;
+
+      const streamUsage =
+        (ev?.message as { usage?: Record<string, unknown>; model?: string })
+          ?.usage || (ev?.usage as Record<string, unknown> | undefined);
+      if (streamUsage) {
+        const model =
+          (ev?.message as { model?: string })?.model || this._lastModel;
+        if (model) {
+          this._lastModel = model;
+        }
+        const ctx = buildContextInfo(
+          streamUsage,
+          model || this._lastModel || "opus",
+          this._lastContextWindow
+        );
+        this._lastContextWindow = ctx.contextWindow;
+        this.emit("contextUpdate", ctx);
+      }
+
       if (delta?.type === "text_delta" && delta.text) {
         this.emit("textDelta", delta.text);
       }

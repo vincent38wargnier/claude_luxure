@@ -55,6 +55,7 @@ export default function DiffPanel({
               lineCount={lineCount}
               codePreview={diff.diff}
               showActions
+              startExpanded
               onAccept={() => onAccept(diff.filePath)}
               onReject={() => onReject(diff.filePath)}
             />

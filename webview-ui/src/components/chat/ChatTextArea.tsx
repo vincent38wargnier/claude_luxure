@@ -19,6 +19,10 @@ import {
   mergeCliCommands,
   type CliCommand,
 } from "../../../../src/shared/cli-commands";
+import {
+  contextTokensUsed,
+  contextUsedPercent,
+} from "../../../../src/shared/context-window";
 
 interface ChatTextAreaProps {
   mode: Mode;
@@ -164,24 +168,17 @@ function EffortSelector({
 }
 
 function ContextBadge({ context }: { context: ContextInfo }) {
-  const totalTokens =
-    context.inputTokens +
-    context.outputTokens +
-    context.cacheReadTokens +
-    context.cacheCreationTokens;
-  const pct = Math.min(
-    100,
-    Math.round((totalTokens / context.contextWindow) * 100)
-  );
+  const contextUsed = contextTokensUsed(context);
+  const pct = contextUsedPercent(contextUsed, context.contextWindow);
 
   let color = "text-[#4ade80]"; // green
   if (pct >= 80) color = "text-[#f87171]"; // red
   else if (pct >= 50) color = "text-[#fbbf24]"; // amber
 
   const formattedTokens =
-    totalTokens >= 1000
-      ? `${(totalTokens / 1000).toFixed(0)}k`
-      : `${totalTokens}`;
+    contextUsed >= 1000
+      ? `${(contextUsed / 1000).toFixed(0)}k`
+      : `${contextUsed}`;
   const formattedWindow =
     context.contextWindow >= 1000000
       ? `${(context.contextWindow / 1000000).toFixed(0)}M`
@@ -190,7 +187,7 @@ function ContextBadge({ context }: { context: ContextInfo }) {
   return (
     <span
       className={`text-[10px] ${color} opacity-80 tabular-nums cursor-default`}
-      title={`${formattedTokens} / ${formattedWindow} tokens (${context.inputTokens.toLocaleString()} in + ${context.outputTokens.toLocaleString()} out + ${context.cacheReadTokens.toLocaleString()} cache)`}
+      title={`${formattedTokens} / ${formattedWindow} input context (${context.inputTokens.toLocaleString()} new + ${context.cacheReadTokens.toLocaleString()} cache read + ${context.cacheCreationTokens.toLocaleString()} cache write). Output this turn: ${context.outputTokens.toLocaleString()}. Updates during streaming.`}
     >
       {pct}%
     </span>

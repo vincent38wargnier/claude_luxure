@@ -14,11 +14,8 @@
     "Chat"
   ],
   "activationEvents": [
-    "onView:claude-luxure.chatView",
-    "onCommand:claude-luxure.acceptChange",
-    "onCommand:claude-luxure.rejectChange",
-    "onCommand:claude-luxure.acceptAllChanges",
-    "onCommand:claude-luxure.rejectAllChanges"
+    "onStartupFinished",
+    "onCommand:claude-luxure.openChat"
   ],
   "main": "./dist/extension.js",
   "contributes": {
@@ -42,6 +39,14 @@
     },
     "commands": [
       {
+        "command": "claude-luxure.openChat",
+        "title": "Open Claude Luxure",
+        "icon": {
+          "light": "media/icon-button.svg",
+          "dark": "media/icon-button.svg"
+        }
+      },
+      {
         "command": "claude-luxure.acceptChange",
         "title": "Claude Luxure: Accept Change"
       },
@@ -62,7 +67,26 @@
         "title": "Add to Claude Luxure"
       }
     ],
+    "keybindings": [
+      {
+        "command": "claude-luxure.openChat",
+        "key": "ctrl+shift+alt+c",
+        "mac": "cmd+shift+alt+c"
+      }
+    ],
     "menus": {
+      "editor/title": [
+        {
+          "command": "claude-luxure.openChat",
+          "group": "navigation"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "claude-luxure.openChat",
+          "when": "true"
+        }
+      ],
       "explorer/context": [
         {
           "command": "claude-luxure.addToChat",

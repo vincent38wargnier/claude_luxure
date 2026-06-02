@@ -5,43 +5,6 @@ import ChatTextArea from "./ChatTextArea";
 import TabBar from "./TabBar";
 import DiffPanel from "../common/DiffPanel";
 
-function formatToolActivity(activity: ActivityEvent): string {
-  if (activity.type === "tool_use") {
-    const name = activity.toolName;
-    const input = activity.toolInput;
-    if (name === "Read" || name === "read_file") return `Reading ${input.file_path || input.path || "file"}`;
-    if (name === "Write" || name === "write_to_file" || name === "WriteToFile") return `Writing ${input.file_path || input.path || "file"}`;
-    if (name === "Edit" || name === "edit_file" || name === "EditFile") return `Editing ${input.file_path || input.path || "file"}`;
-    if (name === "Bash" || name === "bash") return `Running: ${String(input.command || "").slice(0, 60)}`;
-    if (name === "Grep" || name === "grep") return `Searching for "${String(input.pattern || "").slice(0, 40)}"`;
-    if (name === "Glob" || name === "glob") return `Finding files: ${input.pattern || input.glob_pattern || ""}`;
-    if (name === "LS" || name === "ls") return `Listing ${input.path || input.directory || "."}`;
-    if (name === "View") return `Viewing ${input.file_path || input.path || "file"}`;
-    return `${name}`;
-  }
-  if (activity.type === "thinking" || activity.type === "thinking_delta") return "Thinking...";
-  if (activity.type === "tool_result") return "Processing result...";
-  return "";
-}
-
-function ActivityIndicator({ activities }: { activities: ActivityEvent[] }) {
-  const last = activities[activities.length - 1];
-  if (!last) return null;
-  const label = formatToolActivity(last);
-  if (!label) return null;
-
-  return (
-    <div className="px-4 py-2 flex items-center gap-2 text-[12px] text-vscode-descriptionFg animate-pulse">
-      <div className="flex gap-0.5">
-        <div className="w-1.5 h-1.5 rounded-full bg-[#f59e0b] animate-bounce" style={{ animationDelay: "0ms" }} />
-        <div className="w-1.5 h-1.5 rounded-full bg-[#f59e0b] animate-bounce" style={{ animationDelay: "150ms" }} />
-        <div className="w-1.5 h-1.5 rounded-full bg-[#f59e0b] animate-bounce" style={{ animationDelay: "300ms" }} />
-      </div>
-      <span className="truncate opacity-70">{label}</span>
-    </div>
-  );
-}
-
 interface ChatViewProps {
   messages: ChatMessage[];
   mode: Mode;
@@ -80,6 +43,8 @@ interface ChatViewProps {
   onAcceptAll: () => void;
   onRejectAll: () => void;
   onOpenSkills?: () => void;
+  onEditMessage?: (messageId: string, text: string) => void;
+  onSwitchFork?: (anchorId: string, index: number) => void;
 }
 
 export default function ChatView({
@@ -120,17 +85,75 @@ export default function ChatView({
   onAcceptAll,
   onRejectAll,
   onOpenSkills,
+  onEditMessage,
+  onSwitchFork,
 }: ChatViewProps) {
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const scrollContainerRef = useRef<HTMLDivElement>(null);
+  const stickToBottomRef = useRef(true);
+  const prevMsgCountRef = useRef(messages.length);
   const [showReview, setShowReview] = useState(false);
+  const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
+
+  const handleScroll = useCallback(() => {
+    const el = scrollContainerRef.current;
+    if (!el) return;
+    // Considered "stuck" to the bottom when within ~80px of the end.
+    stickToBottomRef.current =
+      el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+  }, []);
 
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    const grew = messages.length > prevMsgCountRef.current;
+    const lastMsg = messages[messages.length - 1];
+    prevMsgCountRef.current = messages.length;
+
+    // Jump down when the user just sent a message; otherwise only follow new
+    // output if they're already near the bottom — don't yank them away from
+    // something they scrolled up to read.
+    if (grew && lastMsg?.role === "user") {
+      stickToBottomRef.current = true;
+      messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+      return;
+    }
+    if (stickToBottomRef.current) {
+      messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    }
   }, [messages, streamingText]);
+
+  // Switching conversations starts pinned to the latest message.
+  useEffect(() => {
+    stickToBottomRef.current = true;
+    messagesEndRef.current?.scrollIntoView({ behavior: "auto" });
+  }, [activeTabId]);
 
   const handleReview = useCallback(() => {
     setShowReview((prev) => !prev);
   }, []);
+
+  const handleStartEdit = useCallback((messageId: string) => {
+    if (!isStreaming) {
+      setEditingMessageId(messageId);
+    }
+  }, [isStreaming]);
+
+  const handleCancelEdit = useCallback(() => {
+    setEditingMessageId(null);
+  }, []);
+
+  const handleSubmitEdit = useCallback(
+    (messageId: string, text: string) => {
+      setEditingMessageId(null);
+      onEditMessage?.(messageId, text);
+    },
+    [onEditMessage]
+  );
+
+  useEffect(() => {
+    if (isStreaming) {
+      setEditingMessageId(null);
+    }
+  }, [isStreaming]);
 
   return (
     <div className="flex flex-col h-full">
@@ -147,7 +170,11 @@ export default function ChatView({
       />
 
       {/* Messages area */}
-      <div className="flex-1 overflow-y-auto py-2 space-y-1">
+      <div
+        ref={scrollContainerRef}
+        onScroll={handleScroll}
+        className="flex-1 overflow-y-auto py-2 space-y-1"
+      >
         {messages.length === 0 && !isStreaming && (
           <div className="flex items-center justify-center h-full">
             <div className="text-center space-y-3 opacity-40">
@@ -173,13 +200,22 @@ export default function ChatView({
               key={msg.id}
               message={msg}
               streamingContent={isLastAssistant ? streamingText : undefined}
+              liveActivities={
+                isLastAssistant && activities.length > 0 ? activities : undefined
+              }
+              isEditing={editingMessageId === msg.id}
+              canEdit={msg.role === "user" && !isStreaming && !editingMessageId}
+              mode={mode}
+              model={model}
+              onStartEdit={() => handleStartEdit(msg.id)}
+              onSubmitEdit={(text) => handleSubmitEdit(msg.id, text)}
+              onCancelEdit={handleCancelEdit}
+              onModeChange={onModeChange}
+              onModelChange={onModelChange}
+              onSwitchFork={onSwitchFork}
             />
           );
         })}
-
-        {isStreaming && activities.length > 0 && !streamingText && (
-          <ActivityIndicator activities={activities} />
-        )}
 
         {contextSummarized && !isStreaming && messages.length > 0 && (
           <div className="px-4 py-3 flex items-center gap-3 select-none">

@@ -44,12 +44,18 @@ export default function App() {
     const msg = event.data as ExtensionMessage;
 
     switch (msg.type) {
-      case "state":
+      case "state": {
+        // Only reset the live activity buffer when switching tabs — clearing it on
+        // every state update would wipe the in-progress feed mid-stream.
+        const tabChanged = activeTabRef.current !== msg.state.activeTabId;
         activeTabRef.current = msg.state.activeTabId;
         setState(msg.state);
         setLiveStreamingText(msg.state.streamingText || "");
-        setActivities([]);
+        if (tabChanged) {
+          setActivities([]);
+        }
         break;
+      }
 
       case "message":
         setState((prev) => ({
@@ -73,7 +79,7 @@ export default function App() {
         break;
 
       case "activity":
-        setActivities((prev) => [...prev.slice(-20), msg.activity]);
+        setActivities((prev) => [...prev.slice(-60), msg.activity]);
         break;
 
       case "error":
@@ -183,6 +189,14 @@ export default function App() {
     },
     []
   );
+
+  const handleEditMessage = useCallback((messageId: string, text: string) => {
+    vscode.postMessage({ type: "editMessage", messageId, text });
+  }, []);
+
+  const handleSwitchFork = useCallback((anchorId: string, index: number) => {
+    vscode.postMessage({ type: "switchFork", anchorId, index });
+  }, []);
 
   const handleCancel = useCallback(() => {
     vscode.postMessage({ type: "cancelRequest" });
@@ -334,6 +348,8 @@ export default function App() {
         onAcceptAll={handleAcceptAll}
         onRejectAll={handleRejectAll}
         onOpenSkills={() => setSkillsOpen(true)}
+        onEditMessage={handleEditMessage}
+        onSwitchFork={handleSwitchFork}
       />
     </div>
   );

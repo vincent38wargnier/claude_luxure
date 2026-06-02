@@ -12,6 +12,24 @@ export function activate(context: vscode.ExtensionContext) {
 
   const provider = new ChatViewProvider(context, outputChannel);
 
+  const openChat = async () => {
+    await provider.reveal();
+  };
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("claude-luxure.openChat", openChat)
+  );
+
+  const statusBar = vscode.window.createStatusBarItem(
+    vscode.StatusBarAlignment.Right,
+    50
+  );
+  statusBar.command = "claude-luxure.openChat";
+  statusBar.text = "$(comment-discussion) Claude Luxure";
+  statusBar.tooltip = "Open Claude Luxure chat";
+  statusBar.show();
+  context.subscriptions.push(statusBar);
+
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider(
       ChatViewProvider.viewId,
@@ -76,6 +94,7 @@ export function activate(context: vscode.ExtensionContext) {
         relativePath = filePath.slice(workspacePath.length + 1);
       }
 
+      await openChat();
       provider.addFileToChat(relativePath);
       log("INFO", "addToChat:", relativePath);
     })

@@ -18,6 +18,15 @@ export interface ChatMessage {
   isStreaming?: boolean;
   diff?: DiffInfo;
   cost?: CostInfo;
+  activities?: ActivityEvent[];
+  forkInfo?: ForkInfo;
+}
+
+/** Marks a user message that is a fork point with multiple edited versions. */
+export interface ForkInfo {
+  anchorId: string;
+  index: number;
+  total: number;
 }
 
 export interface DiffInfo {
@@ -80,6 +89,8 @@ export interface SkillInfo {
 
 export type WebviewMessage =
   | { type: "sendMessage"; text: string; images?: string[]; mentions?: string[] }
+  | { type: "editMessage"; messageId: string; text: string; images?: string[] }
+  | { type: "switchFork"; anchorId: string; index: number }
   | { type: "cancelRequest" }
   | { type: "mode"; mode: Mode }
   | { type: "changeModel"; model: string }
@@ -94,6 +105,7 @@ export type WebviewMessage =
   | { type: "rejectAllChanges" }
   | { type: "searchFiles"; query: string }
   | { type: "openFile"; filePath: string }
+  | { type: "openDiff"; filePath: string }
   | { type: "ready" }
   | { type: "listSkills" }
   | { type: "readSkill"; skillId: string }

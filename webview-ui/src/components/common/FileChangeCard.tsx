@@ -2,12 +2,16 @@ import { useState } from "react";
 import { ChevronDown, ChevronRight, FileText, Check, X } from "lucide-react";
 import vscode from "../../vscode";
 
+const COLLAPSED_PREVIEW_LINES = 3;
+
 interface FileChangeCardProps {
   filePath: string;
   lineCount?: number;
+  removedCount?: number;
   codePreview?: string;
   language?: string;
   showActions?: boolean;
+  startExpanded?: boolean;
   onAccept?: () => void;
   onReject?: () => void;
 }
@@ -56,19 +60,24 @@ function getIconColor(filePath: string): string {
 export default function FileChangeCard({
   filePath,
   lineCount,
+  removedCount,
   codePreview,
   language,
   showActions,
+  startExpanded,
   onAccept,
   onReject,
 }: FileChangeCardProps) {
-  const [expanded, setExpanded] = useState(true);
+  const [expanded, setExpanded] = useState(startExpanded ?? false);
   const fileName = filePath.split("/").pop() || filePath;
   const icon = getFileIcon(filePath);
   const iconColor = getIconColor(filePath);
+  const previewLines = codePreview ? codePreview.split("\n") : [];
+  const hiddenLines = previewLines.length - COLLAPSED_PREVIEW_LINES;
+  const canExpand = !expanded && hiddenLines > 0;
 
-  const openFile = () => {
-    vscode.postMessage({ type: "openFile", filePath });
+  const openInDiff = () => {
+    vscode.postMessage({ type: "openDiff", filePath });
   };
 
   return (
@@ -98,16 +107,22 @@ export default function FileChangeCard({
           className="text-xs text-vscode-fg hover:text-vscode-linkFg cursor-pointer truncate"
           onClick={(e) => {
             e.stopPropagation();
-            openFile();
+            openInDiff();
           }}
+          title="Open diff (HEAD ↔ Working Tree)"
         >
           {fileName}
         </span>
 
-        {/* Line count badge */}
+        {/* Line count badges */}
         {lineCount !== undefined && lineCount > 0 && (
           <span className="text-[10px] text-[#4ade80] font-medium">
             +{lineCount}
+          </span>
+        )}
+        {removedCount !== undefined && removedCount > 0 && (
+          <span className="text-[10px] text-[#f87171] font-medium">
+            -{removedCount}
           </span>
         )}
 
@@ -141,14 +156,32 @@ export default function FileChangeCard({
         )}
       </div>
 
-      {/* Code preview */}
-      {expanded && codePreview && (
+      {/* Code preview — short preview when collapsed, full when expanded */}
+      {codePreview && (
         <div className="border-t border-[rgba(255,255,255,0.04)]">
-          <pre className="text-[11px] leading-[1.5] px-3 py-2 overflow-x-auto font-[var(--vscode-editor-font-family)] bg-[rgba(0,0,0,0.15)]">
-            {codePreview.split("\n").map((line, i) => (
+          <pre
+            className={`text-[11px] leading-[1.5] px-3 py-2 overflow-x-auto font-[var(--vscode-editor-font-family)] bg-[rgba(0,0,0,0.15)] ${
+              canExpand ? "cursor-pointer" : ""
+            }`}
+            onClick={canExpand ? () => setExpanded(true) : undefined}
+            title={canExpand ? "Click to expand" : undefined}
+          >
+            {(expanded
+              ? previewLines
+              : previewLines.slice(0, COLLAPSED_PREVIEW_LINES)
+            ).map((line, i) => (
               <CodeLine key={i} line={line} />
             ))}
           </pre>
+          {canExpand && (
+            <button
+              type="button"
+              onClick={() => setExpanded(true)}
+              className="w-full text-left px-3 py-1 text-[10px] text-vscode-descriptionFg hover:text-vscode-fg hover:bg-[rgba(255,255,255,0.03)] border-t border-[rgba(255,255,255,0.04)]"
+            >
+              Show {hiddenLines} more line{hiddenLines === 1 ? "" : "s"}
+            </button>
+          )}
         </div>
       )}
     </div>

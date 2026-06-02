@@ -53,15 +53,18 @@ npm run build
 
 Then press **F5** in VS Code to launch the Extension Development Host.
 
-### From VSIX
+### From VSIX (use in any project)
 ```bash
 npm run package
 code --install-extension claude-luxure-0.1.0.vsix
 ```
 
+After installing once, the extension is available in **every** VS Code window and workspace — not only when you press F5 from this repo.
+
 ## Usage
 
-1. Open the **Claude Luxure** panel from the activity bar (left sidebar)
+1. Click the **Claude Luxure** icon in the **editor title bar** (top-right of any file tab), or the **Claude Luxure** entry in the status bar (bottom-right), or run **Cmd+Shift+P** → **Open Claude Luxure**
+2. Alternatively, open the **Claude Luxure** panel from the activity bar (left sidebar)
 2. Type a message or drag files into the chat
 3. Toggle between Agent and Plan mode using the dropdown
 4. Review diffs with Accept/Reject when Claude makes changes

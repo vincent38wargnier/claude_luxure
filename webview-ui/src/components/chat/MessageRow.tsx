@@ -1,13 +1,26 @@
 import { useMemo } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import type { ChatMessage } from "../../types";
+import type { ChatMessage, Mode, ActivityEvent } from "../../types";
 import Thumbnails from "../common/Thumbnails";
 import FileChangeCard from "../common/FileChangeCard";
+import EditableUserMessage from "./EditableUserMessage";
+import ActivityFeed from "./ActivityFeed";
 
 interface MessageRowProps {
   message: ChatMessage;
   streamingContent?: string;
+  liveActivities?: ActivityEvent[];
+  isEditing?: boolean;
+  canEdit?: boolean;
+  mode?: Mode;
+  model?: string;
+  onStartEdit?: () => void;
+  onSubmitEdit?: (text: string) => void;
+  onCancelEdit?: () => void;
+  onModeChange?: (mode: Mode) => void;
+  onModelChange?: (model: string) => void;
+  onSwitchFork?: (anchorId: string, index: number) => void;
 }
 
 interface ParsedBlock {
@@ -83,9 +96,27 @@ function parseAssistantContent(content: string): ParsedBlock[] {
   return blocks;
 }
 
+function cleanUserContent(content: string): string {
+  return content
+    .replace(/<file path="[^"]*">\n[\s\S]*?\n<\/file>/g, "")
+    .replace(/\[{"tool_use_id".*$/s, "")
+    .trim();
+}
+
 export default function MessageRow({
   message,
   streamingContent,
+  liveActivities,
+  isEditing,
+  canEdit,
+  mode,
+  model,
+  onStartEdit,
+  onSubmitEdit,
+  onCancelEdit,
+  onModeChange,
+  onModelChange,
+  onSwitchFork,
 }: MessageRowProps) {
   const content = streamingContent ?? message.content;
   const isUser = message.role === "user";
@@ -108,21 +139,80 @@ export default function MessageRow({
   }
 
   if (isUser) {
-    const cleanContent = content
-      .replace(/<file path="[^"]*">\n[\s\S]*?\n<\/file>/g, "")
-      .replace(/\[{"tool_use_id".*$/s, "")
-      .trim();
+    const cleanContent = cleanUserContent(content);
     if (!cleanContent && !message.images?.length) return null;
+
+    if (isEditing && onSubmitEdit && onCancelEdit && onModeChange && onModelChange) {
+      return (
+        <EditableUserMessage
+          initialText={cleanContent}
+          mode={mode || "agent"}
+          model={model}
+          onModeChange={onModeChange}
+          onModelChange={onModelChange}
+          onSubmit={onSubmitEdit}
+          onCancel={onCancelEdit}
+        />
+      );
+    }
+
     return (
       <div className="mx-2">
+        {message.forkInfo && message.forkInfo.total > 1 && (
+          <div className="flex items-center gap-0.5 mb-1 ml-0.5 select-none">
+            <button
+              type="button"
+              onClick={() =>
+                message.forkInfo &&
+                onSwitchFork?.(
+                  message.forkInfo.anchorId,
+                  message.forkInfo.index - 1
+                )
+              }
+              disabled={message.forkInfo.index === 0}
+              className="text-vscode-descriptionFg hover:text-vscode-fg disabled:opacity-25 disabled:cursor-default text-sm leading-none px-1"
+              title="Previous version"
+            >
+              ‹
+            </button>
+            <span className="text-[10px] text-vscode-descriptionFg tabular-nums">
+              {message.forkInfo.index + 1}/{message.forkInfo.total}
+            </span>
+            <button
+              type="button"
+              onClick={() =>
+                message.forkInfo &&
+                onSwitchFork?.(
+                  message.forkInfo.anchorId,
+                  message.forkInfo.index + 1
+                )
+              }
+              disabled={message.forkInfo.index === message.forkInfo.total - 1}
+              className="text-vscode-descriptionFg hover:text-vscode-fg disabled:opacity-25 disabled:cursor-default text-sm leading-none px-1"
+              title="Next version"
+            >
+              ›
+            </button>
+          </div>
+        )}
         {message.images && message.images.length > 0 && (
           <Thumbnails images={message.images} />
         )}
-        <div className="bg-[var(--vscode-input-background)] rounded-lg px-3 py-2.5">
+        <button
+          type="button"
+          onClick={canEdit ? onStartEdit : undefined}
+          disabled={!canEdit}
+          className={`w-full text-left bg-[var(--vscode-input-background)] rounded-lg px-3 py-2.5 transition-colors ${
+            canEdit
+              ? "cursor-pointer hover:ring-1 hover:ring-[rgba(255,255,255,0.1)]"
+              : "cursor-default"
+          }`}
+          title={canEdit ? "Click to edit and resend from here" : undefined}
+        >
           <div className="text-sm text-vscode-fg whitespace-pre-wrap">
             {cleanContent}
           </div>
-        </div>
+        </button>
       </div>
     );
   }
@@ -130,6 +220,10 @@ export default function MessageRow({
   // Assistant message
   return (
     <div className="mx-1 py-1">
+      <ActivityFeed
+        activities={liveActivities ?? message.activities}
+        live={isStreaming}
+      />
       {blocks.map((block, i) => {
         if (block.type === "file" && block.filePath) {
           return (
