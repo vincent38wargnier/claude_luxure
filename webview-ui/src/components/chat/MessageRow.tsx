@@ -1,7 +1,6 @@
-import { useMemo } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import type { ChatMessage, Mode, ActivityEvent } from "../../types";
+import type { ChatMessage, Mode, ActivityEvent, TimelinePart } from "../../types";
 import Thumbnails from "../common/Thumbnails";
 import FileChangeCard from "../common/FileChangeCard";
 import EditableUserMessage from "./EditableUserMessage";
@@ -11,6 +10,7 @@ interface MessageRowProps {
   message: ChatMessage;
   streamingContent?: string;
   liveActivities?: ActivityEvent[];
+  liveTimeline?: TimelinePart[];
   isEditing?: boolean;
   canEdit?: boolean;
   mode?: Mode;
@@ -107,6 +107,7 @@ export default function MessageRow({
   message,
   streamingContent,
   liveActivities,
+  liveTimeline,
   isEditing,
   canEdit,
   mode,
@@ -122,13 +123,6 @@ export default function MessageRow({
   const isUser = message.role === "user";
   const isSystem = message.role === "system";
   const isStreaming = message.isStreaming && streamingContent !== undefined;
-
-  const blocks = useMemo(() => {
-    if (isUser || isSystem) {
-      return [{ type: "text" as const, content }];
-    }
-    return parseAssistantContent(content);
-  }, [content, isUser, isSystem]);
 
   if (isSystem) {
     return (
@@ -217,41 +211,92 @@ export default function MessageRow({
     );
   }
 
-  // Assistant message
+  // Assistant message — render the ordered timeline (prose + activity in the
+  // order they happened) when present; older messages fall back to the feed.
+  const timeline = isStreaming ? liveTimeline : message.timeline;
+
   return (
     <div className="mx-1 py-1">
-      <ActivityFeed
-        activities={liveActivities ?? message.activities}
-        live={isStreaming}
-      />
-      {blocks.map((block, i) => {
-        if (block.type === "file" && block.filePath) {
-          return (
-            <FileChangeCard
-              key={i}
-              filePath={block.filePath}
-              lineCount={block.lineCount}
-              codePreview={block.content}
-            />
-          );
-        }
+      {timeline && timeline.length > 0 ? (
+        <Timeline parts={timeline} isStreaming={!!isStreaming} />
+      ) : (
+        <>
+          <ActivityFeed
+            activities={liveActivities ?? message.activities}
+            live={isStreaming}
+          />
+          <TextContent content={content} />
+          {isStreaming && <StreamingCursor />}
+        </>
+      )}
+    </div>
+  );
+}
 
-        return (
-          <div
+const MARKDOWN_CLASS =
+  "px-1 py-0.5 text-sm prose prose-invert prose-sm max-w-none text-vscode-fg [&_pre]:bg-[rgba(0,0,0,0.2)] [&_pre]:rounded [&_pre]:px-3 [&_pre]:py-2 [&_pre]:text-[11px] [&_pre]:overflow-x-auto [&_pre]:font-[var(--vscode-editor-font-family)] [&_code]:text-[11px] [&_code]:bg-[rgba(0,0,0,0.2)] [&_code]:px-1 [&_code]:py-0.5 [&_code]:rounded [&_a]:text-vscode-linkFg [&_a]:no-underline [&_a:hover]:underline [&_p]:my-1.5 [&_p]:leading-relaxed [&_ul]:my-1 [&_ol]:my-1 [&_li]:my-0 [&_h1]:text-sm [&_h1]:font-semibold [&_h1]:mt-3 [&_h1]:mb-1 [&_h2]:text-sm [&_h2]:font-semibold [&_h2]:mt-2 [&_h2]:mb-1 [&_h3]:text-xs [&_h3]:font-semibold [&_h3]:mt-2 [&_h3]:mb-1 [&_table]:text-xs [&_blockquote]:border-l-2 [&_blockquote]:border-[rgba(255,255,255,0.1)] [&_blockquote]:pl-3 [&_blockquote]:italic [&_blockquote]:opacity-80";
+
+/** Render an assistant prose string: fenced code that looks like a file edit
+ * becomes a card, everything else renders as markdown. */
+function TextContent({ content }: { content: string }) {
+  if (!content.trim()) return null;
+  return (
+    <>
+      {parseAssistantContent(content).map((block, i) =>
+        block.type === "file" && block.filePath ? (
+          <FileChangeCard
             key={i}
-            className="px-1 py-0.5 text-sm prose prose-invert prose-sm max-w-none text-vscode-fg [&_pre]:bg-[rgba(0,0,0,0.2)] [&_pre]:rounded [&_pre]:px-3 [&_pre]:py-2 [&_pre]:text-[11px] [&_pre]:overflow-x-auto [&_pre]:font-[var(--vscode-editor-font-family)] [&_code]:text-[11px] [&_code]:bg-[rgba(0,0,0,0.2)] [&_code]:px-1 [&_code]:py-0.5 [&_code]:rounded [&_a]:text-vscode-linkFg [&_a]:no-underline [&_a:hover]:underline [&_p]:my-1.5 [&_p]:leading-relaxed [&_ul]:my-1 [&_ol]:my-1 [&_li]:my-0 [&_h1]:text-sm [&_h1]:font-semibold [&_h1]:mt-3 [&_h1]:mb-1 [&_h2]:text-sm [&_h2]:font-semibold [&_h2]:mt-2 [&_h2]:mb-1 [&_h3]:text-xs [&_h3]:font-semibold [&_h3]:mt-2 [&_h3]:mb-1 [&_table]:text-xs [&_blockquote]:border-l-2 [&_blockquote]:border-[rgba(255,255,255,0.1)] [&_blockquote]:pl-3 [&_blockquote]:italic [&_blockquote]:opacity-80"
-          >
+            filePath={block.filePath}
+            lineCount={block.lineCount}
+            codePreview={block.content}
+          />
+        ) : (
+          <div key={i} className={MARKDOWN_CLASS}>
             <ReactMarkdown remarkPlugins={[remarkGfm]}>
               {block.content}
             </ReactMarkdown>
           </div>
+        )
+      )}
+    </>
+  );
+}
+
+function StreamingCursor() {
+  return (
+    <span className="inline-block w-[2px] h-[14px] bg-[#D97706] animate-pulse ml-2 align-text-bottom" />
+  );
+}
+
+/** Walk the ordered timeline, rendering each prose run as text and each
+ * activity run as its own feed, so edits appear exactly where they happened. */
+function Timeline({
+  parts,
+  isStreaming,
+}: {
+  parts: TimelinePart[];
+  isStreaming: boolean;
+}) {
+  return (
+    <>
+      {parts.map((part, i) => {
+        const isLast = i === parts.length - 1;
+        if (part.type === "activities") {
+          return (
+            <ActivityFeed
+              key={i}
+              activities={part.activities}
+              live={isStreaming && isLast}
+            />
+          );
+        }
+        return (
+          <div key={i}>
+            <TextContent content={part.text} />
+            {isStreaming && isLast && <StreamingCursor />}
+          </div>
         );
       })}
-
-      {/* Streaming cursor */}
-      {isStreaming && (
-        <span className="inline-block w-[2px] h-[14px] bg-[#D97706] animate-pulse ml-2 align-text-bottom" />
-      )}
-    </div>
+    </>
   );
 }

@@ -15,6 +15,7 @@ import {
   ExtensionMessage,
   ExtensionState,
   Mode,
+  TimelinePart,
   WebviewMessage,
 } from "../shared/types";
 import { extractMentions, resolveFromMention } from "../utils/path-mentions";
@@ -47,7 +48,13 @@ interface SessionRuntime {
   bridge?: ClaudeBridge;
   streamingMessageId: string | null;
   currentStreamText: string;
+  /** Set when a tool/thinking block interrupts text, so the next text delta
+   * starts a fresh paragraph instead of being glued onto the previous one. */
+  pendingParagraphBreak?: boolean;
   currentActivities: ActivityEvent[];
+  /** Ordered prose/activity segments for the in-flight assistant turn; copied
+   * onto the message at finalize so rendering preserves order of appearance. */
+  currentTimeline: TimelinePart[];
   lastContext?: ContextInfo;
   cost?: CostInfo;
   cliStatus: ExtensionState["cliStatus"];
@@ -61,6 +68,7 @@ function createEmptyRuntime(): SessionRuntime {
     streamingMessageId: null,
     currentStreamText: "",
     currentActivities: [],
+    currentTimeline: [],
     cliStatus: "stopped",
   };
 }
@@ -312,6 +320,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     );
   }
 
+  /** Anchor the "Context summarized" divider to the most recent settled
+   * message, so it stays put as new messages are appended below it. */
+  private markCompactBoundary(runtime: SessionRuntime): void {
+    for (let i = runtime.messages.length - 1; i >= 0; i--) {
+      const m = runtime.messages[i];
+      if (m.isStreaming) {
+        continue;
+      }
+      m.compactBoundary = true;
+      return;
+    }
+  }
+
   private persistActiveSession(): void {
     const runtime = this.runtimes.get(this.activeKey);
     if (runtime) {
@@ -426,7 +447,32 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   private sendOpenTabs(): void {
-    this.postMessage({ type: "openTabs", tabIds: this.openTabIds });
+    const names: Record<string, string> = {};
+    for (const id of this.openTabIds) {
+      names[id] = this.tabNameFor(id);
+    }
+    this.postMessage({ type: "openTabs", tabIds: this.openTabIds, names });
+  }
+
+  /** A human-readable tab label: the session's name, else its first real user
+   * message (from memory, or persisted messages for tabs not loaded yet). */
+  private tabNameFor(key: string): string {
+    const rt = this.runtimes.get(key);
+    if (rt?.sessionName) {
+      return rt.sessionName;
+    }
+    const messages =
+      rt?.messages ??
+      this.context.workspaceState.get<ChatMessage[]>(
+        `claude-luxure.messages.${key}`
+      );
+    const firstUser = messages?.find(
+      (m) => m.role === "user" && m.content.trim() && !isSlashCommand(m.content)
+    );
+    if (firstUser) {
+      return sessionNameFromText(firstUser.content);
+    }
+    return "New chat";
   }
 
   private handleNewConversation(): void {
@@ -840,6 +886,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     runtime.contextSummarized = false;
     runtime.streamingMessageId = null;
     runtime.currentStreamText = "";
+    runtime.currentTimeline = [];
 
     this.postMessage({ type: "streamEnd" });
     this.sendOpenTabs();
@@ -891,6 +938,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     runtime.messages = [...prefix, ...target.tail];
     runtime.streamingMessageId = null;
     runtime.currentStreamText = "";
+    runtime.currentTimeline = [];
 
     this.postMessage({ type: "streamEnd" });
     this.sendOpenTabs();
@@ -984,7 +1032,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     runtime.streamingMessageId = generateId();
     runtime.currentStreamText = "";
+    runtime.pendingParagraphBreak = false;
     runtime.currentActivities = [];
+    runtime.currentTimeline = [];
     const assistantMessage: ChatMessage = {
       id: runtime.streamingMessageId,
       role: "assistant",
@@ -1066,6 +1116,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         meta ? `pre_tokens=${meta.pre_tokens} trigger=${meta.trigger}` : ""
       );
       runtime.contextSummarized = true;
+      this.markCompactBoundary(runtime);
       if (isActive()) {
         this.sendState();
       }
@@ -1124,7 +1175,21 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       if (isStale()) {
         return;
       }
+      // The assistant emits its answer as several text blocks split by tool
+      // calls. Re-paragraph them so they don't run together ("...wiring.Handler").
+      if (
+        runtime.pendingParagraphBreak &&
+        runtime.currentStreamText &&
+        !runtime.currentStreamText.endsWith("\n")
+      ) {
+        runtime.currentStreamText += "\n\n";
+        if (isActive()) {
+          this.postMessage({ type: "streamToken", text: "\n\n" });
+        }
+      }
+      runtime.pendingParagraphBreak = false;
       runtime.currentStreamText += text;
+      this.pushTimelineText(runtime, text);
       if (runtime.streamingMessageId) {
         const msg = runtime.messages.find((m) => m.id === runtime.streamingMessageId);
         if (msg) {
@@ -1147,6 +1212,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       log("INFO", "assistantText received, length:", text.length);
       if (runtime.streamingMessageId && !runtime.currentStreamText) {
         runtime.currentStreamText = text;
+        this.pushTimelineText(runtime, text);
         if (runtime.streamingMessageId) {
           const msg = runtime.messages.find((m) => m.id === runtime.streamingMessageId);
           if (msg) {
@@ -1188,6 +1254,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     bridge.on("activity", (activity: ActivityEvent) => {
       this.appendActivity(runtime, activity);
+      this.pushTimelineActivity(runtime, activity);
+      // A tool call or thinking block means the assistant paused its prose; flag
+      // a paragraph break so the next text delta doesn't fuse onto the last one.
+      if (
+        runtime.currentStreamText &&
+        (activity.type === "tool_use" ||
+          activity.type === "thinking" ||
+          activity.type === "thinking_delta")
+      ) {
+        runtime.pendingParagraphBreak = true;
+      }
       if (isActive()) {
         this.postMessage({ type: "activity", activity });
       }
@@ -1286,7 +1363,37 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (!runtime.currentActivities) {
       runtime.currentActivities = [];
     }
-    const acts = runtime.currentActivities;
+    this.coalesceInto(runtime.currentActivities, e);
+  }
+
+  /** Push (and coalesce) an activity onto the timeline's trailing activity run,
+   * starting a new run if the previous segment was prose. */
+  private pushTimelineActivity(runtime: SessionRuntime, e: ActivityEvent): void {
+    const tl = runtime.currentTimeline;
+    let last = tl[tl.length - 1];
+    if (!last || last.type !== "activities") {
+      last = { type: "activities", activities: [] };
+      tl.push(last);
+    }
+    this.coalesceInto(last.activities, e);
+  }
+
+  /** Append streamed prose to the timeline's trailing text run, starting a new
+   * run if the previous segment was activity (so order of appearance is kept). */
+  private pushTimelineText(runtime: SessionRuntime, text: string): void {
+    const tl = runtime.currentTimeline;
+    const last = tl[tl.length - 1];
+    if (last && last.type === "text") {
+      last.text += text;
+    } else {
+      tl.push({ type: "text", text });
+    }
+  }
+
+  /** Coalesce a raw activity event into `acts`: fill tool placeholders, merge
+   * contiguous thinking, drop tool_result. Scoped to whatever array is passed,
+   * so it serves both the flat list and a single timeline run. */
+  private coalesceInto(acts: ActivityEvent[], e: ActivityEvent): void {
     if (e.type === "tool_result") {
       return;
     }
@@ -1343,18 +1450,24 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       if (runtime.currentActivities.length > 0) {
         msg.activities = runtime.currentActivities;
       }
+      if (runtime.currentTimeline.length > 0) {
+        msg.timeline = runtime.currentTimeline;
+      }
     }
     runtime.currentActivities = [];
+    runtime.currentTimeline = [];
 
     const lastUserMessage = [...runtime.messages]
       .reverse()
       .find((m) => m.role === "user");
     if (lastUserMessage && isCompactCommand(lastUserMessage.content)) {
       runtime.contextSummarized = true;
+      this.markCompactBoundary(runtime);
     }
 
     runtime.streamingMessageId = null;
     runtime.currentStreamText = "";
+    runtime.pendingParagraphBreak = false;
 
     if (runtime.bridge?.sessionId && !runtime.sessionId) {
       runtime.sessionId = runtime.bridge.sessionId;

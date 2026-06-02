@@ -1,11 +1,13 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import vscode from "./vscode";
 import ChatView from "./components/chat/ChatView";
+import { coalesceActivities } from "./components/chat/ActivityFeed";
 import SkillsPanel from "./components/skills/SkillsPanel";
 import type {
   ExtensionState,
   ExtensionMessage,
   ActivityEvent,
+  TimelinePart,
   SessionInfo,
   Mode,
   EffortLevel,
@@ -28,7 +30,9 @@ export default function App() {
   const [liveStreamingText, setLiveStreamingText] = useState("");
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
   const [activities, setActivities] = useState<ActivityEvent[]>([]);
+  const [liveTimeline, setLiveTimeline] = useState<TimelinePart[]>([]);
   const [openTabIds, setOpenTabIds] = useState<string[]>([]);
+  const [tabNames, setTabNames] = useState<Record<string, string>>({});
   const [externalFiles, setExternalFiles] = useState<string[]>([]);
   const [skillsOpen, setSkillsOpen] = useState(false);
   const [skills, setSkills] = useState<SkillInfo[]>([]);
@@ -53,6 +57,7 @@ export default function App() {
         setLiveStreamingText(msg.state.streamingText || "");
         if (tabChanged) {
           setActivities([]);
+          setLiveTimeline([]);
         }
         break;
       }
@@ -66,11 +71,22 @@ export default function App() {
 
       case "streamToken":
         setLiveStreamingText((prev) => prev + msg.text);
+        setLiveTimeline((prev) => {
+          const next = prev.slice();
+          const last = next[next.length - 1];
+          if (last && last.type === "text") {
+            next[next.length - 1] = { type: "text", text: last.text + msg.text };
+          } else {
+            next.push({ type: "text", text: msg.text });
+          }
+          return next;
+        });
         break;
 
       case "streamEnd":
         setLiveStreamingText("");
         setActivities([]);
+        setLiveTimeline([]);
         setState((prev) => ({
           ...prev,
           isStreaming: false,
@@ -80,6 +96,24 @@ export default function App() {
 
       case "activity":
         setActivities((prev) => [...prev.slice(-60), msg.activity]);
+        setLiveTimeline((prev) => {
+          const next = prev.slice();
+          const last = next[next.length - 1];
+          if (last && last.type === "activities") {
+            next[next.length - 1] = {
+              type: "activities",
+              // Coalesce on append (merge thinking, fill tool placeholders) so a
+              // long thinking run can't grow the stored array without bound.
+              activities: coalesceActivities([...last.activities, msg.activity]),
+            };
+          } else {
+            next.push({
+              type: "activities",
+              activities: coalesceActivities([msg.activity]),
+            });
+          }
+          return next;
+        });
         break;
 
       case "error":
@@ -114,6 +148,7 @@ export default function App() {
 
       case "openTabs":
         setOpenTabIds(msg.tabIds);
+        setTabNames(msg.names ?? {});
         break;
 
       case "slashCommands":
@@ -319,6 +354,7 @@ export default function App() {
         activeTabId={state.activeTabId}
         sessions={sessions}
         openTabIds={openTabIds}
+        tabNames={tabNames}
         runningSessionIds={state.runningSessionIds || []}
         cliStatus={state.cliStatus}
         workspacePath={state.workspacePath}
@@ -328,6 +364,7 @@ export default function App() {
         streamingText={streamingText}
         isStreaming={isStreaming}
         activities={activities}
+        liveTimeline={isStreaming ? liveTimeline : []}
         cost={state.cost ?? null}
         contextInfo={state.contextInfo ?? null}
         accountEmail={state.accountEmail}

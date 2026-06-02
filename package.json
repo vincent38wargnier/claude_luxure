@@ -118,6 +118,7 @@
     "package": "vsce package"
   },
   "devDependencies": {
+    "@types/diff": "^7.0.2",
     "@types/node": "^20.11.0",
     "@types/vscode": "^1.85.0",
     "concurrently": "^9.1.0",

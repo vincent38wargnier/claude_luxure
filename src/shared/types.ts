@@ -19,8 +19,21 @@ export interface ChatMessage {
   diff?: DiffInfo;
   cost?: CostInfo;
   activities?: ActivityEvent[];
+  /** Ordered interleaving of prose and activity for an assistant turn, so file
+   * edits / tool steps render where they happened relative to the text rather
+   * than lumped above it. Absent on older messages (fall back to activities). */
+  timeline?: TimelinePart[];
   forkInfo?: ForkInfo;
+  /** Marks the message after which the context was summarized (/compact or
+   * auto-compaction). Anchors the "Context summarized" divider in the chat. */
+  compactBoundary?: boolean;
 }
+
+/** One segment of an assistant turn's timeline: either a run of prose, or a
+ * contiguous run of activity (tool calls / thinking) between prose segments. */
+export type TimelinePart =
+  | { type: "text"; text: string }
+  | { type: "activities"; activities: ActivityEvent[] };
 
 /** Marks a user message that is a fork point with multiple edited versions. */
 export interface ForkInfo {
@@ -126,7 +139,7 @@ export type ExtensionMessage =
   | { type: "activity"; activity: ActivityEvent }
   | { type: "accountInfo"; account: AccountInfo }
   | { type: "sessionList"; sessions: SessionInfo[] }
-  | { type: "openTabs"; tabIds: string[] }
+  | { type: "openTabs"; tabIds: string[]; names?: Record<string, string> }
   | { type: "cliStatus"; status: "starting" | "ready" | "busy" | "error" | "stopped" }
   | { type: "slashCommands"; commands: string[] }
   | { type: "skillsList"; skills: SkillInfo[] }

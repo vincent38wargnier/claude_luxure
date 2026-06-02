@@ -4,6 +4,7 @@ import type { SessionInfo } from "../../types";
 interface TabBarProps {
   sessions: SessionInfo[];
   openTabIds: string[];
+  tabNames?: Record<string, string>;
   currentTabId?: string;
   runningSessionIds: string[];
   onSelect: (sessionId: string) => void;
@@ -46,6 +47,7 @@ function groupByTime(sessions: SessionInfo[]): { label: string; items: SessionIn
 export default function TabBar({
   sessions,
   openTabIds,
+  tabNames,
   currentTabId,
   runningSessionIds,
   onSelect,
@@ -87,16 +89,19 @@ export default function TabBar({
 
   const tabs = useMemo(() => {
     return openTabIds.map((id) => {
+      // Prefer the name the extension derived from the conversation; fall back
+      // to the session list, then to a friendly placeholder — never a raw id.
+      const provided = tabNames?.[id];
+      if (provided) {
+        return { id, label: truncate(provided, 22), isDraft: provided === "New chat" };
+      }
       const session = sessionMap.get(id);
       if (session) {
         return { id, label: truncate(session.firstMessage, 22), isDraft: false };
       }
-      if (isDraftTab(id)) {
-        return { id, label: "New chat", isDraft: true };
-      }
-      return { id, label: truncate(id.slice(0, 8), 22), isDraft: false };
+      return { id, label: "New chat", isDraft: isDraftTab(id) };
     });
-  }, [openTabIds, sessionMap]);
+  }, [openTabIds, tabNames, sessionMap]);
 
   const filteredSessions = useMemo(() => {
     if (!search.trim()) return sessions;

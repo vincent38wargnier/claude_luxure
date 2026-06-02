@@ -1,5 +1,5 @@
-import { useRef, useEffect, useState, useCallback } from "react";
-import type { ChatMessage, CostInfo, ContextInfo, ActivityEvent, SessionInfo, Mode, EffortLevel, PendingDiff } from "../../types";
+import { useRef, useEffect, useState, useCallback, Fragment } from "react";
+import type { ChatMessage, CostInfo, ContextInfo, ActivityEvent, TimelinePart, SessionInfo, Mode, EffortLevel, PendingDiff } from "../../types";
 import MessageRow from "./MessageRow";
 import ChatTextArea from "./ChatTextArea";
 import TabBar from "./TabBar";
@@ -14,12 +14,14 @@ interface ChatViewProps {
   activeTabId?: string;
   sessions: SessionInfo[];
   openTabIds: string[];
+  tabNames?: Record<string, string>;
   runningSessionIds: string[];
   cliStatus: string;
   pendingDiffs: PendingDiff[];
   streamingText: string;
   isStreaming: boolean;
   activities: ActivityEvent[];
+  liveTimeline: TimelinePart[];
   cost: CostInfo | null;
   contextInfo: ContextInfo | null;
   accountEmail?: string;
@@ -56,12 +58,14 @@ export default function ChatView({
   activeTabId,
   sessions,
   openTabIds,
+  tabNames,
   runningSessionIds,
   cliStatus,
   pendingDiffs,
   streamingText,
   isStreaming,
   activities,
+  liveTimeline,
   cost,
   contextInfo,
   accountEmail,
@@ -161,6 +165,7 @@ export default function ChatView({
       <TabBar
         sessions={sessions}
         openTabIds={openTabIds}
+        tabNames={tabNames}
         currentTabId={activeTabId || sessionId}
         runningSessionIds={runningSessionIds}
         onSelect={onSwitchSession}
@@ -196,36 +201,35 @@ export default function ChatView({
             isStreaming;
 
           return (
-            <MessageRow
-              key={msg.id}
-              message={msg}
-              streamingContent={isLastAssistant ? streamingText : undefined}
-              liveActivities={
-                isLastAssistant && activities.length > 0 ? activities : undefined
-              }
-              isEditing={editingMessageId === msg.id}
-              canEdit={msg.role === "user" && !isStreaming && !editingMessageId}
-              mode={mode}
-              model={model}
-              onStartEdit={() => handleStartEdit(msg.id)}
-              onSubmitEdit={(text) => handleSubmitEdit(msg.id, text)}
-              onCancelEdit={handleCancelEdit}
-              onModeChange={onModeChange}
-              onModelChange={onModelChange}
-              onSwitchFork={onSwitchFork}
-            />
+            <Fragment key={msg.id}>
+              <MessageRow
+                message={msg}
+                streamingContent={isLastAssistant ? streamingText : undefined}
+                liveActivities={
+                  isLastAssistant && activities.length > 0 ? activities : undefined
+                }
+                liveTimeline={isLastAssistant ? liveTimeline : undefined}
+                isEditing={editingMessageId === msg.id}
+                canEdit={msg.role === "user" && !isStreaming && !editingMessageId}
+                mode={mode}
+                model={model}
+                onStartEdit={() => handleStartEdit(msg.id)}
+                onSubmitEdit={(text) => handleSubmitEdit(msg.id, text)}
+                onCancelEdit={handleCancelEdit}
+                onModeChange={onModeChange}
+                onModelChange={onModelChange}
+                onSwitchFork={onSwitchFork}
+              />
+              {msg.compactBoundary && <SummaryDivider />}
+            </Fragment>
           );
         })}
 
-        {contextSummarized && !isStreaming && messages.length > 0 && (
-          <div className="px-4 py-3 flex items-center gap-3 select-none">
-            <div className="flex-1 h-px bg-[rgba(255,255,255,0.06)]" />
-            <span className="text-[11px] text-vscode-descriptionFg opacity-45 shrink-0">
-              Context summarized
-            </span>
-            <div className="flex-1 h-px bg-[rgba(255,255,255,0.06)]" />
-          </div>
-        )}
+        {/* Fallback for sessions compacted before per-message anchoring existed. */}
+        {contextSummarized &&
+          !messages.some((m) => m.compactBoundary) &&
+          !isStreaming &&
+          messages.length > 0 && <SummaryDivider />}
 
         <div ref={messagesEndRef} />
       </div>
@@ -274,6 +278,18 @@ export default function ChatView({
         onReview={handleReview}
         onOpenSkills={onOpenSkills}
       />
+    </div>
+  );
+}
+
+function SummaryDivider() {
+  return (
+    <div className="px-4 py-3 flex items-center gap-3 select-none">
+      <div className="flex-1 h-px bg-[rgba(255,255,255,0.06)]" />
+      <span className="text-[11px] text-vscode-descriptionFg opacity-45 shrink-0">
+        Context summarized
+      </span>
+      <div className="flex-1 h-px bg-[rgba(255,255,255,0.06)]" />
     </div>
   );
 }
