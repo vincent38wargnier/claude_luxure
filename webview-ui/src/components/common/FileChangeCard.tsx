@@ -1,8 +1,10 @@
 import { useState } from "react";
-import { ChevronDown, ChevronRight, FileText, Check, X } from "lucide-react";
+import { ChevronDown, ChevronRight, Sparkles, Check, X } from "lucide-react";
 import vscode from "../../vscode";
 
-const COLLAPSED_PREVIEW_LINES = 3;
+// Real diffs are condensed (context collapsed around changes), so a small edit
+// fits in full; only genuinely large diffs collapse behind "Show N more lines".
+const COLLAPSED_PREVIEW_LINES = 12;
 
 interface FileChangeCardProps {
   filePath: string;
@@ -14,47 +16,6 @@ interface FileChangeCardProps {
   startExpanded?: boolean;
   onAccept?: () => void;
   onReject?: () => void;
-}
-
-function getFileIcon(filePath: string): string {
-  const ext = filePath.split(".").pop()?.toLowerCase() || "";
-  const icons: Record<string, string> = {
-    ts: "TS",
-    tsx: "TX",
-    js: "JS",
-    jsx: "JX",
-    py: "PY",
-    rs: "RS",
-    go: "GO",
-    css: "CS",
-    html: "HT",
-    json: "{}",
-    md: "MD",
-    yaml: "YM",
-    yml: "YM",
-    toml: "TM",
-    svg: "SV",
-  };
-  return icons[ext] || "F";
-}
-
-function getIconColor(filePath: string): string {
-  const ext = filePath.split(".").pop()?.toLowerCase() || "";
-  const colors: Record<string, string> = {
-    ts: "#3178c6",
-    tsx: "#3178c6",
-    js: "#f0db4f",
-    jsx: "#f0db4f",
-    py: "#3776ab",
-    rs: "#dea584",
-    go: "#00add8",
-    css: "#264de4",
-    html: "#e34c26",
-    json: "#a8a8a8",
-    md: "#ffffff",
-    svg: "#ffb13b",
-  };
-  return colors[ext] || "#888888";
 }
 
 export default function FileChangeCard({
@@ -70,8 +31,6 @@ export default function FileChangeCard({
 }: FileChangeCardProps) {
   const [expanded, setExpanded] = useState(startExpanded ?? false);
   const fileName = filePath.split("/").pop() || filePath;
-  const icon = getFileIcon(filePath);
-  const iconColor = getIconColor(filePath);
   const previewLines = codePreview ? codePreview.split("\n") : [];
   const hiddenLines = previewLines.length - COLLAPSED_PREVIEW_LINES;
   const canExpand = !expanded && hiddenLines > 0;
@@ -81,7 +40,7 @@ export default function FileChangeCard({
   };
 
   return (
-    <div className="my-1.5 rounded-md overflow-hidden border border-[rgba(255,255,255,0.06)] bg-[rgba(255,255,255,0.02)]">
+    <div className="my-1.5 rounded-md overflow-hidden border border-[var(--app-border)] bg-[var(--app-surface)]">
       {/* Header */}
       <div
         className="flex items-center gap-2 px-2.5 py-1.5 cursor-pointer hover:bg-[rgba(255,255,255,0.03)] transition-colors"
@@ -91,16 +50,8 @@ export default function FileChangeCard({
           {expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
         </button>
 
-        {/* File type badge */}
-        <span
-          className="shrink-0 text-[9px] font-bold leading-none px-1 py-0.5 rounded"
-          style={{
-            color: iconColor,
-            backgroundColor: `${iconColor}18`,
-          }}
-        >
-          {icon}
-        </span>
+        {/* AI-edit marker */}
+        <Sparkles size={12} className="shrink-0 text-[#a78bfa]" />
 
         {/* File name */}
         <span
@@ -116,12 +67,12 @@ export default function FileChangeCard({
 
         {/* Line count badges */}
         {lineCount !== undefined && lineCount > 0 && (
-          <span className="text-[10px] text-[#4ade80] font-medium">
+          <span className="text-[10px] text-[#3fb950] font-medium">
             +{lineCount}
           </span>
         )}
         {removedCount !== undefined && removedCount > 0 && (
-          <span className="text-[10px] text-[#f87171] font-medium">
+          <span className="text-[10px] text-[#f85149] font-medium">
             -{removedCount}
           </span>
         )}
@@ -160,11 +111,10 @@ export default function FileChangeCard({
       {codePreview && (
         <div className="border-t border-[rgba(255,255,255,0.04)]">
           <pre
-            className={`text-[11px] leading-[1.5] px-3 py-2 overflow-x-auto font-[var(--vscode-editor-font-family)] bg-[rgba(0,0,0,0.15)] ${
+            className={`text-[11px] leading-[1.5] py-2 overflow-x-auto font-[var(--vscode-editor-font-family)] bg-[var(--app-bg)] ${
               canExpand ? "cursor-pointer" : ""
             }`}
             onClick={canExpand ? () => setExpanded(true) : undefined}
-            title={canExpand ? "Click to expand" : undefined}
           >
             {(expanded
               ? previewLines
@@ -189,23 +139,37 @@ export default function FileChangeCard({
 }
 
 function CodeLine({ line }: { line: string }) {
-  // Diff-aware coloring
-  if (line.startsWith("+") && !line.startsWith("+++")) {
-    return (
-      <div className="text-[#4ade80] bg-[rgba(34,197,94,0.06)]">{line}</div>
-    );
-  }
-  if (line.startsWith("-") && !line.startsWith("---")) {
-    return (
-      <div className="text-[#f87171] bg-[rgba(239,68,68,0.06)]">{line}</div>
-    );
-  }
+  // Cursor-style diff: muted tint + left bar on changed lines, syntax colors
+  // preserved inside, context left uncolored. The "+ "/"- " (or "  ") prefix
+  // keeps every line's content aligned in the same column.
   if (line.startsWith("@@")) {
-    return <div className="text-[#60a5fa]">{line}</div>;
+    return <div className="px-2.5 text-[#6b9fd8] opacity-70">{line}</div>;
   }
-
-  // Simple syntax highlighting for non-diff code
-  return <div>{highlightSyntax(line)}</div>;
+  const isAdd = line.startsWith("+") && !line.startsWith("+++");
+  const isDel = line.startsWith("-") && !line.startsWith("---");
+  if (isAdd) {
+    // Warm olive tint (Cursor), green left bar, syntax colors kept.
+    return (
+      <div className="border-l-2 border-[#5a8a3a] bg-[#3e3b2a] pl-2 pr-2.5">
+        <span className="select-none text-[#7fae5a] opacity-80">+ </span>
+        {highlightSyntax(line.slice(2))}
+      </div>
+    );
+  }
+  if (isDel) {
+    // Lighter maroon tint, muted (not crimson) red bar.
+    return (
+      <div className="border-l-2 border-[#4b1918] bg-[#471b18] pl-2 pr-2.5">
+        <span className="select-none text-[#e0817c] opacity-80">- </span>
+        {highlightSyntax(line.slice(2))}
+      </div>
+    );
+  }
+  return (
+    <div className="border-l-2 border-transparent pl-2 pr-2.5 opacity-90">
+      {highlightSyntax(line)}
+    </div>
+  );
 }
 
 function highlightSyntax(line: string): React.ReactNode {

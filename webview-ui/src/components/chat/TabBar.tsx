@@ -112,7 +112,7 @@ export default function TabBar({
   const groups = useMemo(() => groupByTime(filteredSessions), [filteredSessions]);
 
   return (
-    <div className="flex items-center border-b border-[rgba(255,255,255,0.06)] bg-[rgba(0,0,0,0.15)] min-h-[32px]">
+    <div className="flex items-center border-b border-[rgba(255,255,255,0.08)] bg-[var(--app-bg)] min-h-[32px]">
       <div className="flex-1 flex items-center overflow-x-auto no-scrollbar">
         {tabs.map((tab) => {
           const isCurrent = tab.id === currentTabId;
@@ -123,14 +123,11 @@ export default function TabBar({
               key={tab.id}
               className={`group relative flex items-center gap-1 pl-3 pr-1 py-1.5 text-[11px] whitespace-nowrap border-r border-[rgba(255,255,255,0.04)] transition-colors shrink-0 cursor-pointer ${
                 isCurrent
-                  ? "bg-[var(--vscode-editor-background)] text-vscode-fg"
-                  : "text-vscode-descriptionFg hover:text-vscode-fg hover:bg-[rgba(255,255,255,0.03)]"
+                  ? "bg-[var(--app-surface-2)] text-vscode-fg"
+                  : "text-vscode-descriptionFg hover:text-vscode-fg hover:bg-[rgba(255,255,255,0.04)]"
               }`}
               onClick={() => onSelect(tab.id)}
             >
-              {isCurrent && (
-                <div className="absolute bottom-0 left-0 right-0 h-[2px] bg-[#60a5fa]" />
-              )}
               {running && !isCurrent && (
                 <span
                   className="w-1.5 h-1.5 rounded-full bg-[#f59e0b] shrink-0 animate-pulse"

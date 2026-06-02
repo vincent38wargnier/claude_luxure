@@ -17,7 +17,7 @@ export default function DiffPanel({
   onRejectAll,
 }: DiffPanelProps) {
   return (
-    <div className="border-t border-[rgba(255,255,255,0.06)] bg-[rgba(0,0,0,0.1)]">
+    <div className="border-t border-[var(--app-border)] bg-[var(--app-surface)]">
       {/* Header */}
       <div className="flex items-center justify-between px-3 py-1.5">
         <span className="text-[11px] font-medium text-vscode-fg">

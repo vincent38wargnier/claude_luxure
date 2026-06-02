@@ -4,7 +4,7 @@ import {
   Square,
   Paperclip,
   Image as ImageIcon,
-  ArrowUpCircle,
+  ArrowUp,
   ChevronRight,
 } from "lucide-react";
 import vscode from "../../vscode";
@@ -588,7 +588,7 @@ export default function ChatTextArea({
     (inputValue.trim().length > 0 || selectedImages.length > 0);
 
   return (
-    <div className="border-t border-[rgba(255,255,255,0.06)]">
+    <div className="mx-2 mb-2 rounded-xl border border-[var(--app-border)] bg-[var(--app-surface-2)]">
       {/* Toolbar row */}
       {(isStreaming || pendingDiffCount > 0 || fileCount > 0) && (
         <div className="flex items-center justify-between px-3 py-1 border-b border-[rgba(255,255,255,0.04)] text-[11px]">
@@ -612,7 +612,7 @@ export default function ChatTextArea({
             {pendingDiffCount > 0 && (
               <button
                 onClick={onReview}
-                className="px-2.5 py-0.5 rounded text-[11px] font-medium bg-vscode-buttonBg text-vscode-buttonFg hover:bg-vscode-buttonHover transition-colors"
+                className="px-2.5 py-0.5 rounded text-[11px] font-medium bg-[#313131] text-vscode-fg border border-[var(--app-border)] hover:bg-[#3a3a3a] transition-colors"
               >
                 Review
               </button>
@@ -756,14 +756,14 @@ export default function ChatTextArea({
             <button
               onClick={handleSend}
               disabled={!canSend}
-              className={`p-0.5 transition-colors ${
+              className={`flex items-center justify-center w-6 h-6 rounded-full border border-[var(--app-border)] bg-[var(--app-surface-2)] transition-colors ${
                 canSend
-                  ? "text-vscode-fg hover:text-white"
-                  : "text-vscode-descriptionFg opacity-30"
+                  ? "text-vscode-fg hover:bg-[#3a3a3a]"
+                  : "text-vscode-descriptionFg opacity-40"
               }`}
               title="Send (Enter)"
             >
-              <ArrowUpCircle size={22} strokeWidth={canSend ? 2 : 1.5} />
+              <ArrowUp size={14} strokeWidth={2.5} />
             </button>
           )}
         </div>

@@ -196,7 +196,7 @@ export default function MessageRow({
           type="button"
           onClick={canEdit ? onStartEdit : undefined}
           disabled={!canEdit}
-          className={`w-full text-left bg-[var(--vscode-input-background)] rounded-lg px-3 py-2.5 transition-colors ${
+          className={`w-full text-left bg-[var(--app-surface-2)] rounded-lg px-3 py-2.5 transition-colors ${
             canEdit
               ? "cursor-pointer hover:ring-1 hover:ring-[rgba(255,255,255,0.1)]"
               : "cursor-default"

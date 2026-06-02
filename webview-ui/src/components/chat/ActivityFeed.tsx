@@ -125,7 +125,79 @@ const FILE_EDIT_TOOLS = new Set([
   "apply_diff",
 ]);
 
-/** Build a +/- diff preview and line counts from a file-editing tool_use. */
+type DiffPart = { sign: " " | "+" | "-"; text: string };
+
+/** Line-level LCS diff so a card shows the real change (context kept once, only
+ * changed lines marked) instead of the whole old block then the whole new. */
+function diffLines(oldText: string, newText: string): DiffPart[] {
+  const a = oldText.split("\n");
+  const b = newText.split("\n");
+  const n = a.length;
+  const m = b.length;
+  // LCS is O(n*m); bail to a plain old-then-new dump for huge inputs.
+  if (n * m > 250000) {
+    return [
+      ...a.map((t): DiffPart => ({ sign: "-", text: t })),
+      ...b.map((t): DiffPart => ({ sign: "+", text: t })),
+    ];
+  }
+  const dp = Array.from({ length: n + 1 }, () => new Array(m + 1).fill(0));
+  for (let i = n - 1; i >= 0; i--) {
+    for (let j = m - 1; j >= 0; j--) {
+      dp[i][j] =
+        a[i] === b[j]
+          ? dp[i + 1][j + 1] + 1
+          : Math.max(dp[i + 1][j], dp[i][j + 1]);
+    }
+  }
+  const out: DiffPart[] = [];
+  let i = 0;
+  let j = 0;
+  while (i < n && j < m) {
+    if (a[i] === b[j]) {
+      out.push({ sign: " ", text: a[i] });
+      i++;
+      j++;
+    } else if (dp[i + 1][j] >= dp[i][j + 1]) {
+      out.push({ sign: "-", text: a[i] });
+      i++;
+    } else {
+      out.push({ sign: "+", text: b[j] });
+      j++;
+    }
+  }
+  while (i < n) out.push({ sign: "-", text: a[i++] });
+  while (j < m) out.push({ sign: "+", text: b[j++] });
+  return out;
+}
+
+/** Collapse long runs of unchanged context (keep CTX lines around each change)
+ * so a small edit inside a large block doesn't list dozens of unchanged lines. */
+function condenseDiff(parts: DiffPart[], ctx = 3): DiffPart[] {
+  if (parts.length <= 2 * ctx + 4) return parts;
+  const keep = new Array(parts.length).fill(false);
+  for (let i = 0; i < parts.length; i++) {
+    if (parts[i].sign !== " ") {
+      const lo = Math.max(0, i - ctx);
+      const hi = Math.min(parts.length - 1, i + ctx);
+      for (let j = lo; j <= hi; j++) keep[j] = true;
+    }
+  }
+  const out: DiffPart[] = [];
+  let gap = false;
+  for (let i = 0; i < parts.length; i++) {
+    if (keep[i]) {
+      out.push(parts[i]);
+      gap = false;
+    } else if (!gap) {
+      out.push({ sign: " ", text: "⋯" });
+      gap = true;
+    }
+  }
+  return out;
+}
+
+/** Build a real diff preview and changed-line counts from a file-editing tool_use. */
 function fileEditFrom(a: ActivityEvent): FileEdit | null {
   if (a.type !== "tool_use" || !FILE_EDIT_TOOLS.has(a.toolName)) return null;
   const input = a.toolInput || {};
@@ -137,24 +209,28 @@ function fileEditFrom(a: ActivityEvent): FileEdit | null {
   const lines: string[] = [];
   let added = 0;
   let removed = 0;
-  const push = (text: unknown, sign: "+" | "-") => {
-    for (const line of String(text ?? "").split("\n")) {
-      lines.push(`${sign} ${line}`);
-      if (sign === "+") added++;
-      else removed++;
+  const pushDiff = (oldText: unknown, newText: unknown) => {
+    for (const p of condenseDiff(
+      diffLines(String(oldText ?? ""), String(newText ?? ""))
+    )) {
+      lines.push(`${p.sign} ${p.text}`);
+      if (p.sign === "+") added++;
+      else if (p.sign === "-") removed++;
     }
   };
 
   if (a.toolName === "MultiEdit" && Array.isArray(input.edits)) {
-    for (const ed of input.edits as Array<Record<string, unknown>>) {
-      if (ed.old_string != null) push(ed.old_string, "-");
-      if (ed.new_string != null) push(ed.new_string, "+");
-    }
+    (input.edits as Array<Record<string, unknown>>).forEach((ed, idx) => {
+      if (idx > 0) lines.push("");
+      pushDiff(ed.old_string, ed.new_string);
+    });
   } else if (input.old_string != null || input.new_string != null) {
-    if (input.old_string != null) push(input.old_string, "-");
-    if (input.new_string != null) push(input.new_string, "+");
+    pushDiff(input.old_string, input.new_string);
   } else {
-    push(input.content ?? input.file_text ?? "", "+");
+    for (const line of String(input.content ?? input.file_text ?? "").split("\n")) {
+      lines.push(`+ ${line}`);
+      added++;
+    }
   }
 
   return { filePath, lines, added, removed };
@@ -172,6 +248,7 @@ function buildPreview(lines: string[]): string {
 }
 
 const READ_TOOLS = new Set(["Read", "read_file", "View"]);
+const SEARCH_TOOLS = new Set(["Grep", "grep", "Glob", "glob"]);
 
 interface Todo {
   content: string;
@@ -220,6 +297,7 @@ export default function ActivityFeed({
   const fileEditOrder: string[] = [];
   const steps: Step[] = [];
   const exploredFiles = new Set<string>();
+  let searchCount = 0;
   let todos: Todo[] | null = null;
   for (const a of coalesceActivities(activities || [])) {
     const td = todosFrom(a);
@@ -243,6 +321,7 @@ export default function ActivityFeed({
     }
     const read = readFileTarget(a);
     if (read) exploredFiles.add(read);
+    if (a.type === "tool_use" && SEARCH_TOOLS.has(a.toolName)) searchCount++;
     const st = toStep(a);
     if (st) steps.push(st);
   }
@@ -277,7 +356,7 @@ export default function ActivityFeed({
               </span>
             )}
             <span className="truncate">
-              {stepSummary(steps, exploredFiles.size, !!live)}
+              {stepSummary(steps, exploredFiles.size, searchCount, !!live)}
             </span>
           </button>
 
@@ -330,11 +409,11 @@ function TodoList({ todos }: { todos: Todo[] }) {
   const allDone = done === total;
 
   return (
-    <div className="rounded-md border border-[rgba(255,255,255,0.06)] bg-[rgba(255,255,255,0.02)] overflow-hidden">
+    <div className="rounded-md border border-[var(--app-border)] bg-[var(--app-surface)] overflow-hidden">
       <button
         type="button"
         onClick={() => setOpen((v) => !v)}
-        className="w-full flex items-center gap-2 px-2.5 py-1.5 text-[11px] text-vscode-descriptionFg hover:bg-[rgba(255,255,255,0.03)] transition-colors"
+        className="w-full flex items-center gap-2 px-2.5 py-1.5 text-[11px] text-vscode-descriptionFg hover:bg-[rgba(255,255,255,0.05)] transition-colors"
       >
         <span
           className={`inline-block text-[8px] leading-none opacity-70 transition-transform ${open ? "rotate-90" : ""}`}
@@ -387,7 +466,12 @@ function TodoList({ todos }: { todos: Todo[] }) {
 /** The quiet one-liner for the collapsed steps: the current action while live,
  * "Explored N files" for read-heavy runs, a single action verbatim, else a
  * generic recap. File edits are shown separately as cards. */
-function stepSummary(steps: Step[], exploredCount: number, live: boolean): string {
+function stepSummary(
+  steps: Step[],
+  exploredCount: number,
+  searchCount: number,
+  live: boolean
+): string {
   if (live) {
     if (steps.length > 0) {
       const s = steps[steps.length - 1];
@@ -396,7 +480,14 @@ function stepSummary(steps: Step[], exploredCount: number, live: boolean): strin
     return "Working…";
   }
   if (exploredCount > 0) {
-    return `Explored ${exploredCount} file${exploredCount === 1 ? "" : "s"}`;
+    const bits = [`${exploredCount} file${exploredCount === 1 ? "" : "s"}`];
+    if (searchCount > 0) {
+      bits.push(`${searchCount} search${searchCount === 1 ? "" : "es"}`);
+    }
+    return `Explored ${bits.join(", ")}`;
+  }
+  if (searchCount > 0) {
+    return `Searched ${searchCount} time${searchCount === 1 ? "" : "s"}`;
   }
   if (steps.length === 1) {
     const s = steps[0];
