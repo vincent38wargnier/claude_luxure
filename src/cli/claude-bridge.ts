@@ -224,25 +224,23 @@ export class ClaudeBridge extends EventEmitter {
       this.emit("status", this._status);
       this.emit("result", event);
 
+      // result.modelUsage is CUMULATIVE across every tool-use round-trip in the
+      // turn — each round re-reads the cached context, so the cache-token counts
+      // sum up. Feeding that into the context % overstates live occupancy and
+      // spikes the bar to ~100% at end-of-turn (it snaps back on the next turn
+      // when a fresh stream_event reports the real per-request usage). So use it
+      // ONLY to refresh the model + window denominator for the next turn; the
+      // live context % comes from the stream_event usage handled below.
       const modelUsage = (event as any).modelUsage;
       if (modelUsage && typeof modelUsage === "object") {
         const models = Object.keys(modelUsage);
         const primary = models.find(m => !m.includes("haiku")) || models[0];
         if (primary && modelUsage[primary]) {
-          const mu = modelUsage[primary];
           this._lastModel = primary;
-          const ctx = buildContextInfo(
-            {
-              input_tokens: mu.inputTokens,
-              output_tokens: mu.outputTokens,
-              cache_read_input_tokens: mu.cacheReadInputTokens,
-              cache_creation_input_tokens: mu.cacheCreationInputTokens,
-            },
+          this._lastContextWindow = resolveContextWindow(
             primary,
-            mu.contextWindow
+            modelUsage[primary].contextWindow
           );
-          this._lastContextWindow = ctx.contextWindow;
-          this.emit("contextUpdate", ctx);
         }
       }
     }

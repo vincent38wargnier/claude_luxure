@@ -42,29 +42,64 @@ A VS Code extension that wraps the [Claude Code CLI](https://docs.anthropic.com/
 
 ## Installation
 
-### From Source
+### Quick setup (recommended)
+
 ```bash
 git clone https://github.com/your-org/claude-luxure.git
 cd claude_luxure
+./setup.sh        # installs deps, builds, and symlinks into your editor(s)
+```
+
+Then fully **quit and reopen** your editor — Claude Luxure now loads in **every window**. From then on, editing code only needs **Cmd+Shift+P → "Developer: Reload Window"**. Run `./setup.sh --dev` to also start watch mode so edits auto-rebuild and you skip the manual build. (`npm run setup` does the same thing.)
+
+`setup.sh` is just a wrapper around the manual steps below — use those if you'd rather run them yourself, or need the F5 / VSIX flows.
+
+### Manual build
+
+```bash
 npm install
 cd webview-ui && npm install && cd ..
 npm run build
 ```
 
-Then press **F5** in VS Code to launch the Extension Development Host.
+Then choose how to run it:
 
-### From VSIX (use in any project)
+### Option A — Symlink into your everyday editor (recommended for local use)
+
+This runs the extension in your **normal** VS Code — every window and workspace, just like a published extension — while still loading straight from your source tree. The **Quick setup** script above does this for you; to do it by hand, link the repo into your editor's extensions folder:
+
+```bash
+# from the repo root
+ln -s "$(pwd)" ~/.vscode/extensions/claude-luxure
+```
+
+Then fully **quit and reopen** VS Code. The extension now loads everywhere.
+
+- **Cursor**: link into `~/.cursor/extensions/` instead.
+- **VS Code Insiders**: use `~/.vscode-insiders/extensions/`.
+
+To apply code changes later: rebuild (`npm run build`, or `npm run dev` for watch mode) then **Cmd+Shift+P → "Developer: Reload Window"**. No reinstall — the symlink always points at your latest build.
+
+To remove it: `rm ~/.vscode/extensions/claude-luxure` and reload.
+
+> This is the setup used to develop the app day-to-day: edit → build → reload, all in your real editor.
+
+### Option B — Extension Development Host (F5)
+
+Press **F5** in VS Code with the `claude_luxure` folder open. This opens a **separate** VS Code window with the extension loaded — handy for debugging with breakpoints, but the extension is *not* available in your normal windows.
+
+### Option C — Packaged VSIX
+
 ```bash
 npm run package
 code --install-extension claude-luxure-0.1.0.vsix
 ```
 
-After installing once, the extension is available in **every** VS Code window and workspace — not only when you press F5 from this repo.
+Installs a fixed copy into every VS Code window. Unlike the symlink, you must re-package and re-install to pick up changes.
 
 ## Usage
 
-1. Click the **Claude Luxure** icon in the **editor title bar** (top-right of any file tab), or the **Claude Luxure** entry in the status bar (bottom-right), or run **Cmd+Shift+P** → **Open Claude Luxure**
-2. Alternatively, open the **Claude Luxure** panel from the activity bar (left sidebar)
+1. Open the panel — click the **Claude Luxure** icon in the **editor title bar** (top-right of any file tab), or the status-bar entry (bottom-right), run **Cmd+Shift+P → Open Claude Luxure**, or open it from the activity bar (left sidebar)
 2. Type a message or drag files into the chat
 3. Toggle between Agent and Plan mode using the dropdown
 4. Review diffs with Accept/Reject when Claude makes changes
@@ -90,13 +125,12 @@ Extension Host (Node.js)          Webview (React + Vite)
 ### Quick start
 
 ```bash
-cd claude_luxure
-npm install
-cd webview-ui && npm install && cd ..
-npm run build
+./setup.sh --dev
 ```
 
-Then press **F5** in VS Code (with `claude_luxure` folder open). This launches the **Extension Development Host** — a second VS Code window with the extension loaded.
+This installs everything, symlinks the extension into your editor(s), and starts watch mode. After the first run, fully quit and reopen your editor; from then on you work entirely in your **normal** windows — edit code, then **Cmd+Shift+P → "Developer: Reload Window"** to see changes.
+
+Prefer a separate, breakpoint-debuggable window? Press **F5** with the `claude_luxure` folder open to launch the **Extension Development Host** instead.
 
 ### Hot-reload workflow
 
@@ -123,7 +157,7 @@ To see changes in the Extension Development Host, press **Cmd+Shift+P** > **"Dev
 ### Debugging tips
 
 - **Extension logs**: Output panel > "Claude Luxure" channel
-- **File logs**: `claude-luxure.log` in the extension's `dist/` parent directory
+- **File logs**: `claude-luxure.log`, written one level **above** the extension folder — e.g. `~/.vscode/extensions/claude-luxure.log` for a VSIX install, or the repo's parent directory when running from a symlink/source checkout
 - **Webview DevTools**: In the Extension Development Host, press **Cmd+Shift+P** > **"Developer: Open Webview Developer Tools"**
 
 ## License

@@ -109,6 +109,7 @@
   },
   "scripts": {
     "vscode:prepublish": "npm run build",
+    "setup": "./setup.sh",
     "build": "npm run build:webview && npm run build:ext",
     "build:ext": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --sourcemap",
     "build:webview": "cd webview-ui && npm run build",
