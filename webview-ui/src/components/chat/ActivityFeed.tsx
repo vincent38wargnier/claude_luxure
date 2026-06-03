@@ -2,6 +2,7 @@ import { useState } from "react";
 import { Check } from "lucide-react";
 import type { ActivityEvent } from "../../types";
 import FileChangeCard from "../common/FileChangeCard";
+import McpCallCard, { type McpCall } from "../common/McpCallCard";
 
 interface Step {
   kind: "thinking" | "tool";
@@ -14,17 +15,46 @@ function truncate(value: unknown, max = 80): string {
   return s.length > max ? s.slice(0, max) + "…" : s;
 }
 
+/** Attach a tool_result to the tool_use it belongs to (matched by id) so the
+ * call and its output stay one entry. Multiple result blocks for one call (e.g.
+ * an MCP tool_reference block + a text block) concatenate; a later non-empty
+ * block is never clobbered by an empty one. */
+function attachToolResult(acts: ActivityEvent[], e: ActivityEvent): void {
+  if (e.type !== "tool_result" || !e.toolUseId) return;
+  for (let i = acts.length - 1; i >= 0; i--) {
+    const a = acts[i];
+    if (a.type === "tool_use" && a.toolUseId === e.toolUseId) {
+      if (a.result) {
+        if (e.content) {
+          a.result = {
+            content: a.result.content ? `${a.result.content}\n${e.content}` : e.content,
+            isError: a.result.isError || e.isError,
+          };
+        } else if (e.isError) {
+          a.result = { ...a.result, isError: true };
+        }
+      } else {
+        a.result = { content: e.content, isError: e.isError };
+      }
+      return;
+    }
+  }
+}
+
 /**
  * Collapse the raw activity stream into clean, de-duplicated steps.
  * - thinking / thinking_delta -> a single "Thinking" step per contiguous run
- * - tool_result -> dropped (it's the result of a tool, not a step)
+ * - tool_result -> attached to its tool_use (matched by id), not a step itself
  * - tool_use emitted twice (content_block_start with empty input, then the
  *   completed assistant event) -> merged into one entry with full input
  */
 export function coalesceActivities(events: ActivityEvent[]): ActivityEvent[] {
   const out: ActivityEvent[] = [];
   for (const e of events) {
-    if (e.type === "tool_result") continue;
+    if (e.type === "tool_result") {
+      attachToolResult(out, e);
+      continue;
+    }
     if (e.type === "thinking" || e.type === "thinking_delta") {
       const last = out[out.length - 1];
       if (!last || (last.type !== "thinking" && last.type !== "thinking_delta")) {
@@ -44,6 +74,7 @@ export function coalesceActivities(events: ActivityEvent[]): ActivityEvent[] {
         );
         if (placeholder && placeholder.type === "tool_use") {
           placeholder.toolInput = input;
+          if (e.toolUseId && !placeholder.toolUseId) placeholder.toolUseId = e.toolUseId;
           continue;
         }
         const dup = out.find(
@@ -54,10 +85,27 @@ export function coalesceActivities(events: ActivityEvent[]): ActivityEvent[] {
         );
         if (dup) continue;
       }
-      out.push({ type: "tool_use", toolName: e.toolName, toolInput: input });
+      out.push({
+        type: "tool_use",
+        toolName: e.toolName,
+        toolInput: input,
+        toolUseId: e.toolUseId,
+        result: e.result,
+      });
     }
   }
   return out;
+}
+
+/** Parse an `mcp__server__tool` call into the pieces the card needs. Returns
+ * null for non-MCP tools (native Read/Bash/etc. keep their compact steps). */
+function mcpCallFrom(a: ActivityEvent): McpCall | null {
+  if (a.type !== "tool_use" || !a.toolName.startsWith("mcp__")) return null;
+  const rest = a.toolName.slice("mcp__".length);
+  const sep = rest.indexOf("__");
+  const server = sep >= 0 ? rest.slice(0, sep) : rest;
+  const tool = sep >= 0 ? rest.slice(sep + 2) : "";
+  return { server, tool, input: a.toolInput || {}, result: a.result };
 }
 
 function toStep(a: ActivityEvent): Step | null {
@@ -296,6 +344,7 @@ export default function ActivityFeed({
   const fileEditMap = new Map<string, FileEdit>();
   const fileEditOrder: string[] = [];
   const steps: Step[] = [];
+  const mcpCalls: McpCall[] = [];
   const exploredFiles = new Set<string>();
   let searchCount = 0;
   let todos: Todo[] | null = null;
@@ -303,6 +352,13 @@ export default function ActivityFeed({
     const td = todosFrom(a);
     if (td) {
       todos = td; // keep the latest plan state
+      continue;
+    }
+    // MCP calls become their own expandable request/response cards (like file
+    // edits) rather than a one-line step.
+    const mcp = mcpCallFrom(a);
+    if (mcp) {
+      mcpCalls.push(mcp);
       continue;
     }
     const fe = fileEditFrom(a);
@@ -327,7 +383,13 @@ export default function ActivityFeed({
   }
   const fileEdits = fileEditOrder.map((p) => fileEditMap.get(p)!);
 
-  if (fileEdits.length === 0 && steps.length === 0 && !todos) return null;
+  if (
+    fileEdits.length === 0 &&
+    steps.length === 0 &&
+    !todos &&
+    mcpCalls.length === 0
+  )
+    return null;
 
   const stepCount = steps.length;
   // File edits are the substance — always shown as cards. The other actions
@@ -386,6 +448,10 @@ export default function ActivityFeed({
       )}
 
       {todos && <TodoList todos={todos} />}
+
+      {mcpCalls.map((m, i) => (
+        <McpCallCard key={`${m.server}__${m.tool}__${i}`} call={m} live={!!live} />
+      ))}
 
       {fileEdits.map((f) => (
         <FileChangeCard

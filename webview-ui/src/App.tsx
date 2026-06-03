@@ -321,6 +321,10 @@ export default function App() {
     vscode.postMessage({ type: "openFile", filePath });
   }, []);
 
+  const handleOpenMcp = useCallback(() => {
+    vscode.postMessage({ type: "openMcpConfig" });
+  }, []);
+
   const isStreaming = state.isStreaming ?? false;
   const skillsDirty = editorContent !== savedEditorContent;
   const streamingText = isStreaming ? liveStreamingText : "";
@@ -385,6 +389,7 @@ export default function App() {
         onAcceptAll={handleAcceptAll}
         onRejectAll={handleRejectAll}
         onOpenSkills={() => setSkillsOpen(true)}
+        onOpenMcp={handleOpenMcp}
         onEditMessage={handleEditMessage}
         onSwitchFork={handleSwitchFork}
       />

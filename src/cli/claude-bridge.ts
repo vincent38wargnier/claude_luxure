@@ -73,6 +73,52 @@ function buildContextInfo(
   };
 }
 
+/**
+ * Tool results from MCP servers (and agent/Task tools) arrive as an ARRAY of
+ * content blocks, not a plain string — native tools usually return a string.
+ * Flatten either form to displayable text: keep text blocks verbatim, inline an
+ * embedded resource's text, and leave a short marker for binary/link blocks.
+ * Unknown block types (e.g. Claude Code's "tool_reference") are skipped.
+ */
+function extractToolResultText(content: unknown): string {
+  if (typeof content === "string") {
+    return content;
+  }
+  if (!Array.isArray(content)) {
+    return "";
+  }
+  const parts: string[] = [];
+  for (const block of content) {
+    if (!block || typeof block !== "object") {
+      continue;
+    }
+    const b = block as Record<string, any>;
+    switch (b.type) {
+      case "text":
+        if (typeof b.text === "string") {
+          parts.push(b.text);
+        }
+        break;
+      case "image":
+        parts.push(`[image: ${b.mimeType || "image"}]`);
+        break;
+      case "audio":
+        parts.push(`[audio: ${b.mimeType || "audio"}]`);
+        break;
+      case "resource_link":
+        parts.push(`[resource link: ${b.name || b.uri || ""}]`);
+        break;
+      case "resource": {
+        const r = b.resource || {};
+        parts.push(typeof r.text === "string" ? r.text : `[resource: ${r.uri || ""}]`);
+        break;
+      }
+      // tool_reference and any unknown block types: skip
+    }
+  }
+  return parts.join("\n");
+}
+
 export class ClaudeBridge extends EventEmitter {
   private proc: ChildProcess | null = null;
   private rl: readline.Interface | null = null;
@@ -271,6 +317,7 @@ export class ClaudeBridge extends EventEmitter {
               type: "tool_use",
               toolName: block.name as string,
               toolInput: block.input as Record<string, unknown>,
+              toolUseId: block.id as string,
             });
           }
           if (block.type === "thinking") {
@@ -291,7 +338,10 @@ export class ClaudeBridge extends EventEmitter {
             this.emit("activity", {
               type: "tool_result",
               toolUseId: block.tool_use_id,
-              content: typeof block.content === "string" ? block.content?.slice(0, 200) : "",
+              // MCP results are arrays of content blocks; flatten to text and
+              // cap to keep persisted state bounded (the card shows full text).
+              content: extractToolResultText(block.content).slice(0, 10000),
+              isError: block.is_error === true,
             });
           }
         }
@@ -334,6 +384,7 @@ export class ClaudeBridge extends EventEmitter {
           type: "tool_use",
           toolName: ev.content_block.name as string,
           toolInput: ev.content_block.input || {},
+          toolUseId: ev.content_block.id as string,
         });
       }
       this.emit("streamEvent", event);

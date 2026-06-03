@@ -69,9 +69,20 @@ export interface AccountInfo {
   subscriptionType?: string;
 }
 
+export interface ToolResultData {
+  content: string;
+  isError?: boolean;
+}
+
 export type ActivityEvent =
-  | { type: "tool_use"; toolName: string; toolInput: Record<string, unknown> }
-  | { type: "tool_result"; toolUseId: string; content: string }
+  | {
+      type: "tool_use";
+      toolName: string;
+      toolInput: Record<string, unknown>;
+      toolUseId?: string;
+      result?: ToolResultData;
+    }
+  | { type: "tool_result"; toolUseId: string; content: string; isError?: boolean }
   | { type: "thinking"; text: string }
   | { type: "thinking_delta"; text: string };
 
@@ -150,7 +161,8 @@ export type WebviewMessage =
   | { type: "readSkill"; skillId: string }
   | { type: "saveSkill"; skillId: string; content: string }
   | { type: "createSkill"; scope: SkillScope; name: string }
-  | { type: "deleteSkill"; skillId: string };
+  | { type: "deleteSkill"; skillId: string }
+  | { type: "openMcpConfig" };
 
 export type ExtensionMessage =
   | { type: "state"; state: ExtensionState }

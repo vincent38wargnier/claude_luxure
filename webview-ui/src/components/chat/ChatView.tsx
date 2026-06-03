@@ -45,6 +45,7 @@ interface ChatViewProps {
   onAcceptAll: () => void;
   onRejectAll: () => void;
   onOpenSkills?: () => void;
+  onOpenMcp?: () => void;
   onEditMessage?: (messageId: string, text: string) => void;
   onSwitchFork?: (anchorId: string, index: number) => void;
 }
@@ -89,6 +90,7 @@ export default function ChatView({
   onAcceptAll,
   onRejectAll,
   onOpenSkills,
+  onOpenMcp,
   onEditMessage,
   onSwitchFork,
 }: ChatViewProps) {
@@ -277,6 +279,7 @@ export default function ChatView({
         onEffortChange={onEffortChange}
         onReview={handleReview}
         onOpenSkills={onOpenSkills}
+        onOpenMcp={onOpenMcp}
       />
     </div>
   );

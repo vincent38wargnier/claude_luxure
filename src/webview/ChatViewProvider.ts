@@ -30,6 +30,34 @@ import type { SkillScope } from "../shared/types";
 
 const ROOT_FORK_ANCHOR = "ROOT";
 
+/** Attach a tool_result to the tool_use it belongs to (matched by id) so the
+ * call and its output stay one entry. Multiple result blocks for one call (e.g.
+ * an MCP tool_reference block + a text block) concatenate; a later non-empty
+ * block is never clobbered by an empty one. */
+function attachToolResult(acts: ActivityEvent[], e: ActivityEvent): void {
+  if (e.type !== "tool_result" || !e.toolUseId) {
+    return;
+  }
+  for (let i = acts.length - 1; i >= 0; i--) {
+    const a = acts[i];
+    if (a.type === "tool_use" && a.toolUseId === e.toolUseId) {
+      if (a.result) {
+        if (e.content) {
+          a.result.content = a.result.content
+            ? `${a.result.content}\n${e.content}`
+            : e.content;
+        }
+        if (e.isError) {
+          a.result.isError = true;
+        }
+      } else {
+        a.result = { content: e.content, isError: e.isError };
+      }
+      return;
+    }
+  }
+}
+
 interface ForkVersion {
   sessionId?: string;
   tail: ChatMessage[];
@@ -715,6 +743,37 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       case "deleteSkill":
         await this.handleDeleteSkill(message.skillId);
         break;
+
+      case "openMcpConfig":
+        await this.handleOpenMcpConfig();
+        break;
+    }
+  }
+
+  /**
+   * Open Claude Code's project-scoped MCP config (`.mcp.json` at the workspace
+   * root) in the editor, creating an empty scaffold if it doesn't exist yet.
+   * This is the file Claude Code reads for project MCP servers — analogous to
+   * Cursor's `.cursor/mcp.json`.
+   */
+  private async handleOpenMcpConfig(): Promise<void> {
+    const workspacePath = this.getWorkspacePath();
+    if (!workspacePath) {
+      vscode.window.showWarningMessage(
+        "Open a workspace folder to edit its MCP config (.mcp.json)."
+      );
+      return;
+    }
+
+    const mcpPath = path.join(workspacePath, ".mcp.json");
+    try {
+      if (!fs.existsSync(mcpPath)) {
+        fs.writeFileSync(mcpPath, '{\n  "mcpServers": {}\n}\n', "utf-8");
+      }
+      const doc = await vscode.workspace.openTextDocument(mcpPath);
+      await vscode.window.showTextDocument(doc, { preview: false });
+    } catch (err) {
+      vscode.window.showErrorMessage(`Failed to open MCP config: ${err}`);
     }
   }
 
@@ -1502,6 +1561,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
    * so it serves both the flat list and a single timeline run. */
   private coalesceInto(acts: ActivityEvent[], e: ActivityEvent): void {
     if (e.type === "tool_result") {
+      // Don't render the result as its own step — attach it to the tool_use it
+      // belongs to (matched by id) so the call + its output stay one entry.
+      attachToolResult(acts, e);
       return;
     }
     if (e.type === "thinking" || e.type === "thinking_delta") {
@@ -1524,6 +1586,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         );
         if (placeholder && placeholder.type === "tool_use") {
           placeholder.toolInput = input;
+          if (e.toolUseId && !placeholder.toolUseId) {
+            placeholder.toolUseId = e.toolUseId;
+          }
           return;
         }
         // Skip exact duplicates (assistant event re-emits completed tool calls).
@@ -1537,7 +1602,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           return;
         }
       }
-      acts.push({ type: "tool_use", toolName: e.toolName, toolInput: input });
+      acts.push({
+        type: "tool_use",
+        toolName: e.toolName,
+        toolInput: input,
+        toolUseId: e.toolUseId,
+      });
     }
   }
 

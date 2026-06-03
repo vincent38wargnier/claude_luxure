@@ -46,6 +46,7 @@ interface ChatTextAreaProps {
   onEffortChange: (effort: EffortLevel) => void;
   onReview?: () => void;
   onOpenSkills?: () => void;
+  onOpenMcp?: () => void;
 }
 
 const MAX_IMAGES = 10;
@@ -216,6 +217,7 @@ export default function ChatTextArea({
   onEffortChange,
   onReview,
   onOpenSkills,
+  onOpenMcp,
 }: ChatTextAreaProps) {
   const [inputValue, setInputValue] = useState("");
   const [selectedImages, setSelectedImages] = useState<string[]>([]);
@@ -696,19 +698,6 @@ export default function ChatTextArea({
       {/* Bottom bar */}
       <div className="flex items-center justify-between px-3 py-1.5 border-t border-[rgba(255,255,255,0.04)]">
         <div className="flex items-center gap-1.5">
-          {onOpenSkills && (
-            <>
-              <button
-                type="button"
-                onClick={onOpenSkills}
-                className="text-[11px] text-vscode-descriptionFg hover:text-vscode-fg transition-colors px-1"
-                title="Manage Claude skills"
-              >
-                Skills
-              </button>
-              <span className="text-[10px] text-vscode-descriptionFg opacity-30 select-none">|</span>
-            </>
-          )}
           <ModeSelector mode={mode} onChange={onModeChange} />
           <span className="text-[10px] text-vscode-descriptionFg opacity-30 select-none">|</span>
           <ModelSelector model={model} onChange={onModelChange} />
@@ -718,6 +707,32 @@ export default function ChatTextArea({
             <>
               <span className="text-[10px] text-vscode-descriptionFg opacity-30 select-none">|</span>
               <ContextBadge context={contextInfo} />
+            </>
+          )}
+          {onOpenSkills && (
+            <>
+              <span className="text-[10px] text-vscode-descriptionFg opacity-30 select-none">|</span>
+              <button
+                type="button"
+                onClick={onOpenSkills}
+                className="text-[11px] text-vscode-descriptionFg hover:text-vscode-fg transition-colors px-1"
+                title="Manage Claude skills"
+              >
+                Skills
+              </button>
+            </>
+          )}
+          {onOpenMcp && (
+            <>
+              <span className="text-[10px] text-vscode-descriptionFg opacity-30 select-none">|</span>
+              <button
+                type="button"
+                onClick={onOpenMcp}
+                className="text-[11px] text-vscode-descriptionFg hover:text-vscode-fg transition-colors px-1"
+                title="Edit MCP servers (.mcp.json)"
+              >
+                MCP
+              </button>
             </>
           )}
         </div>
