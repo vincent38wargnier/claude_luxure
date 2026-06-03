@@ -30,6 +30,14 @@ const PLAN_MODE_SYSTEM_PROMPT = `You are in PLAN MODE. You must ONLY:
 4. NEVER use Write, Edit, Bash, or any tool that modifies files
 Present your analysis and proposed changes clearly in markdown.`;
 
+// Always appended so the assistant's prose renders cleanly in the chat webview.
+const MARKDOWN_STYLE_SYSTEM_PROMPT = `Format every response as clean, well-structured GitHub-flavored Markdown:
+- Use ## and ### headings to organize anything longer than a couple of paragraphs, and keep a blank line around headings, lists, tables, and code blocks.
+- Use tables (with a header row) for comparisons or any data with two or more attributes; keep cell text terse.
+- Use \`inline code\` for file paths, commands, flags, and identifiers; use fenced code blocks with a language tag for multi-line code or terminal output.
+- Use "-" for bullets and "1." for ordered steps; bold only key terms. Keep paragraphs short.
+- Do not wrap ordinary prose in code blocks, and do not over-nest lists.`;
+
 function buildContextInfo(
   usage: Record<string, unknown>,
   model: string,
@@ -125,13 +133,17 @@ export class ClaudeBridge extends EventEmitter {
       args.push("--effort", this.options.effort);
     }
 
+    // Combine into a single --append-system-prompt; the markdown styling is
+    // always on, with the plan-mode constraints layered in when relevant.
+    const systemPromptParts = [MARKDOWN_STYLE_SYSTEM_PROMPT];
     if (this.options.mode === "plan") {
-      args.push("--append-system-prompt", PLAN_MODE_SYSTEM_PROMPT);
+      systemPromptParts.push(PLAN_MODE_SYSTEM_PROMPT);
       args.push(
         "--allowedTools",
         "Read,Grep,Glob,LS,View,BatchTool"
       );
     }
+    args.push("--append-system-prompt", systemPromptParts.join("\n\n"));
 
     try {
       this.proc = spawn("claude", args, {

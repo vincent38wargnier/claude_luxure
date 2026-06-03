@@ -233,8 +233,10 @@ export default function MessageRow({
   );
 }
 
-const MARKDOWN_CLASS =
-  "px-1 py-0.5 text-sm prose prose-invert prose-sm max-w-none text-vscode-fg [&_pre]:bg-[rgba(0,0,0,0.2)] [&_pre]:rounded [&_pre]:px-3 [&_pre]:py-2 [&_pre]:text-[11px] [&_pre]:overflow-x-auto [&_pre]:font-[var(--vscode-editor-font-family)] [&_code]:text-[11px] [&_code]:bg-[rgba(0,0,0,0.2)] [&_code]:px-1 [&_code]:py-0.5 [&_code]:rounded [&_a]:text-vscode-linkFg [&_a]:no-underline [&_a:hover]:underline [&_p]:my-1.5 [&_p]:leading-relaxed [&_ul]:my-1 [&_ol]:my-1 [&_li]:my-0 [&_h1]:text-sm [&_h1]:font-semibold [&_h1]:mt-3 [&_h1]:mb-1 [&_h2]:text-sm [&_h2]:font-semibold [&_h2]:mt-2 [&_h2]:mb-1 [&_h3]:text-xs [&_h3]:font-semibold [&_h3]:mt-2 [&_h3]:mb-1 [&_table]:text-xs [&_blockquote]:border-l-2 [&_blockquote]:border-[rgba(255,255,255,0.1)] [&_blockquote]:pl-3 [&_blockquote]:italic [&_blockquote]:opacity-80";
+// Markdown prose styling lives in the `.md` class in index.css (the Tailwind
+// typography plugin isn't installed, so prose-* utilities are no-ops). Keep the
+// base size/color here; everything structural (tables, headings, lists) is CSS.
+const MARKDOWN_CLASS = "md px-1 py-0.5 text-sm text-vscode-fg";
 
 /** Render an assistant prose string: fenced code that looks like a file edit
  * becomes a card, everything else renders as markdown. */
