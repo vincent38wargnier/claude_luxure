@@ -60,7 +60,7 @@ export default function FileChangeCard({
             e.stopPropagation();
             openInDiff();
           }}
-          title="Open diff (HEAD ↔ Working Tree)"
+          title="Open file & view changes"
         >
           {fileName}
         </span>

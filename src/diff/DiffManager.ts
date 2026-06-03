@@ -3,7 +3,7 @@ import * as path from "path";
 import * as fs from "fs";
 import { SnapshotManager } from "./SnapshotManager";
 import { DIFF_SCHEME } from "./VirtualDocProvider";
-import { createPatch } from "diff";
+import { createPatch, diffLines } from "diff";
 
 export interface PendingDiff {
   filePath: string;
@@ -15,7 +15,59 @@ export class DiffManager {
   private onDiffDetected: ((diff: PendingDiff) => void) | undefined;
   private openDiffTabs = new Set<string>();
 
-  constructor(private snapshotManager: SnapshotManager) {}
+  // Inline diff: highlight the lines Claude changed directly in the real file
+  // (Cursor-style), rather than only showing a separate side-by-side diff.
+  private addedLineDecoration = vscode.window.createTextEditorDecorationType({
+    isWholeLine: true,
+    backgroundColor: "rgba(63, 185, 80, 0.14)",
+    overviewRulerColor: "rgba(63, 185, 80, 0.7)",
+    overviewRulerLane: vscode.OverviewRulerLane.Left,
+  });
+  private decorationListeners: vscode.Disposable[] = [];
+
+  // Quick-diff: feed VS Code our snapshot as the file's "original" so it renders
+  // native gutter change bars + an expandable inline diff (red removals + green
+  // additions, per-hunk revert) right in the real file — against our own
+  // baseline, so it also works for untracked/new files where git HEAD is empty.
+  private readonly sourceControl: vscode.SourceControl;
+
+  constructor(private snapshotManager: SnapshotManager) {
+    // Keep highlights in sync as files open, become visible, or change.
+    this.decorationListeners.push(
+      vscode.window.onDidChangeVisibleTextEditors((editors) => {
+        for (const editor of editors) {
+          this.refreshInlineDiff(editor);
+        }
+      }),
+      vscode.workspace.onDidChangeTextDocument((e) => {
+        const editor = vscode.window.visibleTextEditors.find(
+          (ed) => ed.document === e.document
+        );
+        if (editor) {
+          this.refreshInlineDiff(editor);
+        }
+      })
+    );
+
+    this.sourceControl = vscode.scm.createSourceControl(
+      "claudeLuxure",
+      "Claude Luxure"
+    );
+    this.sourceControl.inputBox.visible = false; // no commit box; we only want quick-diff
+    this.sourceControl.quickDiffProvider = {
+      provideOriginalResource: (uri) => {
+        const original = this.snapshotManager.getOriginal(uri.fsPath);
+        if (original === undefined) {
+          return undefined; // no pending Claude change → no quick-diff
+        }
+        // Serve the snapshot through our content provider (base64 in the query).
+        return uri.with({
+          scheme: DIFF_SCHEME,
+          query: Buffer.from(original, "utf-8").toString("base64"),
+        });
+      },
+    };
+  }
 
   setDiffCallback(cb: (diff: PendingDiff) => void) {
     this.onDiffDetected = cb;
@@ -77,6 +129,8 @@ export class DiffManager {
     if (this.onDiffDetected) {
       this.onDiffDetected({ filePath, diff: patch });
     }
+    // Update inline highlights live if the file is already open.
+    this.refreshVisibleInlineDiffs(filePath);
   }
 
   async openDiffEditor(filePath: string): Promise<void> {
@@ -105,6 +159,53 @@ export class DiffManager {
     this.openDiffTabs.add(filePath);
   }
 
+  /**
+   * Open the real file and highlight the lines Claude changed inline (Cursor
+   * style). Works for any file — tracked, untracked, new, or already accepted —
+   * because it compares against our own snapshot, never git HEAD.
+   */
+  async revealFile(filePath: string): Promise<void> {
+    const uri = vscode.Uri.file(filePath);
+    const doc = await vscode.workspace.openTextDocument(uri);
+    const editor = await vscode.window.showTextDocument(doc, { preview: true });
+    this.refreshInlineDiff(editor);
+  }
+
+  /** Re-highlight the changed lines in `editor` from the snapshot, or clear the
+   * highlight when the file has no pending Claude changes. */
+  private refreshInlineDiff(editor: vscode.TextEditor): void {
+    const original = this.snapshotManager.getOriginal(editor.document.uri.fsPath);
+    if (original === undefined) {
+      editor.setDecorations(this.addedLineDecoration, []);
+      return;
+    }
+    const current = editor.document.getText();
+    const ranges: vscode.Range[] = [];
+    const lastLine = Math.max(0, editor.document.lineCount - 1);
+    let line = 0;
+    for (const part of diffLines(original, current)) {
+      const count = part.count ?? 0;
+      if (part.added) {
+        for (let i = 0; i < count && line + i <= lastLine; i++) {
+          ranges.push(new vscode.Range(line + i, 0, line + i, 0));
+        }
+        line += count;
+      } else if (!part.removed) {
+        line += count;
+      }
+    }
+    editor.setDecorations(this.addedLineDecoration, ranges);
+  }
+
+  /** Re-highlight every visible editor showing `filePath`. */
+  private refreshVisibleInlineDiffs(filePath: string): void {
+    for (const editor of vscode.window.visibleTextEditors) {
+      if (editor.document.uri.fsPath === filePath) {
+        this.refreshInlineDiff(editor);
+      }
+    }
+  }
+
   async closeDiffEditor(filePath: string): Promise<void> {
     this.openDiffTabs.delete(filePath);
 
@@ -124,6 +225,7 @@ export class DiffManager {
   async acceptChange(filePath: string): Promise<void> {
     await this.closeDiffEditor(filePath);
     this.snapshotManager.clear(filePath);
+    this.refreshVisibleInlineDiffs(filePath);
   }
 
   async rejectChange(filePath: string): Promise<void> {
@@ -146,6 +248,7 @@ export class DiffManager {
         await doc.save();
       }
     }
+    this.refreshVisibleInlineDiffs(filePath);
   }
 
   async acceptAll(): Promise<void> {
@@ -186,5 +289,9 @@ export class DiffManager {
   dispose(): void {
     this.stopWatching();
     this.openDiffTabs.clear();
+    this.addedLineDecoration.dispose();
+    this.decorationListeners.forEach((d) => d.dispose());
+    this.decorationListeners = [];
+    this.sourceControl.dispose();
   }
 }

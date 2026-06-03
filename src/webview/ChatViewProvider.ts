@@ -40,10 +40,19 @@ interface ForkGroup {
   activeIndex: number;
 }
 
+/** A per-turn snapshot of files before Claude first edits them, keyed by the
+ * user message that opened the turn. Powers Cursor-style "restore code" when the
+ * conversation is forked from an earlier message. */
+interface FileCheckpoint {
+  userMsgId: string;
+  files: Map<string, string | null>; // null = the file did not exist yet
+}
+
 interface SessionRuntime {
   sessionId?: string;
   draftId?: string;
   forks?: Record<string, ForkGroup>;
+  checkpoints: FileCheckpoint[];
   messages: ChatMessage[];
   bridge?: ClaudeBridge;
   streamingMessageId: string | null;
@@ -65,6 +74,7 @@ interface SessionRuntime {
 function createEmptyRuntime(): SessionRuntime {
   return {
     messages: [],
+    checkpoints: [],
     streamingMessageId: null,
     currentStreamText: "",
     currentActivities: [],
@@ -847,6 +857,36 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       return;
     }
 
+    // Cursor-style rollback: if Claude changed files at or after this message,
+    // offer to restore them to their pre-message state before we fork. "Keep
+    // code" forks without touching files; cancelling aborts the fork entirely.
+    const forkIdx = runtime.checkpoints.findIndex((c) => c.userMsgId === messageId);
+    if (forkIdx >= 0) {
+      const restore = new Map<string, string | null>();
+      // Walk newest → fork point so the earliest baseline per file wins.
+      for (let i = runtime.checkpoints.length - 1; i >= forkIdx; i--) {
+        for (const [p, content] of runtime.checkpoints[i].files) {
+          restore.set(p, content);
+        }
+      }
+      if (restore.size > 0) {
+        const n = restore.size;
+        const choice = await vscode.window.showInformationMessage(
+          `Claude changed ${n} file${n === 1 ? "" : "s"} after this message. Restore ${n === 1 ? "it" : "them"} to the previous state?`,
+          { modal: true },
+          "Restore code",
+          "Keep code"
+        );
+        if (choice === undefined) {
+          return; // Cancelled — leave the conversation and files untouched.
+        }
+        if (choice === "Restore code") {
+          await this.restoreFiles(restore);
+        }
+      }
+      runtime.checkpoints = runtime.checkpoints.slice(0, forkIdx);
+    }
+
     // The shared prefix stays; the rest is the branch we're leaving — preserved as
     // a fork version so the user can switch back to it with the ‹ › control.
     const anchorId =
@@ -893,6 +933,46 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.sendState();
 
     await this.handleSendMessage(text, images, undefined, priorMessages);
+  }
+
+  /**
+   * Restore files to captured contents (Cursor-style rollback). A null content
+   * means the file did not exist at that point, so it is deleted. Open editors
+   * are updated in place so the rollback is visible without a reload.
+   */
+  private async restoreFiles(files: Map<string, string | null>): Promise<void> {
+    for (const [filePath, content] of files) {
+      try {
+        if (content === null) {
+          if (fs.existsSync(filePath)) {
+            fs.unlinkSync(filePath);
+          }
+        } else {
+          const dir = path.dirname(filePath);
+          if (!fs.existsSync(dir)) {
+            fs.mkdirSync(dir, { recursive: true });
+          }
+          fs.writeFileSync(filePath, content, "utf-8");
+          const doc = vscode.workspace.textDocuments.find(
+            (d) => d.uri.fsPath === filePath
+          );
+          if (doc) {
+            const edit = new vscode.WorkspaceEdit();
+            const fullRange = new vscode.Range(
+              doc.positionAt(0),
+              doc.positionAt(doc.getText().length)
+            );
+            edit.replace(doc.uri, fullRange, content);
+            await vscode.workspace.applyEdit(edit);
+            await doc.save();
+          }
+        }
+        // The accept/reject baseline for this file is now stale — drop it.
+        this.snapshotManager.clear(filePath);
+      } catch {
+        // Best-effort: skip files we can't write.
+      }
+    }
   }
 
   private async handleSwitchFork(
@@ -1021,6 +1101,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       timestamp: Date.now(),
     };
     runtime.messages.push(userMessage);
+    // Open a checkpoint for this turn: as Claude edits files during the reply,
+    // each file's pre-edit content is recorded here, so a later fork can offer
+    // to roll the workspace back to this point.
+    runtime.checkpoints.push({ userMsgId: userMessage.id, files: new Map() });
     if (this.isActiveKey(runtimeKey)) {
       this.postMessage({ type: "message", message: userMessage });
     }
@@ -1202,7 +1286,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     });
 
     bridge.on("assistant", (event: ClaudeEvent) => {
-      this.handleAssistantEvent(event);
+      this.handleAssistantEvent(runtime, event);
     });
 
     bridge.on("assistantText", (text: string) => {
@@ -1302,7 +1386,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     });
   }
 
-  private handleAssistantEvent(event: ClaudeEvent): void {
+  private handleAssistantEvent(runtime: SessionRuntime, event: ClaudeEvent): void {
     const message = event.message as any;
     if (!message?.content) {
       return;
@@ -1316,6 +1400,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         if (this.isWriteTool(toolName) && input.file_path) {
           const filePath = input.file_path as string;
           this.snapshotManager.capture(filePath);
+          this.captureCheckpoint(runtime, filePath);
         }
       }
     }
@@ -1330,6 +1415,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
       if (this.isWriteTool(toolName) && toolInput?.file_path) {
         this.snapshotManager.capture(toolInput.file_path as string);
+        this.captureCheckpoint(runtime, toolInput.file_path as string);
       }
 
       runtime.bridge?.sendControlResponse({
@@ -1357,6 +1443,27 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       "bash",
     ];
     return writeTools.includes(name);
+  }
+
+  /**
+   * Record a file's current on-disk content into the active turn's checkpoint,
+   * once per file per turn — its state before Claude first edits it. Kept
+   * independent of SnapshotManager (which is cleared on accept/reject) so it
+   * survives to power a fork-time rollback.
+   */
+  private captureCheckpoint(runtime: SessionRuntime, filePath: string): void {
+    const checkpoint = runtime.checkpoints[runtime.checkpoints.length - 1];
+    if (!checkpoint || checkpoint.files.has(filePath)) {
+      return;
+    }
+    try {
+      checkpoint.files.set(
+        filePath,
+        fs.existsSync(filePath) ? fs.readFileSync(filePath, "utf-8") : null
+      );
+    } catch {
+      checkpoint.files.set(filePath, null);
+    }
   }
 
   private appendActivity(runtime: SessionRuntime, e: ActivityEvent): void {
@@ -1525,33 +1632,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       : ws
       ? path.join(ws, filePath)
       : filePath;
-    const fileUri = vscode.Uri.file(absPath);
-    const fileName = path.basename(absPath);
     try {
-      const gitExt = vscode.extensions.getExtension("vscode.git");
-      if (gitExt && !gitExt.isActive) {
-        await gitExt.activate();
-      }
-      // The built-in Git extension serves HEAD content via the `git:` scheme.
-      const headUri = fileUri.with({
-        scheme: "git",
-        query: JSON.stringify({ path: fileUri.fsPath, ref: "HEAD" }),
-      });
-      await vscode.commands.executeCommand(
-        "vscode.diff",
-        headUri,
-        fileUri,
-        `${fileName} (HEAD ↔ Working Tree)`,
-        { preview: true }
-      );
+      // Open the real file with Claude's changes highlighted inline (Cursor
+      // style). Works for new/untracked files too, unlike a git-HEAD diff.
+      await this.diffManager.revealFile(absPath);
     } catch (err) {
-      log("WARN", "openDiff failed; opening file instead:", String(err));
-      try {
-        const doc = await vscode.workspace.openTextDocument(fileUri);
-        await vscode.window.showTextDocument(doc, { preview: true });
-      } catch {
-        /* ignore */
-      }
+      log("WARN", "openDiff failed:", String(err));
     }
   }
 
