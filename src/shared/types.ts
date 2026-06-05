@@ -136,10 +136,23 @@ export type WebviewMessage =
   | { type: "saveSkill"; skillId: string; content: string }
   | { type: "createSkill"; scope: SkillScope; name: string }
   | { type: "deleteSkill"; skillId: string }
-  | { type: "openMcpConfig" };
+  | { type: "openMcpConfig" }
+  | { type: "restartMcp" };
+
+export type McpConnectionState = "connecting" | "connected" | "stopped" | "error";
+
+/** Overall connection status of one configured MCP server. `connection` is
+ * derived from the live Claude session's lifecycle (a running session connects
+ * every server in `.mcp.json`) — intentionally tool-agnostic, with no per-tool
+ * credential/token checks. */
+export interface McpServerStatus {
+  name: string;
+  connection: McpConnectionState;
+}
 
 export type ExtensionMessage =
   | { type: "state"; state: ExtensionState }
+  | { type: "mcpStatus"; servers: McpServerStatus[] }
   | { type: "streamToken"; text: string }
   | { type: "streamEnd" }
   | { type: "message"; message: ChatMessage }

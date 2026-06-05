@@ -6,9 +6,10 @@ import {
   Image as ImageIcon,
   ArrowUp,
   ChevronRight,
+  RotateCw,
 } from "lucide-react";
 import vscode from "../../vscode";
-import type { Mode, EffortLevel, ContextInfo } from "../../types";
+import type { Mode, EffortLevel, ContextInfo, McpServerStatus } from "../../types";
 import { AVAILABLE_MODELS, EFFORT_LEVELS } from "../../types";
 import ModeSelector from "./ModeSelector";
 import ModelSelector from "./ModelSelector";
@@ -47,9 +48,49 @@ interface ChatTextAreaProps {
   onReview?: () => void;
   onOpenSkills?: () => void;
   onOpenMcp?: () => void;
+  onRestartMcp?: () => void;
+  mcpServers?: McpServerStatus[];
 }
 
 const MAX_IMAGES = 10;
+
+/** A small colored dot summarizing overall MCP health, derived from the live
+ * session lifecycle: green = connected, amber (pulsing) = connecting/restarting,
+ * red = session error, gray = stopped. Tool-agnostic — it reflects every server
+ * configured in `.mcp.json`, not any one server's credentials. Hover lists the
+ * configured servers. */
+function McpStatusDot({ servers }: { servers?: McpServerStatus[] }) {
+  if (!servers || servers.length === 0) return null;
+  const connecting = servers.some((s) => s.connection === "connecting");
+  const errored = servers.some((s) => s.connection === "error");
+  const connected = servers.every((s) => s.connection === "connected");
+
+  let color = "#6b7280"; // gray — stopped / not running
+  let label = "stopped";
+  let pulse = false;
+  if (connecting) {
+    color = "#f59e0b"; // amber
+    label = "connecting…";
+    pulse = true;
+  } else if (errored) {
+    color = "#f85149"; // red
+    label = "error";
+  } else if (connected) {
+    color = "#3fb950"; // green
+    label = "connected";
+  }
+
+  const count = servers.length;
+  const detail = servers.map((s) => `• ${s.name}`).join("\n");
+
+  return (
+    <span
+      title={`MCP — ${label} (${count} server${count === 1 ? "" : "s"})\n${detail}`}
+      className={`inline-block w-2 h-2 rounded-full shrink-0 ${pulse ? "animate-pulse" : ""}`}
+      style={{ backgroundColor: color }}
+    />
+  );
+}
 const ACCEPTED_IMAGE_TYPES = ["image/png", "image/jpeg", "image/webp"];
 const MENTION_REGEX = /@[\w.\/\-\\]+/g;
 
@@ -218,6 +259,8 @@ export default function ChatTextArea({
   onReview,
   onOpenSkills,
   onOpenMcp,
+  onRestartMcp,
+  mcpServers,
 }: ChatTextAreaProps) {
   const [inputValue, setInputValue] = useState("");
   const [selectedImages, setSelectedImages] = useState<string[]>([]);
@@ -725,6 +768,7 @@ export default function ChatTextArea({
           {onOpenMcp && (
             <>
               <span className="text-[10px] text-vscode-descriptionFg opacity-30 select-none">|</span>
+              <McpStatusDot servers={mcpServers} />
               <button
                 type="button"
                 onClick={onOpenMcp}
@@ -733,6 +777,16 @@ export default function ChatTextArea({
               >
                 MCP
               </button>
+              {onRestartMcp && (
+                <button
+                  type="button"
+                  onClick={onRestartMcp}
+                  className="flex items-center text-vscode-descriptionFg hover:text-vscode-fg transition-colors px-0.5"
+                  title="Restart / reconnect MCP servers (e.g. after refreshing a token)"
+                >
+                  <RotateCw size={11} />
+                </button>
+              )}
             </>
           )}
         </div>

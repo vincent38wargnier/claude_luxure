@@ -14,6 +14,8 @@ import {
   EffortLevel,
   ExtensionMessage,
   ExtensionState,
+  McpConnectionState,
+  McpServerStatus,
   Mode,
   TimelinePart,
   WebviewMessage,
@@ -558,6 +560,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       this.context.subscriptions
     );
 
+    // Push an MCP status snapshot now. It's refreshed event-driven on every CLI
+    // status change (start/restart/stop/error) — the only thing that actually
+    // moves the indicator — so no polling timer is needed.
+    this.refreshMcpStatus();
+
     webviewView.onDidDispose(() => {
       this.webviewView = undefined;
       this.webview = undefined;
@@ -747,6 +754,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       case "openMcpConfig":
         await this.handleOpenMcpConfig();
         break;
+
+      case "restartMcp":
+        this.handleRestartMcp();
+        break;
     }
   }
 
@@ -775,6 +786,95 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     } catch (err) {
       vscode.window.showErrorMessage(`Failed to open MCP config: ${err}`);
     }
+  }
+
+  /**
+   * Restart the active session's `claude` process. The bridge relaunches the CLI
+   * with `--resume` (so the conversation is preserved), which reloads `.mcp.json`
+   * and reconnects every MCP server with fresh env — the practical way to recover
+   * a dropped or stale MCP server (e.g. after refreshing an expired token)
+   * without the interactive `/mcp` → Reconnect step.
+   */
+  private handleRestartMcp(): void {
+    const runtime = this.getActiveRuntime();
+    // Flip the indicator to "connecting" immediately so the restart is visible
+    // even before the new process reports back.
+    this.refreshMcpStatus(true);
+    if (runtime.bridge) {
+      vscode.window.showInformationMessage(
+        "Reconnecting MCP servers (restarting Claude — your conversation is preserved)…"
+      );
+      runtime.bridge.restart();
+    } else {
+      // No process yet (e.g. before the first message) — start one so its MCP
+      // servers connect. The bridge's status handler refreshes the indicator.
+      vscode.window.showInformationMessage(
+        "Starting Claude to connect MCP servers…"
+      );
+      void this.startBridge(this.activeKey, runtime);
+    }
+  }
+
+  /** Build and push the current MCP status to the webview. `forceConnecting`
+   * paints every server "connecting" optimistically (used the instant a restart
+   * is triggered, before the new process reports back). */
+  private refreshMcpStatus(forceConnecting = false): void {
+    this.postMessage({
+      type: "mcpStatus",
+      servers: this.computeMcpServerStatuses(forceConnecting),
+    });
+  }
+
+  /** Derive overall MCP status: the servers configured in the project's
+   * `.mcp.json`, each tagged with one connection state taken from the active
+   * session's lifecycle. The CLI exposes no reliable per-server connection
+   * signal — its init event reports every server "pending" (they connect async,
+   * with no follow-up event) and `claude mcp list` reports "pending approval"
+   * non-interactively even for healthy servers. But a running session here uses
+   * `--dangerously-skip-permissions`, which connects every configured server, so
+   * session-up == servers-connected is the honest, tool-agnostic signal — and it
+   * flips amber→green on restart. Reads no draft runtime, so it's safe to call
+   * from any event handler. */
+  private computeMcpServerStatuses(forceConnecting: boolean): McpServerStatus[] {
+    const workspacePath = this.getWorkspacePath();
+    if (!workspacePath) {
+      return [];
+    }
+    let config: { mcpServers?: Record<string, unknown> };
+    try {
+      config = JSON.parse(
+        fs.readFileSync(path.join(workspacePath, ".mcp.json"), "utf-8")
+      );
+    } catch {
+      return [];
+    }
+    const serversObj = config?.mcpServers;
+    if (!serversObj || typeof serversObj !== "object") {
+      return [];
+    }
+
+    const runtime = this.activeKey ? this.runtimes.get(this.activeKey) : undefined;
+    let connection: McpConnectionState;
+    if (forceConnecting) {
+      connection = "connecting";
+    } else {
+      switch (runtime?.cliStatus) {
+        case "starting":
+          connection = "connecting";
+          break;
+        case "ready":
+        case "busy":
+          connection = "connected";
+          break;
+        case "error":
+          connection = "error";
+          break;
+        default:
+          connection = "stopped";
+      }
+    }
+
+    return Object.keys(serversObj).map((name) => ({ name, connection }));
   }
 
   private handleListSkills(): void {
@@ -1301,6 +1401,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           type: "cliStatus",
           status: runtime.cliStatus,
         });
+        this.refreshMcpStatus();
         this.sendState();
       }
     });

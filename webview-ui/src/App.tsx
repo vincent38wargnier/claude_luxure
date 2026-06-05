@@ -13,6 +13,7 @@ import type {
   EffortLevel,
   SkillInfo,
   SkillScope,
+  McpServerStatus,
 } from "./types";
 
 const initialState: ExtensionState = {
@@ -31,6 +32,7 @@ export default function App() {
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
   const [activities, setActivities] = useState<ActivityEvent[]>([]);
   const [liveTimeline, setLiveTimeline] = useState<TimelinePart[]>([]);
+  const [mcpServers, setMcpServers] = useState<McpServerStatus[]>([]);
   const [openTabIds, setOpenTabIds] = useState<string[]>([]);
   const [tabNames, setTabNames] = useState<Record<string, string>>({});
   const [externalFiles, setExternalFiles] = useState<string[]>([]);
@@ -114,6 +116,10 @@ export default function App() {
           }
           return next;
         });
+        break;
+
+      case "mcpStatus":
+        setMcpServers(msg.servers);
         break;
 
       case "error":
@@ -325,6 +331,10 @@ export default function App() {
     vscode.postMessage({ type: "openMcpConfig" });
   }, []);
 
+  const handleRestartMcp = useCallback(() => {
+    vscode.postMessage({ type: "restartMcp" });
+  }, []);
+
   const isStreaming = state.isStreaming ?? false;
   const skillsDirty = editorContent !== savedEditorContent;
   const streamingText = isStreaming ? liveStreamingText : "";
@@ -390,6 +400,8 @@ export default function App() {
         onRejectAll={handleRejectAll}
         onOpenSkills={() => setSkillsOpen(true)}
         onOpenMcp={handleOpenMcp}
+        onRestartMcp={handleRestartMcp}
+        mcpServers={mcpServers}
         onEditMessage={handleEditMessage}
         onSwitchFork={handleSwitchFork}
       />

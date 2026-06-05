@@ -4,3 +4,6 @@ dist/
 webview-ui/node_modules/
 webview-ui/dist/
 .vscode-test/
+
+# Local MCP server config — contains secrets (e.g. JARVIO_API_KEY)
+.mcp.json

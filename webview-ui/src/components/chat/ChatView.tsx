@@ -1,5 +1,5 @@
 import { useRef, useEffect, useState, useCallback, Fragment } from "react";
-import type { ChatMessage, CostInfo, ContextInfo, ActivityEvent, TimelinePart, SessionInfo, Mode, EffortLevel, PendingDiff } from "../../types";
+import type { ChatMessage, CostInfo, ContextInfo, ActivityEvent, TimelinePart, SessionInfo, Mode, EffortLevel, PendingDiff, McpServerStatus } from "../../types";
 import MessageRow from "./MessageRow";
 import ChatTextArea from "./ChatTextArea";
 import TabBar from "./TabBar";
@@ -46,6 +46,8 @@ interface ChatViewProps {
   onRejectAll: () => void;
   onOpenSkills?: () => void;
   onOpenMcp?: () => void;
+  onRestartMcp?: () => void;
+  mcpServers?: McpServerStatus[];
   onEditMessage?: (messageId: string, text: string) => void;
   onSwitchFork?: (anchorId: string, index: number) => void;
 }
@@ -91,6 +93,8 @@ export default function ChatView({
   onRejectAll,
   onOpenSkills,
   onOpenMcp,
+  onRestartMcp,
+  mcpServers,
   onEditMessage,
   onSwitchFork,
 }: ChatViewProps) {
@@ -280,6 +284,8 @@ export default function ChatView({
         onReview={handleReview}
         onOpenSkills={onOpenSkills}
         onOpenMcp={onOpenMcp}
+        onRestartMcp={onRestartMcp}
+        mcpServers={mcpServers}
       />
     </div>
   );
