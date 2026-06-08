@@ -21,6 +21,11 @@ export interface ClaudeBridgeOptions {
   sessionId?: string;
   forkSession?: boolean;
   sessionName?: string;
+  /** Isolated CLAUDE_CONFIG_DIR for the bound account (a full `auth login`).
+   * When set, it is injected as CLAUDE_CONFIG_DIR so the spawned process
+   * authenticates as that account (full scope); when unset, the process uses
+   * the ambient keychain login (the "Default" account). */
+  configDir?: string;
 }
 
 const PLAN_MODE_SYSTEM_PROMPT = `You are in PLAN MODE. You must ONLY:
@@ -191,11 +196,25 @@ export class ClaudeBridge extends EventEmitter {
     }
     args.push("--append-system-prompt", systemPromptParts.join("\n\n"));
 
+    // Build the child env with the bound account's auth. A non-default account
+    // gets its own CLAUDE_CONFIG_DIR (isolated full login); we also strip any
+    // ambient token/API key so that config dir's login is authoritative. The
+    // Default account uses the ambient keychain (clear only an inherited token).
+    const childEnv: NodeJS.ProcessEnv = { ...process.env };
+    if (this.options.configDir) {
+      childEnv.CLAUDE_CONFIG_DIR = this.options.configDir;
+      delete childEnv.CLAUDE_CODE_OAUTH_TOKEN;
+      delete childEnv.ANTHROPIC_API_KEY;
+      delete childEnv.ANTHROPIC_AUTH_TOKEN;
+    } else {
+      delete childEnv.CLAUDE_CODE_OAUTH_TOKEN;
+    }
+
     try {
       this.proc = spawn("claude", args, {
         cwd: this.cwd,
         stdio: ["pipe", "pipe", "pipe"],
-        env: { ...process.env },
+        env: childEnv,
       });
     } catch (err) {
       this._status = "error";
@@ -472,6 +491,8 @@ export class ClaudeBridge extends EventEmitter {
       if (options.sessionId !== undefined) { this._sessionId = options.sessionId; }
       if (options.forkSession !== undefined) { this.options.forkSession = options.forkSession; }
       if (options.sessionName !== undefined) { this.options.sessionName = options.sessionName; }
+      // An empty string clears it → switch back to the Default account.
+      if (options.configDir !== undefined) { this.options.configDir = options.configDir; }
     }
     this.start();
   }

@@ -9,13 +9,15 @@ import {
   RotateCw,
 } from "lucide-react";
 import vscode from "../../vscode";
-import type { Mode, EffortLevel, ContextInfo, McpServerStatus } from "../../types";
+import type { Mode, EffortLevel, ContextInfo, McpServerStatus, StoredAccount, UsageInfo } from "../../types";
 import { AVAILABLE_MODELS, EFFORT_LEVELS } from "../../types";
 import ModeSelector from "./ModeSelector";
 import ModelSelector from "./ModelSelector";
 import ContextMenu from "./ContextMenu";
 import SlashCommandMenu from "./SlashCommandMenu";
 import Thumbnails from "../common/Thumbnails";
+import AccountSwitcher from "./AccountSwitcher";
+import UsageBars from "./UsageBars";
 import {
   mergeCliCommands,
   type CliCommand,
@@ -50,6 +52,13 @@ interface ChatTextAreaProps {
   onOpenMcp?: () => void;
   onRestartMcp?: () => void;
   mcpServers?: McpServerStatus[];
+  accounts?: StoredAccount[];
+  activeAccountId?: string;
+  usage?: UsageInfo | null;
+  usageByAccount?: Record<string, UsageInfo | null>;
+  onSwitchAccount?: (accountId: string) => void;
+  onAddAccount?: () => void;
+  onRemoveAccount?: (accountId: string) => void;
 }
 
 const MAX_IMAGES = 10;
@@ -261,6 +270,13 @@ export default function ChatTextArea({
   onOpenMcp,
   onRestartMcp,
   mcpServers,
+  accounts,
+  activeAccountId,
+  usage,
+  usageByAccount,
+  onSwitchAccount,
+  onAddAccount,
+  onRemoveAccount,
 }: ChatTextAreaProps) {
   const [inputValue, setInputValue] = useState("");
   const [selectedImages, setSelectedImages] = useState<string[]>([]);
@@ -792,14 +808,16 @@ export default function ChatTextArea({
         </div>
 
         <div className="flex items-center gap-1.5">
-          {accountEmail && (
-            <span
-              className="text-[10px] text-vscode-descriptionFg opacity-50 truncate max-w-[120px]"
-              title={`${accountEmail}${accountOrg ? ` (${accountOrg})` : ""}`}
-            >
-              {accountEmail}
-            </span>
-          )}
+          <AccountSwitcher
+            accounts={accounts}
+            activeAccountId={activeAccountId}
+            usageByAccount={usageByAccount}
+            fallbackEmail={accountEmail}
+            fallbackOrg={accountOrg}
+            onSwitch={onSwitchAccount}
+            onAdd={onAddAccount}
+            onRemove={onRemoveAccount}
+          />
           <button
             className="p-1 rounded opacity-40 hover:opacity-70 transition-opacity text-vscode-fg"
             title="Attach file"
@@ -837,6 +855,7 @@ export default function ChatTextArea({
           )}
         </div>
       </div>
+      <UsageBars usage={usage ?? null} />
     </div>
   );
 }

@@ -1,5 +1,5 @@
 import { useRef, useEffect, useState, useCallback, Fragment } from "react";
-import type { ChatMessage, CostInfo, ContextInfo, ActivityEvent, TimelinePart, SessionInfo, Mode, EffortLevel, PendingDiff, McpServerStatus } from "../../types";
+import type { ChatMessage, CostInfo, ContextInfo, ActivityEvent, TimelinePart, SessionInfo, Mode, EffortLevel, PendingDiff, McpServerStatus, StoredAccount, UsageInfo } from "../../types";
 import MessageRow from "./MessageRow";
 import ChatTextArea from "./ChatTextArea";
 import TabBar from "./TabBar";
@@ -48,6 +48,13 @@ interface ChatViewProps {
   onOpenMcp?: () => void;
   onRestartMcp?: () => void;
   mcpServers?: McpServerStatus[];
+  accounts?: StoredAccount[];
+  activeAccountId?: string;
+  usage?: UsageInfo | null;
+  usageByAccount?: Record<string, UsageInfo | null>;
+  onSwitchAccount?: (accountId: string) => void;
+  onAddAccount?: () => void;
+  onRemoveAccount?: (accountId: string) => void;
   onEditMessage?: (messageId: string, text: string) => void;
   onSwitchFork?: (anchorId: string, index: number) => void;
 }
@@ -95,6 +102,13 @@ export default function ChatView({
   onOpenMcp,
   onRestartMcp,
   mcpServers,
+  accounts,
+  activeAccountId,
+  usage,
+  usageByAccount,
+  onSwitchAccount,
+  onAddAccount,
+  onRemoveAccount,
   onEditMessage,
   onSwitchFork,
 }: ChatViewProps) {
@@ -286,6 +300,13 @@ export default function ChatView({
         onOpenMcp={onOpenMcp}
         onRestartMcp={onRestartMcp}
         mcpServers={mcpServers}
+        accounts={accounts}
+        activeAccountId={activeAccountId}
+        usage={usage}
+        usageByAccount={usageByAccount}
+        onSwitchAccount={onSwitchAccount}
+        onAddAccount={onAddAccount}
+        onRemoveAccount={onRemoveAccount}
       />
     </div>
   );

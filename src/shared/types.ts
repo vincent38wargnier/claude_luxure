@@ -69,6 +69,34 @@ export interface AccountInfo {
   subscriptionType?: string;
 }
 
+/** An account selectable in the composer switcher. The "default" account uses
+ * the ambient keychain login; others have their own isolated CLAUDE_CONFIG_DIR
+ * (a full `auth login`, full scope), so both chat AND usage % work per-account
+ * and they can run in parallel. */
+export interface StoredAccount {
+  id: string;
+  label: string;
+  email?: string;
+  subscriptionType?: string;
+  isDefault: boolean;
+  /** Isolated config dir for a non-default account (undefined for Default). */
+  configDir?: string;
+}
+
+/** One rate-limit bucket from GET /api/oauth/usage. */
+export interface UsageBucket {
+  utilization: number; // 0-100
+  resetsAt: string; // ISO timestamp
+}
+
+/** Subscription usage for the active conversation's account. */
+export interface UsageInfo {
+  fiveHour?: UsageBucket | null;
+  sevenDay?: UsageBucket | null;
+  sevenDaySonnet?: UsageBucket | null;
+  sevenDayOpus?: UsageBucket | null;
+}
+
 export interface ToolResultData {
   content: string;
   isError?: boolean;
@@ -137,7 +165,11 @@ export type WebviewMessage =
   | { type: "createSkill"; scope: SkillScope; name: string }
   | { type: "deleteSkill"; skillId: string }
   | { type: "openMcpConfig" }
-  | { type: "restartMcp" };
+  | { type: "restartMcp" }
+  | { type: "switchAccount"; accountId: string }
+  | { type: "addAccount" }
+  | { type: "removeAccount"; accountId: string }
+  | { type: "refreshUsage" };
 
 export type McpConnectionState = "connecting" | "connected" | "stopped" | "error";
 
@@ -170,7 +202,13 @@ export type ExtensionMessage =
   | { type: "skillsList"; skills: SkillInfo[] }
   | { type: "skillContent"; skillId: string; content: string }
   | { type: "skillsError"; error: string }
-  | { type: "skillsSaved"; skillId: string };
+  | { type: "skillsSaved"; skillId: string }
+  | { type: "accountsList"; accounts: StoredAccount[]; activeAccountId: string }
+  | { type: "usageUpdate"; usage: UsageInfo | null }
+  | {
+      type: "usageByAccount";
+      usageByAccount: Record<string, UsageInfo | null>;
+    };
 
 export interface ExtensionState {
   mode: Mode;
@@ -191,4 +229,7 @@ export interface ExtensionState {
   accountOrg?: string;
   slashCommands?: string[];
   contextSummarized?: boolean;
+  accounts?: StoredAccount[];
+  activeAccountId?: string;
+  usage?: UsageInfo | null;
 }

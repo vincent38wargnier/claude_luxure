@@ -14,6 +14,8 @@ import type {
   SkillInfo,
   SkillScope,
   McpServerStatus,
+  StoredAccount,
+  UsageInfo,
 } from "./types";
 
 const initialState: ExtensionState = {
@@ -33,6 +35,12 @@ export default function App() {
   const [activities, setActivities] = useState<ActivityEvent[]>([]);
   const [liveTimeline, setLiveTimeline] = useState<TimelinePart[]>([]);
   const [mcpServers, setMcpServers] = useState<McpServerStatus[]>([]);
+  const [accounts, setAccounts] = useState<StoredAccount[]>([]);
+  const [activeAccountId, setActiveAccountId] = useState<string>("default");
+  const [usage, setUsage] = useState<UsageInfo | null>(null);
+  const [usageByAccount, setUsageByAccount] = useState<
+    Record<string, UsageInfo | null>
+  >({});
   const [openTabIds, setOpenTabIds] = useState<string[]>([]);
   const [tabNames, setTabNames] = useState<Record<string, string>>({});
   const [externalFiles, setExternalFiles] = useState<string[]>([]);
@@ -120,6 +128,19 @@ export default function App() {
 
       case "mcpStatus":
         setMcpServers(msg.servers);
+        break;
+
+      case "accountsList":
+        setAccounts(msg.accounts);
+        setActiveAccountId(msg.activeAccountId);
+        break;
+
+      case "usageUpdate":
+        setUsage(msg.usage);
+        break;
+
+      case "usageByAccount":
+        setUsageByAccount(msg.usageByAccount);
         break;
 
       case "error":
@@ -335,6 +356,18 @@ export default function App() {
     vscode.postMessage({ type: "restartMcp" });
   }, []);
 
+  const handleSwitchAccount = useCallback((accountId: string) => {
+    vscode.postMessage({ type: "switchAccount", accountId });
+  }, []);
+
+  const handleAddAccount = useCallback(() => {
+    vscode.postMessage({ type: "addAccount" });
+  }, []);
+
+  const handleRemoveAccount = useCallback((accountId: string) => {
+    vscode.postMessage({ type: "removeAccount", accountId });
+  }, []);
+
   const isStreaming = state.isStreaming ?? false;
   const skillsDirty = editorContent !== savedEditorContent;
   const streamingText = isStreaming ? liveStreamingText : "";
@@ -402,6 +435,13 @@ export default function App() {
         onOpenMcp={handleOpenMcp}
         onRestartMcp={handleRestartMcp}
         mcpServers={mcpServers}
+        accounts={accounts}
+        activeAccountId={activeAccountId}
+        usage={usage}
+        usageByAccount={usageByAccount}
+        onSwitchAccount={handleSwitchAccount}
+        onAddAccount={handleAddAccount}
+        onRemoveAccount={handleRemoveAccount}
         onEditMessage={handleEditMessage}
         onSwitchFork={handleSwitchFork}
       />

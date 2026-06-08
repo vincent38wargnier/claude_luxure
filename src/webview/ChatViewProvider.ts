@@ -1,6 +1,9 @@
 import * as vscode from "vscode";
 import * as path from "path";
 import * as fs from "fs";
+import * as os from "os";
+import * as https from "https";
+import * as crypto from "crypto";
 import { execFile } from "child_process";
 import { ClaudeBridge, ClaudeEvent } from "../cli/claude-bridge";
 import { DiffManager } from "../diff/DiffManager";
@@ -17,7 +20,10 @@ import {
   McpConnectionState,
   McpServerStatus,
   Mode,
+  StoredAccount,
   TimelinePart,
+  UsageBucket,
+  UsageInfo,
   WebviewMessage,
 } from "../shared/types";
 import { extractMentions, resolveFromMention } from "../utils/path-mentions";
@@ -99,6 +105,9 @@ interface SessionRuntime {
   cliStatus: ExtensionState["cliStatus"];
   sessionName?: string;
   contextSummarized?: boolean;
+  /** Which account (StoredAccount.id) this conversation is bound to. "default"
+   * or undefined → ambient keychain login; otherwise an isolated config-dir. */
+  accountId?: string;
 }
 
 function createEmptyRuntime(): SessionRuntime {
@@ -179,6 +188,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private diffWatchStarted = false;
   private slashCommands: string[] = [];
   private skillsManager = new SkillsManager();
+  private accountSubscription: string | undefined;
+  private usagePollTimer: ReturnType<typeof setInterval> | undefined;
+  private usagePollInFlight = false;
+  private usageAllInFlight = false;
+  private cachedCliVersion: string | undefined;
+  // Cache per keychain service name: the global "Claude Code-credentials"
+  // (Default) plus one per config-dir account ("…-<sha256(configDir)[:8]>").
+  private cachedKeychainTokens = new Map<
+    string,
+    { token: string; at: number }
+  >();
 
   constructor(
     private readonly context: vscode.ExtensionContext,
@@ -277,6 +297,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         const info = JSON.parse(stdout.trim());
         this.accountEmail = info.email;
         this.accountOrg = info.orgName;
+        this.accountSubscription = info.subscriptionType;
         log("INFO", "Account info:", info.email, info.orgName);
         this.postMessage({
           type: "accountInfo",
@@ -287,6 +308,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           },
         });
         this.sendState();
+        this.sendAccountsList();
       } catch {
         log("WARN", "Failed to parse account info:", stdout.slice(0, 200));
       }
@@ -344,6 +366,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       this.context.workspaceState.update(
         `claude-luxure.contextSummarized.${persistId}`,
         runtime.contextSummarized ?? false
+      );
+    }
+    if (persistId && runtime.accountId && runtime.accountId !== "default") {
+      this.context.workspaceState.update(
+        `claude-luxure.accountFor.${persistId}`,
+        runtime.accountId
       );
     }
     this.context.workspaceState.update("claude-luxure.openTabs", this.openTabIds);
@@ -444,6 +472,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.persistActiveSession();
     this.sendState();
     this.sendOpenTabs();
+    this.sendAccountsList();
+    void this.pollUsageForActive();
   }
 
   private stopRuntimeBridge(key: string, runtime: SessionRuntime): void {
@@ -519,11 +549,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.persistActiveSession();
 
     const draftKey = this.createDraftRuntime();
+    // New conversations inherit the last-used account so a chosen account
+    // "sticks" across new chats; switch per-conversation via the composer.
+    this.runtimes.get(draftKey)!.accountId =
+      this.context.globalState.get<string>("claude-luxure.lastAccountId") || "default";
     this.openTabIds.unshift(draftKey);
     this.activeKey = draftKey;
 
     this.sendState();
     this.sendOpenTabs();
+    this.sendAccountsList();
+    void this.pollUsageForActive();
   }
 
   async reveal(): Promise<void> {
@@ -564,10 +600,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     // status change (start/restart/stop/error) — the only thing that actually
     // moves the indicator — so no polling timer is needed.
     this.refreshMcpStatus();
+    this.sendAccountsList();
+    this.startUsagePolling();
 
     webviewView.onDidDispose(() => {
       this.webviewView = undefined;
       this.webview = undefined;
+      this.stopUsagePolling();
     });
   }
 
@@ -611,6 +650,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         this.sendState();
         this.sendOpenTabs();
         this.handleListSessions();
+        this.sendAccountsList();
+        void this.pollUsageForActive();
         break;
 
       case "sendMessage":
@@ -758,6 +799,22 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       case "restartMcp":
         this.handleRestartMcp();
         break;
+
+      case "switchAccount":
+        await this.handleSwitchAccount(message.accountId);
+        break;
+
+      case "addAccount":
+        await this.handleAddAccount();
+        break;
+
+      case "removeAccount":
+        await this.handleRemoveAccount(message.accountId);
+        break;
+
+      case "refreshUsage":
+        void this.pollUsageForAll();
+        break;
     }
   }
 
@@ -875,6 +932,502 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
 
     return Object.keys(serversObj).map((name) => ({ name, connection }));
+  }
+
+  // ───────────────────────── Accounts ─────────────────────────
+
+  /** The user-added (config-dir) accounts; the synthetic "Default" keychain
+   * account is not stored here — it's prepended in {@link getAllAccounts}. */
+  private getAddedAccounts(): StoredAccount[] {
+    return (
+      this.context.globalState.get<StoredAccount[]>("claude-luxure.accounts") || []
+    );
+  }
+
+  /** All selectable accounts: the keychain "Default" first, then added ones. */
+  private getAllAccounts(): StoredAccount[] {
+    const def: StoredAccount = {
+      id: "default",
+      label: this.accountEmail || "Default account",
+      email: this.accountEmail,
+      subscriptionType: this.accountSubscription,
+      isDefault: true,
+    };
+    return [def, ...this.getAddedAccounts()];
+  }
+
+  private labelFor(accountId: string | undefined): string {
+    return (
+      this.getAllAccounts().find((a) => a.id === (accountId || "default"))?.label ||
+      "account"
+    );
+  }
+
+  /** Config dir to spawn under for an account. Default/undefined → undefined
+   * (the process uses the ambient keychain login). */
+  private getConfigDirForAccount(
+    accountId: string | undefined
+  ): string | undefined {
+    if (!accountId || accountId === "default") {
+      return undefined;
+    }
+    return this.getAddedAccounts().find((a) => a.id === accountId)?.configDir;
+  }
+
+  private sendAccountsList(): void {
+    const runtime = this.activeKey ? this.runtimes.get(this.activeKey) : undefined;
+    this.postMessage({
+      type: "accountsList",
+      accounts: this.getAllAccounts(),
+      activeAccountId: runtime?.accountId || "default",
+    });
+  }
+
+  /** Bind the active conversation to a different account. If a process is
+   * running, restart it with the new token + `--resume` (conversation preserved
+   * — same mechanism as the MCP restart). */
+  private async handleSwitchAccount(accountId: string): Promise<void> {
+    const runtime = this.getActiveRuntime();
+    runtime.accountId = accountId;
+    this.context.globalState.update("claude-luxure.lastAccountId", accountId);
+    if (runtime.sessionId) {
+      this.context.workspaceState.update(
+        `claude-luxure.accountFor.${runtime.sessionId}`,
+        accountId === "default" ? undefined : accountId
+      );
+    }
+    const configDir = this.getConfigDirForAccount(accountId);
+    if (configDir) {
+      this.linkSharedAssets(configDir);
+    }
+    if (runtime.bridge) {
+      vscode.window.showInformationMessage(
+        `Switching to ${this.labelFor(accountId)} (restarting Claude — your conversation is preserved)…`
+      );
+      // Empty string clears it → switch back to the Default account.
+      runtime.bridge.restart({ configDir: configDir ?? "" });
+    }
+    this.sendAccountsList();
+    this.sendState();
+    void this.pollUsageForAll();
+  }
+
+  private async handleAddAccount(): Promise<void> {
+    const id = `acct-${generateId()}`;
+    const configDir = path.join(
+      this.context.globalStorageUri.fsPath,
+      "accounts",
+      id
+    );
+    try {
+      fs.mkdirSync(configDir, { recursive: true });
+      this.linkSharedAssets(configDir);
+    } catch (err) {
+      vscode.window.showErrorMessage(`Could not create account profile: ${err}`);
+      return;
+    }
+
+    // Drive a normal browser login scoped to this account's config dir, in a
+    // terminal so the user sees the URL if the browser doesn't auto-open.
+    const terminal = vscode.window.createTerminal({
+      name: "Add Claude account",
+      env: { CLAUDE_CONFIG_DIR: configDir },
+    });
+    terminal.show();
+    terminal.sendText("claude auth login");
+    vscode.window.showInformationMessage(
+      "Log in as the account you want to add (use an incognito window if it differs from your current claude.ai login). I'll detect it automatically."
+    );
+
+    const ok = await this.waitForLogin(configDir);
+    terminal.dispose();
+    if (!ok) {
+      try {
+        fs.rmSync(configDir, { recursive: true, force: true });
+      } catch {
+        /* ignore */
+      }
+      vscode.window.showWarningMessage(
+        "Didn't detect a completed login — account not added. Try again when ready."
+      );
+      return;
+    }
+
+    const info = await this.authStatusForDir(configDir);
+    const email = info?.email as string | undefined;
+    const added = this.getAddedAccounts();
+    added.push({
+      id,
+      label: email || `Account ${added.length + 1}`,
+      email,
+      subscriptionType: info?.subscriptionType,
+      isDefault: false,
+      configDir,
+    });
+    await this.context.globalState.update("claude-luxure.accounts", added);
+    this.sendAccountsList();
+    void this.pollUsageForAll();
+    vscode.window.showInformationMessage(
+      `Added ${email || "account"}. Select it from the account switcher.`
+    );
+  }
+
+  /** Share assets from ~/.claude into an account's isolated config dir via
+   * symlinks. Read-mostly assets (skills/plugins/memory) so added accounts see
+   * the same skills as Default; and crucially the `projects` session store, so a
+   * conversation created under any account can be `--resume`d after switching
+   * accounts (sessions live inside CLAUDE_CONFIG_DIR, so without this a switch
+   * fails with "No conversation found"). Auth/settings stay isolated. Idempotent
+   * — also called on spawn/switch to retrofit older accounts. */
+  private linkSharedAssets(configDir: string): void {
+    const base = path.join(os.homedir(), ".claude");
+    for (const asset of ["skills", "plugins", "CLAUDE.md", "commands", "agents"]) {
+      this.linkIfAbsent(path.join(base, asset), path.join(configDir, asset));
+    }
+    // Shared session store. Replace a fresh real `projects/` dir (created by an
+    // earlier spawn) with the symlink so transcripts resolve to ~/.claude/projects.
+    this.shareSessionStore(
+      path.join(base, "projects"),
+      path.join(configDir, "projects")
+    );
+  }
+
+  private linkIfAbsent(src: string, dst: string): void {
+    try {
+      if (fs.existsSync(src) && !fs.existsSync(dst)) {
+        fs.symlinkSync(src, dst);
+      }
+    } catch {
+      // Non-fatal — the account still works, just without that shared asset.
+    }
+  }
+
+  private shareSessionStore(src: string, dst: string): void {
+    try {
+      if (!fs.existsSync(src)) {
+        return;
+      }
+      if (fs.existsSync(dst)) {
+        const st = fs.lstatSync(dst);
+        if (st.isSymbolicLink()) {
+          return; // already shared
+        }
+        if (st.isDirectory()) {
+          // A freshly-provisioned account's own (junk) session store — replace it.
+          fs.rmSync(dst, { recursive: true, force: true });
+        } else {
+          return;
+        }
+      }
+      fs.symlinkSync(src, dst);
+    } catch {
+      // Non-fatal.
+    }
+  }
+
+  private authStatusForDir(configDir: string): Promise<any> {
+    return new Promise((resolve) => {
+      execFile(
+        "claude",
+        ["auth", "status"],
+        { env: { ...process.env, CLAUDE_CONFIG_DIR: configDir } },
+        (err, stdout) => {
+          if (err) {
+            resolve(undefined);
+            return;
+          }
+          try {
+            resolve(JSON.parse(stdout.trim()));
+          } catch {
+            resolve(undefined);
+          }
+        }
+      );
+    });
+  }
+
+  /** Poll `auth status` for a config dir until it reports logged in (or times
+   * out after ~3 min). */
+  private async waitForLogin(
+    configDir: string,
+    attempts = 60
+  ): Promise<boolean> {
+    for (let i = 0; i < attempts; i++) {
+      const info = await this.authStatusForDir(configDir);
+      if (info?.loggedIn) {
+        return true;
+      }
+      await new Promise((r) => setTimeout(r, 3000));
+    }
+    return false;
+  }
+
+  private async handleRemoveAccount(accountId: string): Promise<void> {
+    if (!accountId || accountId === "default") {
+      return;
+    }
+    const acct = this.getAddedAccounts().find((a) => a.id === accountId);
+    const added = this.getAddedAccounts().filter((a) => a.id !== accountId);
+    await this.context.globalState.update("claude-luxure.accounts", added);
+    if (
+      this.context.globalState.get<string>("claude-luxure.lastAccountId") === accountId
+    ) {
+      this.context.globalState.update("claude-luxure.lastAccountId", "default");
+    }
+    // Remove the isolated profile dir. Its shared assets are symlinks, which are
+    // unlinked (not followed), so the real ~/.claude targets are untouched.
+    if (acct?.configDir) {
+      try {
+        fs.rmSync(acct.configDir, { recursive: true, force: true });
+      } catch {
+        /* ignore */
+      }
+    }
+    // Any open conversation bound to the removed account falls back to Default.
+    for (const runtime of this.runtimes.values()) {
+      if (runtime.accountId === accountId) {
+        runtime.accountId = "default";
+        if (runtime.sessionId) {
+          this.context.workspaceState.update(
+            `claude-luxure.accountFor.${runtime.sessionId}`,
+            undefined
+          );
+        }
+        if (runtime.bridge) {
+          runtime.bridge.restart({ configDir: "" });
+        }
+      }
+    }
+    this.sendAccountsList();
+    this.sendState();
+    void this.pollUsageForActive();
+  }
+
+  // ───────────────────────── Usage ─────────────────────────
+
+  /** Access token for GET /api/oauth/usage: for a config-dir account, read its
+   * own file-based credential (full scope, so the endpoint allows it); for the
+   * Default account, the auto-refreshed keychain token. */
+  private async resolveUsageToken(
+    accountId: string | undefined
+  ): Promise<string | undefined> {
+    const configDir = this.getConfigDirForAccount(accountId);
+    if (configDir) {
+      // On macOS the CLI stores a custom-config-dir login in a keychain entry
+      // suffixed with sha256(configDir)[:8] — NOT in <configDir>/.credentials.json.
+      // (That file only exists on Linux/other.) Read the keychain entry first so
+      // added accounts — which have full `user:profile` scope, same as Default —
+      // get real usage too. This is the whole reason their bars were blank.
+      const fromKeychain = await this.readKeychainToken(
+        this.keychainServiceForConfigDir(configDir)
+      );
+      if (fromKeychain) {
+        return fromKeychain;
+      }
+      try {
+        const raw = fs.readFileSync(
+          path.join(configDir, ".credentials.json"),
+          "utf-8"
+        );
+        return JSON.parse(raw)?.claudeAiOauth?.accessToken;
+      } catch {
+        return undefined;
+      }
+    }
+    return await this.readKeychainToken();
+  }
+
+  /** The macOS keychain service name the CLI uses for a custom-config-dir login:
+   * the base service plus the first 8 hex of sha256(configDir). Verified against
+   * the live entry ("Claude Code-credentials-623e75a5"). */
+  private keychainServiceForConfigDir(configDir: string): string {
+    const suffix = crypto
+      .createHash("sha256")
+      .update(configDir)
+      .digest("hex")
+      .slice(0, 8);
+    return `Claude Code-credentials-${suffix}`;
+  }
+
+  /** Read the ambient keychain OAuth access token (macOS). May prompt once for
+   * keychain access ("Always Allow" makes subsequent reads silent). */
+  private readKeychainToken(
+    service = "Claude Code-credentials"
+  ): Promise<string | undefined> {
+    // The keychain token is valid ~60min (the CLI refreshes it). Cache for 60s
+    // so frequent polls (e.g. after every turn) don't spawn `security` each time.
+    const cached = this.cachedKeychainTokens.get(service);
+    if (cached && Date.now() - cached.at < 60_000) {
+      return Promise.resolve(cached.token);
+    }
+    return new Promise((resolve) => {
+      if (process.platform !== "darwin") {
+        resolve(undefined);
+        return;
+      }
+      execFile(
+        "security",
+        ["find-generic-password", "-s", service, "-w"],
+        (err, stdout) => {
+          if (err) {
+            resolve(undefined);
+            return;
+          }
+          try {
+            const json = JSON.parse(stdout.trim());
+            const token = json?.claudeAiOauth?.accessToken;
+            if (token) {
+              this.cachedKeychainTokens.set(service, { token, at: Date.now() });
+            }
+            resolve(token);
+          } catch {
+            resolve(undefined);
+          }
+        }
+      );
+    });
+  }
+
+  private getCliVersion(): Promise<string> {
+    if (this.cachedCliVersion) {
+      return Promise.resolve(this.cachedCliVersion);
+    }
+    return new Promise((resolve) => {
+      execFile("claude", ["--version"], (_err, stdout) => {
+        const m = (stdout || "").match(/(\d+\.\d+\.\d+)/);
+        this.cachedCliVersion = m ? m[1] : "2.0.0";
+        resolve(this.cachedCliVersion);
+      });
+    });
+  }
+
+  /** Fetch subscription usage. The endpoint is undocumented (it powers the CLI's
+   * /usage view); isolated here so it's easy to fix if the contract changes. */
+  private async fetchUsage(token: string): Promise<UsageInfo | null> {
+    const version = await this.getCliVersion();
+    return new Promise((resolve) => {
+      const req = https.request(
+        "https://api.anthropic.com/api/oauth/usage",
+        {
+          method: "GET",
+          headers: {
+            Authorization: `Bearer ${token}`,
+            "anthropic-beta": "oauth-2025-04-20",
+            "User-Agent": `claude-code/${version}`,
+          },
+        },
+        (res) => {
+          let body = "";
+          res.on("data", (c) => (body += c));
+          res.on("end", () => {
+            const status = res.statusCode || 0;
+            if (status < 200 || status >= 300) {
+              log("WARN", "usage endpoint status:", String(status));
+              resolve(null);
+              return;
+            }
+            try {
+              const data = JSON.parse(body) as Record<string, any>;
+              const bucket = (b: any): UsageBucket | null =>
+                b && typeof b.utilization === "number"
+                  ? { utilization: b.utilization, resetsAt: b.resets_at }
+                  : null;
+              resolve({
+                fiveHour: bucket(data.five_hour),
+                sevenDay: bucket(data.seven_day),
+                sevenDaySonnet: bucket(data.seven_day_sonnet),
+                sevenDayOpus: bucket(data.seven_day_opus),
+              });
+            } catch {
+              resolve(null);
+            }
+          });
+        }
+      );
+      req.on("error", (err) => {
+        log("WARN", "usage fetch error:", String(err));
+        resolve(null);
+      });
+      req.end();
+    });
+  }
+
+  private async pollUsageForActive(): Promise<void> {
+    if (this.usagePollInFlight) {
+      return;
+    }
+    this.usagePollInFlight = true;
+    try {
+      const runtime = this.activeKey
+        ? this.runtimes.get(this.activeKey)
+        : undefined;
+      const token = await this.resolveUsageToken(runtime?.accountId);
+      if (!token) {
+        this.postMessage({ type: "usageUpdate", usage: null });
+        return;
+      }
+      const usage = await this.fetchUsage(token);
+      this.postMessage({ type: "usageUpdate", usage });
+    } finally {
+      this.usagePollInFlight = false;
+    }
+  }
+
+  /** Poll usage for every account in parallel (each has its own full-scope
+   * keychain token), so the switcher can show per-account bars. Also refreshes
+   * the active account's bottom bars from the same fetch. Called less often than
+   * {@link pollUsageForActive} (timer + account changes) to bound endpoint load —
+   * N accounts = N requests, vs. 1 for the active-only poll. */
+  private async pollUsageForAll(): Promise<void> {
+    if (this.usageAllInFlight) {
+      return;
+    }
+    this.usageAllInFlight = true;
+    try {
+      const accounts = this.getAllAccounts();
+      const entries = await Promise.all(
+        accounts.map(async (a) => {
+          const token = await this.resolveUsageToken(a.id);
+          const usage = token ? await this.fetchUsage(token) : null;
+          return [a.id, usage] as const;
+        })
+      );
+      const usageByAccount: Record<string, UsageInfo | null> = {};
+      for (const [id, usage] of entries) {
+        usageByAccount[id] = usage;
+      }
+      this.postMessage({ type: "usageByAccount", usageByAccount });
+      // Keep the bottom bars in sync with the same data, no extra request.
+      const runtime = this.activeKey
+        ? this.runtimes.get(this.activeKey)
+        : undefined;
+      const activeId = runtime?.accountId || "default";
+      this.postMessage({
+        type: "usageUpdate",
+        usage: usageByAccount[activeId] ?? null,
+      });
+    } finally {
+      this.usageAllInFlight = false;
+    }
+  }
+
+  private startUsagePolling(): void {
+    if (this.usagePollTimer) {
+      return;
+    }
+    void this.pollUsageForAll();
+    // The endpoint is safe at ~180s intervals; tokens auto-refresh server-side.
+    this.usagePollTimer = setInterval(
+      () => void this.pollUsageForAll(),
+      180_000
+    );
+  }
+
+  private stopUsagePolling(): void {
+    if (this.usagePollTimer) {
+      clearInterval(this.usagePollTimer);
+      this.usagePollTimer = undefined;
+    }
   }
 
   private handleListSkills(): void {
@@ -1310,6 +1863,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       }
     }
 
+    // Resolve which account this conversation is bound to (restoring a persisted
+    // binding for resumed sessions), then the config dir to spawn it under.
+    if (!runtime.accountId && runtime.sessionId) {
+      runtime.accountId = this.context.workspaceState.get<string>(
+        `claude-luxure.accountFor.${runtime.sessionId}`
+      );
+    }
+    const configDir = this.getConfigDirForAccount(runtime.accountId);
+    // Ensure the account's config dir shares the session store + skills (also
+    // retrofits accounts created before sharing was introduced).
+    if (configDir) {
+      this.linkSharedAssets(configDir);
+    }
+
     const bridge = new ClaudeBridge({
       cwd: workspacePath,
       mode: this.mode,
@@ -1317,6 +1884,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       effort: this.effort,
       sessionId: runtime.sessionId,
       sessionName: runtime.sessionName,
+      configDir,
     });
 
     runtime.bridge = bridge;
@@ -1475,6 +2043,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       }
       log("INFO", "result received, finalizing message");
       this.finalizeStreamingMessage(runtimeKey, runtime, isActive());
+      // A turn just consumed quota — refresh the usage bars for the active tab.
+      if (isActive()) {
+        void this.pollUsageForActive();
+      }
       if (event.total_cost_usd !== undefined) {
         runtime.cost = {
           inputTokens: (event.total_input_tokens as number) || 0,
@@ -1894,6 +2466,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   dispose(): void {
+    this.stopUsagePolling();
     for (const [key, runtime] of this.runtimes) {
       this.persistRuntime(key, runtime);
       runtime.bridge?.stop();
