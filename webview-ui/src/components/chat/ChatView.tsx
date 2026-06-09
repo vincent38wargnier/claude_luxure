@@ -1,8 +1,9 @@
 import { useRef, useEffect, useState, useCallback, Fragment } from "react";
-import type { ChatMessage, CostInfo, ContextInfo, ActivityEvent, TimelinePart, SessionInfo, Mode, EffortLevel, PendingDiff, McpServerStatus, StoredAccount, UsageInfo } from "../../types";
+import type { ChatMessage, CostInfo, ContextInfo, ActivityEvent, TimelinePart, SessionInfo, Mode, EffortLevel, PendingDiff, McpServerStatus, StoredAccount, UsageInfo, QueuedMessage } from "../../types";
 import MessageRow from "./MessageRow";
 import ChatTextArea from "./ChatTextArea";
 import TabBar from "./TabBar";
+import QueuedMessages from "./QueuedMessages";
 import DiffPanel from "../common/DiffPanel";
 
 interface ChatViewProps {
@@ -59,6 +60,11 @@ interface ChatViewProps {
   summarizeProgress?: { done: number; total: number } | null;
   onSummarizeSession?: (sessionId: string) => void;
   onSummarizeAll?: () => void;
+  queuedMessages?: QueuedMessage[];
+  onQueueEdit?: (id: string, text: string) => void;
+  onQueueRemove?: (id: string) => void;
+  onQueueSendNow?: (id: string) => void;
+  onForceNext?: () => void;
   onEditMessage?: (messageId: string, text: string) => void;
   onSwitchFork?: (anchorId: string, index: number) => void;
 }
@@ -117,6 +123,11 @@ export default function ChatView({
   summarizeProgress,
   onSummarizeSession,
   onSummarizeAll,
+  queuedMessages,
+  onQueueEdit,
+  onQueueRemove,
+  onQueueSendNow,
+  onForceNext,
   onEditMessage,
   onSwitchFork,
 }: ChatViewProps) {
@@ -286,6 +297,14 @@ export default function ChatView({
         </div>
       )}
 
+      {/* Queued follow-ups (Cursor-style) */}
+      <QueuedMessages
+        items={queuedMessages ?? []}
+        onEdit={onQueueEdit ?? (() => {})}
+        onRemove={onQueueRemove ?? (() => {})}
+        onSendNow={onQueueSendNow ?? (() => {})}
+      />
+
       {/* Input area */}
       <ChatTextArea
         mode={mode}
@@ -293,6 +312,8 @@ export default function ChatView({
         effort={effort}
         cliStatus={cliStatus}
         isStreaming={isStreaming}
+        queueCount={queuedMessages?.length ?? 0}
+        onForceNext={onForceNext}
         fileCount={0}
         pendingDiffCount={pendingDiffs.length}
         contextInfo={contextInfo}

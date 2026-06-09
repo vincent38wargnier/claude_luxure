@@ -162,6 +162,15 @@ export interface SessionInfo {
   summary?: string;
 }
 
+/** A follow-up message the user queued while Claude was busy. Lives only in the
+ * webview (transient); drained into a real sendMessage when the turn finishes. */
+export interface QueuedMessage {
+  id: string;
+  text: string;
+  images?: string[];
+  mentions?: string[];
+}
+
 export type SkillScope = "global" | "project";
 
 export interface SkillInfo {

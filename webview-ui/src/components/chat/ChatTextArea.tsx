@@ -33,6 +33,10 @@ interface ChatTextAreaProps {
   effort?: EffortLevel;
   cliStatus: string;
   isStreaming: boolean;
+  /** Number of messages currently queued for this conversation. */
+  queueCount?: number;
+  /** Force-send the first queued message (stops the current response). */
+  onForceNext?: () => void;
   fileCount?: number;
   pendingDiffCount?: number;
   contextInfo: ContextInfo | null;
@@ -251,6 +255,8 @@ export default function ChatTextArea({
   effort,
   cliStatus,
   isStreaming,
+  queueCount = 0,
+  onForceNext,
   fileCount = 0,
   pendingDiffCount = 0,
   contextInfo,
@@ -465,8 +471,16 @@ export default function ChatTextArea({
 
       if (e.key === "Enter" && !e.shiftKey) {
         e.preventDefault();
-        if (isStreaming) return;
-        handleSend();
+        const hasContent =
+          inputValue.trim().length > 0 || selectedImages.length > 0;
+        if (hasContent) {
+          // handleSend → onSend; the parent queues it while a turn is in flight.
+          handleSend();
+        } else if (isStreaming && queueCount > 0) {
+          // Empty composer + queued items: force the first one through.
+          onForceNext?.();
+        }
+        return;
       }
 
       if (e.key === "c" && (e.ctrlKey || e.metaKey) && isStreaming) {
@@ -483,6 +497,10 @@ export default function ChatTextArea({
       contextMenuIndex,
       contextMenuQuery,
       isStreaming,
+      queueCount,
+      onForceNext,
+      inputValue,
+      selectedImages,
       handleSend,
       onCancel,
       insertSlashCommand,
@@ -739,7 +757,9 @@ export default function ChatTextArea({
             onPaste={handlePaste}
             onScroll={syncScroll}
             placeholder={
-              mode === "plan"
+              isStreaming
+                ? "Add a follow-up… (Enter to queue)"
+                : mode === "plan"
                 ? "Describe what to analyze... (/ for commands)"
                 : "Ask Claude anything... (/ commands, @ files)"
             }

@@ -16,6 +16,7 @@ import type {
   McpServerStatus,
   StoredAccount,
   UsageInfo,
+  QueuedMessage,
 } from "./types";
 
 const initialState: ExtensionState = {
@@ -57,6 +58,28 @@ export default function App() {
   const [savedFlash, setSavedFlash] = useState(false);
   const activeTabRef = useRef<string | undefined>();
   const editorContentRef = useRef("");
+
+  // Queued follow-ups, keyed by conversation (activeTabId). Lives only here.
+  const [queues, setQueues] = useState<Record<string, QueuedMessage[]>>({});
+  const queuesRef = useRef(queues);
+  queuesRef.current = queues;
+  const queueIdRef = useRef(0);
+  // A message promoted via "send now"/force, parked until the stop completes.
+  const pendingForceRef = useRef<QueuedMessage | null>(null);
+  // Edge detection for the streaming→idle transition that drains the queue.
+  const prevStreamingRef = useRef(false);
+  const prevTabRef = useRef<string | undefined>(undefined);
+  // Separate prev-tab tracker for draft→real id migration of a pending queue.
+  const migratePrevTabRef = useRef<string | undefined>(undefined);
+
+  const sendQueued = useCallback((item: QueuedMessage) => {
+    vscode.postMessage({
+      type: "sendMessage",
+      text: item.text,
+      images: item.images,
+      mentions: item.mentions,
+    } as any);
+  }, []);
 
   const handleMessage = useCallback((event: MessageEvent) => {
     const msg = event.data as ExtensionMessage;
@@ -269,17 +292,124 @@ export default function App() {
     return () => window.removeEventListener("message", handleMessage);
   }, [handleMessage]);
 
+  // Drain the queue when the active conversation goes streaming→idle. A parked
+  // "send now" message (pendingForceRef) takes priority over the FIFO head.
+  useEffect(() => {
+    const wasStreaming = prevStreamingRef.current;
+    const prevTab = prevTabRef.current;
+    const now = state.isStreaming ?? false;
+    const tab = state.activeTabId ?? "";
+    prevStreamingRef.current = now;
+    prevTabRef.current = tab;
+    if (prevTab !== tab || !wasStreaming || now) return; // not a completion edge
+
+    const forced = pendingForceRef.current;
+    pendingForceRef.current = null;
+    if (forced) {
+      sendQueued(forced);
+      return;
+    }
+    const q = queuesRef.current[tab] ?? [];
+    if (q.length > 0) {
+      setQueues((prev) => ({ ...prev, [tab]: (prev[tab] ?? []).slice(1) }));
+      sendQueued(q[0]);
+    }
+  }, [state.isStreaming, state.activeTabId, sendQueued]);
+
+  // A brand-new chat's tab id flips from "draft-…" to the real session id once
+  // it starts; carry any queue parked under the draft id over to the real one.
+  useEffect(() => {
+    const tab = state.activeTabId;
+    const prev = migratePrevTabRef.current;
+    migratePrevTabRef.current = tab;
+    if (
+      prev &&
+      tab &&
+      prev !== tab &&
+      prev.startsWith("draft-") &&
+      !tab.startsWith("draft-")
+    ) {
+      setQueues((q) => {
+        const items = q[prev];
+        if (!items || items.length === 0) return q;
+        const rest = { ...q };
+        delete rest[prev];
+        rest[tab] = [...(rest[tab] ?? []), ...items];
+        return rest;
+      });
+    }
+  }, [state.activeTabId]);
+
   const handleSend = useCallback(
     (text: string, images?: string[], mentions?: string[]) => {
-      vscode.postMessage({
-        type: "sendMessage",
-        text,
-        images,
-        mentions,
-      } as any);
+      // While a turn is in flight, queue the message instead of sending; it
+      // drains automatically when the current response finishes.
+      if (state.isStreaming) {
+        const tab = state.activeTabId ?? "";
+        const item: QueuedMessage = {
+          id: `q${++queueIdRef.current}`,
+          text,
+          images,
+          mentions,
+        };
+        setQueues((prev) => ({ ...prev, [tab]: [...(prev[tab] ?? []), item] }));
+        return;
+      }
+      vscode.postMessage({ type: "sendMessage", text, images, mentions } as any);
     },
-    []
+    [state.isStreaming, state.activeTabId]
   );
+
+  const handleRemoveQueued = useCallback(
+    (id: string) => {
+      const tab = state.activeTabId ?? "";
+      setQueues((prev) => ({
+        ...prev,
+        [tab]: (prev[tab] ?? []).filter((m) => m.id !== id),
+      }));
+    },
+    [state.activeTabId]
+  );
+
+  const handleEditQueued = useCallback(
+    (id: string, text: string) => {
+      const tab = state.activeTabId ?? "";
+      setQueues((prev) => ({
+        ...prev,
+        [tab]: (prev[tab] ?? []).map((m) => (m.id === id ? { ...m, text } : m)),
+      }));
+    },
+    [state.activeTabId]
+  );
+
+  // Send a queued message immediately, stopping the current response if one is
+  // running (the streaming→idle edge then delivers the parked message).
+  const handleSendQueuedNow = useCallback(
+    (id: string) => {
+      const tab = state.activeTabId ?? "";
+      const item = (queuesRef.current[tab] ?? []).find((m) => m.id === id);
+      if (!item) return;
+      setQueues((prev) => ({
+        ...prev,
+        [tab]: (prev[tab] ?? []).filter((m) => m.id !== id),
+      }));
+      if (state.isStreaming) {
+        pendingForceRef.current = item;
+        vscode.postMessage({ type: "cancelRequest" });
+      } else {
+        sendQueued(item);
+      }
+    },
+    [state.isStreaming, state.activeTabId, sendQueued]
+  );
+
+  // Pressing Enter on an empty composer while queued items exist: force the
+  // first one (stops the current response and sends it next).
+  const handleForceNext = useCallback(() => {
+    const tab = state.activeTabId ?? "";
+    const first = (queuesRef.current[tab] ?? [])[0];
+    if (first) handleSendQueuedNow(first.id);
+  }, [state.activeTabId, handleSendQueuedNow]);
 
   const handleEditMessage = useCallback((messageId: string, text: string) => {
     vscode.postMessage({ type: "editMessage", messageId, text });
@@ -483,6 +613,11 @@ export default function App() {
         summarizeProgress={summarizeProgress}
         onSummarizeSession={handleSummarizeSession}
         onSummarizeAll={handleSummarizeAll}
+        queuedMessages={queues[state.activeTabId ?? ""] ?? []}
+        onQueueEdit={handleEditQueued}
+        onQueueRemove={handleRemoveQueued}
+        onQueueSendNow={handleSendQueuedNow}
+        onForceNext={handleForceNext}
         onEditMessage={handleEditMessage}
         onSwitchFork={handleSwitchFork}
       />
