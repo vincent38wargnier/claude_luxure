@@ -55,6 +55,10 @@ interface ChatViewProps {
   onSwitchAccount?: (accountId: string) => void;
   onAddAccount?: () => void;
   onRemoveAccount?: (accountId: string) => void;
+  summarizingIds?: string[];
+  summarizeProgress?: { done: number; total: number } | null;
+  onSummarizeSession?: (sessionId: string) => void;
+  onSummarizeAll?: () => void;
   onEditMessage?: (messageId: string, text: string) => void;
   onSwitchFork?: (anchorId: string, index: number) => void;
 }
@@ -109,6 +113,10 @@ export default function ChatView({
   onSwitchAccount,
   onAddAccount,
   onRemoveAccount,
+  summarizingIds,
+  summarizeProgress,
+  onSummarizeSession,
+  onSummarizeAll,
   onEditMessage,
   onSwitchFork,
 }: ChatViewProps) {
@@ -192,6 +200,10 @@ export default function ChatView({
         onClose={onCloseTab}
         onNewChat={onNewConversation}
         onListSessions={onListSessions}
+        summarizingIds={summarizingIds}
+        summarizeProgress={summarizeProgress}
+        onSummarizeSession={onSummarizeSession}
+        onSummarizeAll={onSummarizeAll}
       />
 
       {/* Messages area */}

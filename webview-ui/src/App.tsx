@@ -41,6 +41,10 @@ export default function App() {
   const [usageByAccount, setUsageByAccount] = useState<
     Record<string, UsageInfo | null>
   >({});
+  const [summarizingIds, setSummarizingIds] = useState<string[]>([]);
+  const [summarizeProgress, setSummarizeProgress] = useState<
+    { done: number; total: number } | null
+  >(null);
   const [openTabIds, setOpenTabIds] = useState<string[]>([]);
   const [tabNames, setTabNames] = useState<Record<string, string>>({});
   const [externalFiles, setExternalFiles] = useState<string[]>([]);
@@ -141,6 +145,31 @@ export default function App() {
 
       case "usageByAccount":
         setUsageByAccount(msg.usageByAccount);
+        break;
+
+      case "summarizeStatus": {
+        const { sessionId, status } = msg;
+        setSummarizingIds((prev) =>
+          status === "pending"
+            ? prev.includes(sessionId)
+              ? prev
+              : [...prev, sessionId]
+            : prev.filter((id) => id !== sessionId)
+        );
+        if (status === "done") {
+          setSessions((prev) =>
+            prev.map((s) =>
+              s.id === sessionId
+                ? { ...s, title: msg.title, summary: msg.summary }
+                : s
+            )
+          );
+        }
+        break;
+      }
+
+      case "summarizeProgress":
+        setSummarizeProgress(msg.total > 0 ? { done: msg.done, total: msg.total } : null);
         break;
 
       case "error":
@@ -356,6 +385,14 @@ export default function App() {
     vscode.postMessage({ type: "restartMcp" });
   }, []);
 
+  const handleSummarizeSession = useCallback((sessionId: string) => {
+    vscode.postMessage({ type: "summarizeSession", sessionId });
+  }, []);
+
+  const handleSummarizeAll = useCallback(() => {
+    vscode.postMessage({ type: "summarizeAllSessions" });
+  }, []);
+
   const handleSwitchAccount = useCallback((accountId: string) => {
     vscode.postMessage({ type: "switchAccount", accountId });
   }, []);
@@ -442,6 +479,10 @@ export default function App() {
         onSwitchAccount={handleSwitchAccount}
         onAddAccount={handleAddAccount}
         onRemoveAccount={handleRemoveAccount}
+        summarizingIds={summarizingIds}
+        summarizeProgress={summarizeProgress}
+        onSummarizeSession={handleSummarizeSession}
+        onSummarizeAll={handleSummarizeAll}
         onEditMessage={handleEditMessage}
         onSwitchFork={handleSwitchFork}
       />

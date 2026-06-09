@@ -134,6 +134,12 @@ function sessionNameFromText(text: string): string {
   return line.slice(0, 80) || "New chat";
 }
 
+/** Opening line of the summary prompt. Any transcript whose first message
+ * starts with this is a leftover print-mode summary call, not a real
+ * conversation — used to keep it out of the history list. */
+const SUMMARY_PROMPT_MARKER =
+  "Below is the start of a conversation between a user and an AI coding assistant.";
+
 /**
  * Render prior conversation turns as a context block for a rewound (edited)
  * conversation. After an edit we start a fresh CLI session, so earlier turns are
@@ -421,7 +427,270 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const mgr = this.getSessionManager();
     if (!mgr) return;
     const sessions = await mgr.listSessions();
-    this.postMessage({ type: "sessionList", sessions });
+    // Merge in any Claude-generated title/summary persisted for each session so
+    // the list shows the friendly title and hover summary across reloads. Drop
+    // any leftover summary-prompt sessions so they never appear as history, and
+    // self-heal any garbage titles persisted by the earlier buggy summarizer.
+    const enriched = sessions
+      .filter((s) => !s.firstMessage.startsWith(SUMMARY_PROMPT_MARKER))
+      .map((s) => {
+        let title = this.context.workspaceState.get<string>(
+          `claude-luxure.sessionTitle.${s.id}`
+        );
+        let summary = this.context.workspaceState.get<string>(
+          `claude-luxure.sessionSummary.${s.id}`
+        );
+        if (title !== undefined && !this.isUsableTitle(title)) {
+          this.context.workspaceState.update(
+            `claude-luxure.sessionTitle.${s.id}`,
+            undefined
+          );
+          this.context.workspaceState.update(
+            `claude-luxure.sessionSummary.${s.id}`,
+            undefined
+          );
+          title = undefined;
+          summary = undefined;
+        }
+        return { ...s, title, summary };
+      });
+    this.postMessage({ type: "sessionList", sessions: enriched });
+  }
+
+  /** A real generated title is short prose. Reject empties, raw JSON envelopes
+   * ("{...") and the summary prompt itself — leftovers from the buggy version. */
+  private isUsableTitle(title: string): boolean {
+    const t = title.trim();
+    return (
+      t.length > 0 &&
+      t.length <= 80 &&
+      !t.startsWith("{") &&
+      !t.startsWith(SUMMARY_PROMPT_MARKER)
+    );
+  }
+
+  // ─────────────────────── Conversation summaries ───────────────────────
+  // A one-shot `claude -p` call over the first interactions of a transcript
+  // produces a short title + summary, persisted per-session in workspaceState.
+
+  /** Sessions currently being summarized, to dedupe concurrent requests. */
+  private summarizing = new Set<string>();
+
+  /** Generate (or regenerate) the title + summary for a single conversation. */
+  private async handleSummarizeSession(sessionId: string): Promise<void> {
+    if (!sessionId || this.summarizing.has(sessionId)) return;
+    this.summarizing.add(sessionId);
+    this.postMessage({ type: "summarizeStatus", sessionId, status: "pending" });
+    try {
+      const result = await this.summarizeOne(sessionId);
+      if (result) {
+        this.postMessage({
+          type: "summarizeStatus",
+          sessionId,
+          status: "done",
+          title: result.title,
+          summary: result.summary,
+        });
+      } else {
+        this.postMessage({ type: "summarizeStatus", sessionId, status: "error" });
+      }
+    } catch (err) {
+      log("WARN", "Failed to summarize session:", sessionId, String(err));
+      this.postMessage({ type: "summarizeStatus", sessionId, status: "error" });
+    } finally {
+      this.summarizing.delete(sessionId);
+    }
+  }
+
+  /** Summarize conversations from the last 7 days that haven't been processed
+   * yet, with a small concurrency cap so we don't spawn many CLI processes at
+   * once. Older or already-titled conversations are skipped. */
+  private async handleSummarizeAllSessions(): Promise<void> {
+    const mgr = this.getSessionManager();
+    if (!mgr) return;
+    const sessions = await mgr.listSessions();
+    const sevenDaysAgo = Date.now() - 7 * 86400000;
+    const pending = sessions.filter(
+      (s) =>
+        s.modifiedAt >= sevenDaysAgo &&
+        !s.firstMessage.startsWith(SUMMARY_PROMPT_MARKER) &&
+        !this.context.workspaceState.get<string>(
+          `claude-luxure.sessionTitle.${s.id}`
+        )
+    );
+    const total = pending.length;
+    if (total === 0) {
+      this.postMessage({ type: "summarizeProgress", done: 0, total: 0 });
+      return;
+    }
+
+    let done = 0;
+    let idx = 0;
+    this.postMessage({ type: "summarizeProgress", done, total });
+    const worker = async (): Promise<void> => {
+      while (idx < pending.length) {
+        const s = pending[idx++];
+        await this.handleSummarizeSession(s.id);
+        done++;
+        this.postMessage({ type: "summarizeProgress", done, total });
+      }
+    };
+    await Promise.all(
+      Array.from({ length: Math.min(3, total) }, () => worker())
+    );
+    // total: 0 signals the webview to clear the progress indicator.
+    this.postMessage({ type: "summarizeProgress", done: 0, total: 0 });
+  }
+
+  /** Read the first interactions, ask Claude for a title+summary, persist both. */
+  private async summarizeOne(
+    sessionId: string
+  ): Promise<{ title: string; summary: string } | null> {
+    const transcript = await this.buildSummaryTranscript(sessionId);
+    if (!transcript) return null;
+    const { title, summary } = await this.runClaudeSummary(transcript);
+    if (title) {
+      this.context.workspaceState.update(
+        `claude-luxure.sessionTitle.${sessionId}`,
+        title
+      );
+    }
+    if (summary) {
+      this.context.workspaceState.update(
+        `claude-luxure.sessionSummary.${sessionId}`,
+        summary
+      );
+    }
+    return { title, summary };
+  }
+
+  /** Compact transcript of the first 10 interactions, used as summary input. */
+  private async buildSummaryTranscript(
+    sessionId: string
+  ): Promise<string | null> {
+    const mgr = this.getSessionManager();
+    if (!mgr) return null;
+    const msgs = await mgr.getSessionMessages(sessionId);
+    if (msgs.length === 0) return null;
+    return msgs
+      .slice(0, 10)
+      .map(
+        (m) =>
+          `${m.role.toUpperCase()}: ${m.content.replace(/\s+/g, " ").slice(0, 800)}`
+      )
+      .join("\n");
+  }
+
+  /** Spawn a headless `claude -p` (Haiku, JSON output) and parse {title,summary}.
+   * Runs under the active conversation's account so auth matches the UI, and in
+   * a throwaway cwd so the transient print-mode session is NOT written into the
+   * project's transcript folder (which would otherwise pollute the history). */
+  private runClaudeSummary(
+    transcript: string
+  ): Promise<{ title: string; summary: string }> {
+    const prompt =
+      `${SUMMARY_PROMPT_MARKER} Write a concise title and a short summary of ` +
+      "what it is about. Respond with ONLY a JSON object, no markdown, no extra " +
+      'text: {"title": "<max 6 words>", "summary": "<1-2 sentences>"}.\n\n' +
+      `<conversation>\n${transcript}\n</conversation>`;
+
+    const runtime = this.activeKey ? this.runtimes.get(this.activeKey) : undefined;
+    const configDir = this.getConfigDirForAccount(runtime?.accountId);
+    const env: NodeJS.ProcessEnv = { ...process.env };
+    if (configDir) {
+      env.CLAUDE_CONFIG_DIR = configDir;
+    }
+    // The CLI slugifies the *realpath* of cwd (e.g. macOS /tmp → /private/tmp),
+    // so resolve it here too — otherwise the computed delete path won't match.
+    let cwd = os.tmpdir();
+    try {
+      cwd = fs.realpathSync(cwd);
+    } catch {
+      // keep the unresolved path; deletion may then miss but cwd still works
+    }
+
+    return new Promise((resolve, reject) => {
+      const child = execFile(
+        "claude",
+        [
+          "-p",
+          prompt,
+          "--model",
+          "claude-haiku-4-5-20251001",
+          "--output-format",
+          "json",
+        ],
+        { cwd, env, timeout: 60000, maxBuffer: 4 * 1024 * 1024 },
+        (err, stdout) => {
+          if (err) {
+            reject(err);
+            return;
+          }
+          try {
+            // The CLI wraps the model reply in a result envelope; the model's
+            // text (our JSON) is in `.result`. It also writes a transcript for
+            // this throwaway session — delete it so it never lingers anywhere.
+            const envelope = JSON.parse(stdout.trim());
+            if (typeof envelope.session_id === "string") {
+              this.deleteTransientSession(configDir, cwd, envelope.session_id);
+            }
+            const text =
+              typeof envelope.result === "string" ? envelope.result : stdout;
+            resolve(this.parseTitleSummary(text));
+          } catch {
+            resolve(this.parseTitleSummary(stdout));
+          }
+        }
+      );
+      // The prompt is passed via -p; close stdin so the CLI doesn't wait ~3s
+      // for piped input before proceeding.
+      child.stdin?.end();
+    });
+  }
+
+  /** Remove the transcript a throwaway print-mode summary session wrote under
+   * `cwd`'s project slug, so summary calls don't litter the sessions store. */
+  private deleteTransientSession(
+    configDir: string | undefined,
+    cwd: string,
+    sessionId: string
+  ): void {
+    try {
+      const base = configDir || path.join(os.homedir(), ".claude");
+      const slug = cwd.replace(/[^a-zA-Z0-9]/g, "-");
+      const file = path.join(base, "projects", slug, `${sessionId}.jsonl`);
+      if (fs.existsSync(file)) {
+        fs.rmSync(file, { force: true });
+      }
+    } catch {
+      // Non-fatal — worst case a transient session lingers in a temp slug.
+    }
+  }
+
+  /** Extract {title, summary} from model text, tolerating code fences / prose. */
+  private parseTitleSummary(text: string): { title: string; summary: string } {
+    let body = text.trim();
+    const fence = body.match(/```(?:json)?\s*([\s\S]*?)```/);
+    if (fence) body = fence[1].trim();
+    const start = body.indexOf("{");
+    const end = body.lastIndexOf("}");
+    if (start !== -1 && end > start) {
+      try {
+        const obj = JSON.parse(body.slice(start, end + 1));
+        const title = String(obj.title || "").trim();
+        const summary = String(obj.summary || "").trim();
+        if (title || summary) {
+          return { title: title || summary.slice(0, 40), summary: summary || title };
+        }
+      } catch {
+        // fall through to heuristic
+      }
+    }
+    const stripped = text.trim();
+    return {
+      title: stripped.split("\n")[0].slice(0, 50),
+      summary: stripped.slice(0, 200),
+    };
   }
 
   private async loadRuntimeMessages(key: string, runtime: SessionRuntime): Promise<void> {
@@ -814,6 +1083,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
       case "refreshUsage":
         void this.pollUsageForAll();
+        break;
+
+      case "summarizeSession":
+        void this.handleSummarizeSession(message.sessionId);
+        break;
+
+      case "summarizeAllSessions":
+        void this.handleSummarizeAllSessions();
         break;
     }
   }

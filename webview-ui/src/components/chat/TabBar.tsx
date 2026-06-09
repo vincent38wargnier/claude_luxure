@@ -11,6 +11,10 @@ interface TabBarProps {
   onClose: (sessionId: string) => void;
   onNewChat: () => void;
   onListSessions: () => void;
+  summarizingIds?: string[];
+  summarizeProgress?: { done: number; total: number } | null;
+  onSummarizeSession?: (sessionId: string) => void;
+  onSummarizeAll?: () => void;
 }
 
 function truncate(text: string, max: number): string {
@@ -20,6 +24,15 @@ function truncate(text: string, max: number): string {
 
 function isDraftTab(id: string): boolean {
   return id.startsWith("draft-");
+}
+
+function Spinner() {
+  return (
+    <svg className="animate-spin" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+      <circle cx="12" cy="12" r="9" opacity="0.25" />
+      <path d="M21 12a9 9 0 0 0-9-9" strokeLinecap="round" />
+    </svg>
+  );
 }
 
 function groupByTime(sessions: SessionInfo[]): { label: string; items: SessionInfo[] }[] {
@@ -54,6 +67,10 @@ export default function TabBar({
   onClose,
   onNewChat,
   onListSessions,
+  summarizingIds,
+  summarizeProgress,
+  onSummarizeSession,
+  onSummarizeAll,
 }: TabBarProps) {
   const [showHistory, setShowHistory] = useState(false);
   const [search, setSearch] = useState("");
@@ -86,6 +103,10 @@ export default function TabBar({
   }, [sessions]);
 
   const runningSet = useMemo(() => new Set(runningSessionIds), [runningSessionIds]);
+  const summarizingSet = useMemo(
+    () => new Set(summarizingIds || []),
+    [summarizingIds]
+  );
 
   const tabs = useMemo(() => {
     return openTabIds.map((id) => {
@@ -97,7 +118,11 @@ export default function TabBar({
       }
       const session = sessionMap.get(id);
       if (session) {
-        return { id, label: truncate(session.firstMessage, 22), isDraft: false };
+        return {
+          id,
+          label: truncate(session.title || session.firstMessage, 22),
+          isDraft: false,
+        };
       }
       return { id, label: "New chat", isDraft: isDraftTab(id) };
     });
@@ -106,7 +131,12 @@ export default function TabBar({
   const filteredSessions = useMemo(() => {
     if (!search.trim()) return sessions;
     const q = search.toLowerCase();
-    return sessions.filter((s) => s.firstMessage.toLowerCase().includes(q));
+    return sessions.filter(
+      (s) =>
+        s.firstMessage.toLowerCase().includes(q) ||
+        !!s.title?.toLowerCase().includes(q) ||
+        !!s.summary?.toLowerCase().includes(q)
+    );
   }, [sessions, search]);
 
   const groups = useMemo(() => groupByTime(filteredSessions), [filteredSessions]);
@@ -165,6 +195,32 @@ export default function TabBar({
           </svg>
         </button>
 
+        {onSummarizeAll && (
+          <button
+            onClick={onSummarizeAll}
+            disabled={!!summarizeProgress}
+            title="Generate titles & summaries for all conversations"
+            className={`p-1 rounded transition-colors flex items-center gap-1 ${
+              summarizeProgress
+                ? "text-[#60a5fa]"
+                : "text-vscode-descriptionFg hover:text-vscode-fg hover:bg-[rgba(255,255,255,0.06)]"
+            }`}
+          >
+            {summarizeProgress ? (
+              <Spinner />
+            ) : (
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10z" />
+              </svg>
+            )}
+            {summarizeProgress && (
+              <span className="text-[9px] tabular-nums">
+                {summarizeProgress.done}/{summarizeProgress.total}
+              </span>
+            )}
+          </button>
+        )}
+
         <div className="relative" ref={historyRef}>
           <button
             onClick={() => {
@@ -213,15 +269,27 @@ export default function TabBar({
                         const isCurrent = session.id === currentTabId;
                         const isOpen = openTabIds.includes(session.id);
                         const isRunning = runningSet.has(session.id);
+                        const isSummarizing = summarizingSet.has(session.id);
+                        const label = session.title || session.firstMessage;
+                        const selectSession = () => {
+                          onSelect(session.id);
+                          setShowHistory(false);
+                          setSearch("");
+                        };
                         return (
-                          <button
+                          <div
                             key={session.id}
-                            onClick={() => {
-                              onSelect(session.id);
-                              setShowHistory(false);
-                              setSearch("");
+                            role="button"
+                            tabIndex={0}
+                            title={session.summary || undefined}
+                            onClick={selectSession}
+                            onKeyDown={(e) => {
+                              if (e.key === "Enter" || e.key === " ") {
+                                e.preventDefault();
+                                selectSession();
+                              }
                             }}
-                            className={`w-full px-3 py-1.5 text-left transition-colors flex items-center gap-2 ${
+                            className={`group w-full px-3 py-1.5 text-left transition-colors flex items-center gap-2 cursor-pointer ${
                               isCurrent
                                 ? "bg-[rgba(59,130,246,0.08)]"
                                 : "hover:bg-[rgba(255,255,255,0.04)]"
@@ -237,15 +305,38 @@ export default function TabBar({
                               <div className={`text-[11px] leading-snug truncate ${
                                 isCurrent ? "text-[#60a5fa]" : "text-vscode-fg"
                               }`}>
-                                {truncate(session.firstMessage, 45)}
+                                {truncate(label, 45)}
                               </div>
                             </div>
+                            {onSummarizeSession && (
+                              <button
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  onSummarizeSession(session.id);
+                                }}
+                                disabled={isSummarizing}
+                                title={
+                                  session.title
+                                    ? "Regenerate title & summary"
+                                    : "Generate title & summary"
+                                }
+                                className="shrink-0 p-0.5 rounded text-vscode-descriptionFg opacity-0 group-hover:opacity-70 hover:!opacity-100 hover:bg-[rgba(255,255,255,0.1)] transition-all"
+                              >
+                                {isSummarizing ? (
+                                  <Spinner />
+                                ) : (
+                                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                                    <path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10z" />
+                                  </svg>
+                                )}
+                              </button>
+                            )}
                             {isOpen && (
                               <span className="text-[8px] text-vscode-descriptionFg opacity-40 shrink-0">
                                 open
                               </span>
                             )}
-                          </button>
+                          </div>
                         );
                       })}
                     </div>

@@ -12,7 +12,11 @@ export interface SessionSummary {
 }
 
 function getProjectSlug(workspacePath: string): string {
-  return "-" + workspacePath.replace(/\//g, "-").replace(/^-/, "");
+  // Match the Claude CLI's own normalization: every non-alphanumeric character
+  // (including "/", ".", "_") collapses to "-". Replacing only "/" breaks for
+  // paths like ".../magify.fun/code/claude_luxure", whose real transcript dir is
+  // "-Users-...-magify-fun-code-claude-luxure".
+  return workspacePath.replace(/[^a-zA-Z0-9]/g, "-");
 }
 
 function getSessionsDir(workspacePath: string): string {

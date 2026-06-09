@@ -126,6 +126,11 @@ export interface SessionInfo {
   timestamp: string;
   messageCount: number;
   modifiedAt: number;
+  /** Claude-generated short title (replaces the raw first-message slice in the
+   * list when present). Produced on demand via the summarize action. */
+  title?: string;
+  /** Claude-generated 1-2 sentence summary, shown on hover. */
+  summary?: string;
 }
 
 export type SkillScope = "global" | "project";
@@ -169,7 +174,9 @@ export type WebviewMessage =
   | { type: "switchAccount"; accountId: string }
   | { type: "addAccount" }
   | { type: "removeAccount"; accountId: string }
-  | { type: "refreshUsage" };
+  | { type: "refreshUsage" }
+  | { type: "summarizeSession"; sessionId: string }
+  | { type: "summarizeAllSessions" };
 
 export type McpConnectionState = "connecting" | "connected" | "stopped" | "error";
 
@@ -208,7 +215,15 @@ export type ExtensionMessage =
   | {
       type: "usageByAccount";
       usageByAccount: Record<string, UsageInfo | null>;
-    };
+    }
+  | {
+      type: "summarizeStatus";
+      sessionId: string;
+      status: "pending" | "done" | "error";
+      title?: string;
+      summary?: string;
+    }
+  | { type: "summarizeProgress"; done: number; total: number };
 
 export interface ExtensionState {
   mode: Mode;
