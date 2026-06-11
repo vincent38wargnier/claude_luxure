@@ -115,6 +115,7 @@ export type ActivityEvent =
   | { type: "thinking_delta"; text: string };
 
 export const AVAILABLE_MODELS = [
+  { id: "claude-fable-5", alias: "fable", label: "Fable 5" },
   { id: "claude-sonnet-4-20250514", alias: "sonnet", label: "Sonnet 4" },
   { id: "claude-opus-4-20250514", alias: "opus", label: "Opus 4" },
   { id: "claude-haiku-4-5-20251001", alias: "haiku", label: "Haiku 4.5" },

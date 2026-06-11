@@ -108,6 +108,9 @@ interface SessionRuntime {
   /** Which account (StoredAccount.id) this conversation is bound to. "default"
    * or undefined → ambient keychain login; otherwise an isolated config-dir. */
   accountId?: string;
+  /** Watchdog that ends a turn which has gone silent (no CLI output) for too
+   * long — e.g. the model parked work in the background and never resumes. */
+  watchdogTimer?: ReturnType<typeof setTimeout>;
 }
 
 function createEmptyRuntime(): SessionRuntime {
@@ -139,6 +142,12 @@ function sessionNameFromText(text: string): string {
  * conversation — used to keep it out of the history list. */
 const SUMMARY_PROMPT_MARKER =
   "Below is the start of a conversation between a user and an AI coding assistant.";
+
+/** How long a streaming turn may receive zero CLI output before we assume it
+ * stalled (e.g. the model deferred work to a background task that can't resume
+ * in headless mode) and unstick the UI. Generous, so a long-but-live foreground
+ * tool isn't cut short. */
+const STREAM_WATCHDOG_MS = 180000; // 3 minutes
 
 /**
  * Render prior conversation turns as a context block for a rewound (edited)
@@ -2120,6 +2129,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       this.postMessage({ type: "message", message: assistantMessage });
     }
 
+    this.armStreamWatchdog(runtimeKey, runtime);
     this.sendState();
   }
 
@@ -2388,6 +2398,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     bridge.on("event", (event: ClaudeEvent) => {
       log("EVENT", event.type, event.subtype || "");
+      // Any CLI output means the turn is still alive — push the watchdog out.
+      if (!isStale() && runtime.streamingMessageId) {
+        this.armStreamWatchdog(runtimeKey, runtime);
+      }
     });
 
     bridge.on("rawOutput", (text: string) => {
@@ -2561,11 +2575,45 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
+  /** (Re)start the silence watchdog for a streaming turn. Called when a turn
+   * starts and on every CLI event, so it only fires after a true gap. */
+  private armStreamWatchdog(runtimeKey: string, runtime: SessionRuntime): void {
+    this.clearStreamWatchdog(runtime);
+    if (!runtime.streamingMessageId) {
+      return;
+    }
+    runtime.watchdogTimer = setTimeout(() => {
+      this.fireStreamWatchdog(runtimeKey, runtime);
+    }, STREAM_WATCHDOG_MS);
+  }
+
+  private clearStreamWatchdog(runtime: SessionRuntime): void {
+    if (runtime.watchdogTimer) {
+      clearTimeout(runtime.watchdogTimer);
+      runtime.watchdogTimer = undefined;
+    }
+  }
+
+  /** End a turn that has gone silent too long so the UI isn't trapped. We do NOT
+   * kill the bridge — the session stays alive, so a late reply (or the user's
+   * next message) still works. */
+  private fireStreamWatchdog(runtimeKey: string, runtime: SessionRuntime): void {
+    if (!runtime.streamingMessageId) {
+      return;
+    }
+    log("WARN", "Stream watchdog fired; ending stalled turn:", runtimeKey);
+    const notice =
+      "\n\n---\n⏳ *This turn went quiet. The model may have left work running in the background, which this view can't resume on its own — send a message to continue.*";
+    runtime.currentStreamText = (runtime.currentStreamText || "") + notice;
+    this.finalizeStreamingMessage(runtimeKey, runtime, this.isActiveKey(runtimeKey));
+  }
+
   private finalizeStreamingMessage(
     runtimeKey: string,
     runtime: SessionRuntime,
     notifyWebview: boolean
   ): void {
+    this.clearStreamWatchdog(runtime);
     if (!runtime.streamingMessageId) {
       return;
     }

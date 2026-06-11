@@ -35,6 +35,15 @@ const PLAN_MODE_SYSTEM_PROMPT = `You are in PLAN MODE. You must ONLY:
 4. NEVER use Write, Edit, Bash, or any tool that modifies files
 Present your analysis and proposed changes clearly in markdown.`;
 
+// This UI drives the CLI in request/response (stream-json) mode: there is no
+// loop that re-invokes the model when a background task finishes. If the model
+// defers work to the background and ends its turn, the turn never produces a
+// `result` and the conversation hangs. So forbid that pattern outright.
+const NO_BACKGROUND_DEFERRAL_SYSTEM_PROMPT = `You are running inside a request/response chat UI. There is NO mechanism that re-invokes you when a background task or process finishes — once your turn ends, nothing will resume it. Therefore:
+- NEVER start long-running work in the background and tell the user you will "report back", "let them know", or "check in" later. That message would be the last thing they ever see and the turn would hang forever.
+- If you start something in the background, you MUST poll it to completion within THIS turn (e.g. read its output until done) before you finish — or simply run it in the foreground and wait.
+- If the work is genuinely too long to finish now, do NOT silently wait: end your turn by explicitly telling the user to send a message (e.g. "tell me to check on it") so a new turn can resume the work.`;
+
 // Always appended so the assistant's prose renders cleanly in the chat webview.
 const MARKDOWN_STYLE_SYSTEM_PROMPT = `Format every response as clean, well-structured GitHub-flavored Markdown:
 - Use ## and ### headings to organize anything longer than a couple of paragraphs, and keep a blank line around headings, lists, tables, and code blocks.
@@ -186,7 +195,10 @@ export class ClaudeBridge extends EventEmitter {
 
     // Combine into a single --append-system-prompt; the markdown styling is
     // always on, with the plan-mode constraints layered in when relevant.
-    const systemPromptParts = [MARKDOWN_STYLE_SYSTEM_PROMPT];
+    const systemPromptParts = [
+      MARKDOWN_STYLE_SYSTEM_PROMPT,
+      NO_BACKGROUND_DEFERRAL_SYSTEM_PROMPT,
+    ];
     if (this.options.mode === "plan") {
       systemPromptParts.push(PLAN_MODE_SYSTEM_PROMPT);
       args.push(
