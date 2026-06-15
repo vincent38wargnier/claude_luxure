@@ -213,6 +213,7 @@ export type WebviewMessage =
   | { type: "switchAccount"; accountId: string }
   | { type: "addAccount" }
   | { type: "removeAccount"; accountId: string }
+  | { type: "reauthAccount"; accountId: string }
   | { type: "refreshUsage" }
   | { type: "summarizeSession"; sessionId: string }
   | { type: "summarizeAllSessions" };
@@ -254,6 +255,9 @@ export type ExtensionMessage =
   | {
       type: "usageByAccount";
       usageByAccount: Record<string, UsageInfo | null>;
+      /** Account ids whose stored login can no longer authenticate and can't
+       * self-heal (expired token, no refresh token) → show a Reconnect button. */
+      disconnected?: Record<string, boolean>;
     }
   | {
       type: "summarizeStatus";

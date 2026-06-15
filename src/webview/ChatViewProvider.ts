@@ -210,9 +210,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private cachedCliVersion: string | undefined;
   // Cache per keychain service name: the global "Claude Code-credentials"
   // (Default) plus one per config-dir account ("…-<sha256(configDir)[:8]>").
+  // Holds the full claudeAiOauth record (accessToken + expiresAt + refreshToken)
+  // so disconnection can be judged without an extra `security` spawn.
   private cachedKeychainTokens = new Map<
     string,
-    { token: string; at: number }
+    { record: Record<string, any>; at: number }
   >();
 
   constructor(
@@ -1090,6 +1092,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         await this.handleRemoveAccount(message.accountId);
         break;
 
+      case "reauthAccount":
+        await this.handleReauthAccount(message.accountId);
+        break;
+
       case "refreshUsage":
         void this.pollUsageForAll();
         break;
@@ -1489,14 +1495,102 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     void this.pollUsageForActive();
   }
 
+  /** Re-run the browser login for an account whose stored token can no longer
+   * authenticate (see {@link isOAuthDead}) — the one-click "Reconnect" action.
+   * Same login mechanics as {@link handleAddAccount}, but refreshes an existing
+   * account in place instead of creating one. */
+  private async handleReauthAccount(accountId: string): Promise<void> {
+    const configDir = this.getConfigDirForAccount(accountId);
+    const label = this.labelFor(accountId);
+    if (configDir) {
+      this.linkSharedAssets(configDir);
+    }
+
+    const terminal = vscode.window.createTerminal({
+      name: `Reconnect ${label}`,
+      env: configDir ? { CLAUDE_CONFIG_DIR: configDir } : undefined,
+    });
+    terminal.show();
+    terminal.sendText("claude auth login");
+    vscode.window.showInformationMessage(
+      `Reconnecting ${label} — finish the login in your browser (use an incognito window if it differs from your current claude.ai login). I'll detect it automatically.`
+    );
+
+    const ok = await this.waitForReconnect(accountId, configDir);
+    terminal.dispose();
+    if (!ok) {
+      vscode.window.showWarningMessage(
+        `Didn't detect a completed login for ${label}. Click Reconnect to try again.`
+      );
+      // Re-poll so the bar reflects the still-disconnected state.
+      void this.pollUsageForAll();
+      return;
+    }
+
+    // Refresh the stored profile (subscription/email can change on re-login).
+    if (configDir) {
+      const info = await this.authStatusForDir(configDir);
+      if (info?.email) {
+        const added = this.getAddedAccounts();
+        const acct = added.find((a) => a.id === accountId);
+        if (acct) {
+          acct.email = info.email;
+          acct.label = info.email;
+          acct.subscriptionType = info.subscriptionType;
+          await this.context.globalState.update("claude-luxure.accounts", added);
+        }
+      }
+    }
+
+    // Any open conversation bound to this account is still pointing at the dead
+    // token — restart its process so it picks up the fresh credential (same
+    // mechanism as switch/MCP restart; the conversation is preserved).
+    for (const runtime of this.runtimes.values()) {
+      if ((runtime.accountId || "default") === accountId && runtime.bridge) {
+        runtime.bridge.restart({ configDir: configDir ?? "" });
+      }
+    }
+
+    this.sendAccountsList();
+    void this.pollUsageForAll();
+    vscode.window.showInformationMessage(`Reconnected ${label}.`);
+  }
+
+  /** Poll until a re-login has stored a *fresh* (non-expired) token for the
+   * account, or time out (~3 min). Unlike {@link waitForLogin} we can't watch
+   * `auth status` (a disconnected account already reports `loggedIn:true` from
+   * its stale credential) — so we watch the credential itself flip from
+   * expired-with-no-refresh to a future expiry, invalidating the 60s cache each
+   * pass so we read the keychain fresh. */
+  private async waitForReconnect(
+    accountId: string,
+    configDir: string | undefined,
+    attempts = 60
+  ): Promise<boolean> {
+    for (let i = 0; i < attempts; i++) {
+      this.invalidateKeychainCache(configDir);
+      const record = await this.resolveOAuthRecord(accountId);
+      const expiresAt =
+        typeof record?.expiresAt === "number" ? record.expiresAt : 0;
+      if (record?.accessToken && expiresAt > Date.now()) {
+        return true;
+      }
+      await new Promise((r) => setTimeout(r, 3000));
+    }
+    return false;
+  }
+
   // ───────────────────────── Usage ─────────────────────────
 
-  /** Access token for GET /api/oauth/usage: for a config-dir account, read its
-   * own file-based credential (full scope, so the endpoint allows it); for the
-   * Default account, the auto-refreshed keychain token. */
-  private async resolveUsageToken(
+  /** The full OAuth credential record (accessToken + expiresAt + refreshToken +
+   * scopes) for an account: for a config-dir account, its own keychain entry
+   * (full scope, so the usage endpoint allows it), falling back to the Linux
+   * `.credentials.json`; for the Default account, the auto-refreshed keychain
+   * token. Source of truth for both {@link resolveUsageToken} and
+   * {@link isOAuthDead}. */
+  private async resolveOAuthRecord(
     accountId: string | undefined
-  ): Promise<string | undefined> {
+  ): Promise<Record<string, any> | undefined> {
     const configDir = this.getConfigDirForAccount(accountId);
     if (configDir) {
       // On macOS the CLI stores a custom-config-dir login in a keychain entry
@@ -1504,7 +1598,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       // (That file only exists on Linux/other.) Read the keychain entry first so
       // added accounts — which have full `user:profile` scope, same as Default —
       // get real usage too. This is the whole reason their bars were blank.
-      const fromKeychain = await this.readKeychainToken(
+      const fromKeychain = await this.readKeychainRecord(
         this.keychainServiceForConfigDir(configDir)
       );
       if (fromKeychain) {
@@ -1515,12 +1609,39 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           path.join(configDir, ".credentials.json"),
           "utf-8"
         );
-        return JSON.parse(raw)?.claudeAiOauth?.accessToken;
+        return JSON.parse(raw)?.claudeAiOauth;
       } catch {
         return undefined;
       }
     }
-    return await this.readKeychainToken();
+    return await this.readKeychainRecord();
+  }
+
+  /** Access token for GET /api/oauth/usage and for judging connection health. */
+  private async resolveUsageToken(
+    accountId: string | undefined
+  ): Promise<string | undefined> {
+    return (await this.resolveOAuthRecord(accountId))?.accessToken;
+  }
+
+  /** True when an account's stored login can no longer authenticate AND can't
+   * self-heal: an expired access token with no refresh token for the CLI to
+   * refresh with. That is exactly what yields "401 Invalid authentication
+   * credentials" on every request. The Default account keeps a valid refresh
+   * token (auto-refreshed ~hourly), so it isn't flagged; added config-dir
+   * accounts whose refresh token went missing are.
+   *
+   * A missing/unreadable record is deliberately NOT treated as dead: a transient
+   * `security` read hiccup must not flag a healthy Default account — it just
+   * yields blank bars, as before. */
+  private isOAuthDead(record: Record<string, any> | undefined): boolean {
+    if (!record?.accessToken) {
+      return false;
+    }
+    const expiresAt =
+      typeof record.expiresAt === "number" ? record.expiresAt : 0;
+    const expired = expiresAt > 0 && expiresAt < Date.now();
+    return expired && !record.refreshToken;
   }
 
   /** The macOS keychain service name the CLI uses for a custom-config-dir login:
@@ -1535,16 +1656,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     return `Claude Code-credentials-${suffix}`;
   }
 
-  /** Read the ambient keychain OAuth access token (macOS). May prompt once for
-   * keychain access ("Always Allow" makes subsequent reads silent). */
-  private readKeychainToken(
+  /** Read the keychain OAuth record (macOS). May prompt once for keychain access
+   * ("Always Allow" makes subsequent reads silent). */
+  private readKeychainRecord(
     service = "Claude Code-credentials"
-  ): Promise<string | undefined> {
+  ): Promise<Record<string, any> | undefined> {
     // The keychain token is valid ~60min (the CLI refreshes it). Cache for 60s
     // so frequent polls (e.g. after every turn) don't spawn `security` each time.
     const cached = this.cachedKeychainTokens.get(service);
     if (cached && Date.now() - cached.at < 60_000) {
-      return Promise.resolve(cached.token);
+      return Promise.resolve(cached.record);
     }
     return new Promise((resolve) => {
       if (process.platform !== "darwin") {
@@ -1561,17 +1682,31 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           }
           try {
             const json = JSON.parse(stdout.trim());
-            const token = json?.claudeAiOauth?.accessToken;
-            if (token) {
-              this.cachedKeychainTokens.set(service, { token, at: Date.now() });
+            const record = json?.claudeAiOauth;
+            if (record?.accessToken) {
+              this.cachedKeychainTokens.set(service, {
+                record,
+                at: Date.now(),
+              });
             }
-            resolve(token);
+            resolve(record);
           } catch {
             resolve(undefined);
           }
         }
       );
     });
+  }
+
+  /** Drop the cached keychain record so the next read re-fetches from the
+   * keychain — call right after a (re)login replaces the stored credential, or
+   * the 60s cache would keep serving the old (dead) token. */
+  private invalidateKeychainCache(configDir?: string): void {
+    this.cachedKeychainTokens.delete(
+      configDir
+        ? this.keychainServiceForConfigDir(configDir)
+        : "Claude Code-credentials"
+    );
   }
 
   private getCliVersion(): Promise<string> {
@@ -1673,16 +1808,22 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       const accounts = this.getAllAccounts();
       const entries = await Promise.all(
         accounts.map(async (a) => {
-          const token = await this.resolveUsageToken(a.id);
-          const usage = token ? await this.fetchUsage(token) : null;
-          return [a.id, usage] as const;
+          const record = await this.resolveOAuthRecord(a.id);
+          const dead = this.isOAuthDead(record);
+          const token = record?.accessToken;
+          // Don't spend a request on a token we already know is dead — it just
+          // 401s/429s (and repeated dead-token calls trip the rate limiter).
+          const usage = !dead && token ? await this.fetchUsage(token) : null;
+          return [a.id, usage, dead] as const;
         })
       );
       const usageByAccount: Record<string, UsageInfo | null> = {};
-      for (const [id, usage] of entries) {
+      const disconnected: Record<string, boolean> = {};
+      for (const [id, usage, dead] of entries) {
         usageByAccount[id] = usage;
+        disconnected[id] = dead;
       }
-      this.postMessage({ type: "usageByAccount", usageByAccount });
+      this.postMessage({ type: "usageByAccount", usageByAccount, disconnected });
       // Keep the bottom bars in sync with the same data, no extra request.
       const runtime = this.activeKey
         ? this.runtimes.get(this.activeKey)
@@ -2389,6 +2530,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         this.postMessage({ type: "error", error: err });
       }
       this.outputChannel.appendLine(`[ERROR] ${err}`);
+      // An auth failure (e.g. "401 Invalid authentication credentials") means
+      // this account's stored token is likely dead — re-poll so the Reconnect
+      // button surfaces immediately instead of after the next 180s tick.
+      if (/401|invalid authentication|unauthor|oauth|credential/i.test(err)) {
+        void this.pollUsageForAll();
+      }
     });
 
     bridge.on("stderr", (text: string) => {

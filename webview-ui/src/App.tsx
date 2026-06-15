@@ -42,6 +42,9 @@ export default function App() {
   const [usageByAccount, setUsageByAccount] = useState<
     Record<string, UsageInfo | null>
   >({});
+  const [disconnectedAccounts, setDisconnectedAccounts] = useState<
+    Record<string, boolean>
+  >({});
   const [summarizingIds, setSummarizingIds] = useState<string[]>([]);
   const [summarizeProgress, setSummarizeProgress] = useState<
     { done: number; total: number } | null
@@ -168,6 +171,7 @@ export default function App() {
 
       case "usageByAccount":
         setUsageByAccount(msg.usageByAccount);
+        setDisconnectedAccounts(msg.disconnected ?? {});
         break;
 
       case "summarizeStatus": {
@@ -535,6 +539,10 @@ export default function App() {
     vscode.postMessage({ type: "removeAccount", accountId });
   }, []);
 
+  const handleReauthAccount = useCallback((accountId: string) => {
+    vscode.postMessage({ type: "reauthAccount", accountId });
+  }, []);
+
   const isStreaming = state.isStreaming ?? false;
   const skillsDirty = editorContent !== savedEditorContent;
   const streamingText = isStreaming ? liveStreamingText : "";
@@ -606,9 +614,11 @@ export default function App() {
         activeAccountId={activeAccountId}
         usage={usage}
         usageByAccount={usageByAccount}
+        disconnectedAccounts={disconnectedAccounts}
         onSwitchAccount={handleSwitchAccount}
         onAddAccount={handleAddAccount}
         onRemoveAccount={handleRemoveAccount}
+        onReauthAccount={handleReauthAccount}
         summarizingIds={summarizingIds}
         summarizeProgress={summarizeProgress}
         onSummarizeSession={handleSummarizeSession}

@@ -1,5 +1,12 @@
 import { useState, useRef, useEffect } from "react";
-import { Check, Plus, Trash2, ChevronDown } from "lucide-react";
+import {
+  Check,
+  Plus,
+  Trash2,
+  ChevronDown,
+  AlertTriangle,
+  RefreshCw,
+} from "lucide-react";
 import type { StoredAccount, UsageInfo } from "../../types";
 
 interface Props {
@@ -7,12 +14,15 @@ interface Props {
   activeAccountId?: string;
   /** Per-account subscription usage, keyed by account id (incl. "default"). */
   usageByAccount?: Record<string, UsageInfo | null>;
+  /** Account ids whose login expired and can't refresh → show "Reconnect". */
+  disconnected?: Record<string, boolean>;
   /** Shown when the accounts list hasn't loaded yet (keychain email). */
   fallbackEmail?: string;
   fallbackOrg?: string;
   onSwitch?: (accountId: string) => void;
   onAdd?: () => void;
   onRemove?: (accountId: string) => void;
+  onReauth?: (accountId: string) => void;
 }
 
 /** A compact session/weekly usage readout shown under each account in the
@@ -58,11 +68,13 @@ export default function AccountSwitcher({
   accounts,
   activeAccountId,
   usageByAccount,
+  disconnected,
   fallbackEmail,
   fallbackOrg,
   onSwitch,
   onAdd,
   onRemove,
+  onReauth,
 }: Props) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
@@ -84,6 +96,7 @@ export default function AccountSwitcher({
   const activeId = activeAccountId || "default";
   const active = list.find((a) => a.id === activeId);
   const activeLabel = active?.label || fallbackEmail || "Account";
+  const activeDisconnected = !!disconnected?.[activeId];
 
   // Nothing to show or do.
   if (!onSwitch && !fallbackEmail) {
@@ -95,10 +108,23 @@ export default function AccountSwitcher({
       <button
         type="button"
         onClick={() => setOpen((v) => !v)}
-        className="flex items-center gap-0.5 text-[10px] text-vscode-descriptionFg opacity-60 hover:opacity-100 transition-opacity max-w-[150px]"
-        title={`Account: ${activeLabel}${fallbackOrg ? ` (${fallbackOrg})` : ""}\nClick to switch the account for this conversation`}
+        className={
+          activeDisconnected
+            ? "flex items-center gap-1 text-[10px] text-[#f87171] opacity-100 transition-opacity max-w-[150px]"
+            : "flex items-center gap-0.5 text-[10px] text-vscode-descriptionFg opacity-60 hover:opacity-100 transition-opacity max-w-[150px]"
+        }
+        title={
+          activeDisconnected
+            ? `${activeLabel} — session expired. Click to reconnect.`
+            : `Account: ${activeLabel}${fallbackOrg ? ` (${fallbackOrg})` : ""}\nClick to switch the account for this conversation`
+        }
       >
-        <span className="truncate">{activeLabel}</span>
+        {activeDisconnected && (
+          <AlertTriangle size={10} className="shrink-0" />
+        )}
+        <span className="truncate">
+          {activeDisconnected ? `Reconnect ${activeLabel}` : activeLabel}
+        </span>
         <ChevronDown size={10} className="shrink-0 opacity-70" />
       </button>
 
@@ -106,6 +132,7 @@ export default function AccountSwitcher({
         <div className="absolute bottom-full right-0 mb-1.5 min-w-[210px] rounded-md border border-[var(--app-border)] bg-[var(--app-surface-2)] shadow-lg py-1 z-50">
           {list.map((a) => {
             const u = usageByAccount?.[a.id];
+            const isDead = !!disconnected?.[a.id];
             return (
               <div
                 key={a.id}
@@ -129,6 +156,12 @@ export default function AccountSwitcher({
                         default
                       </span>
                     )}
+                    {isDead && (
+                      <AlertTriangle
+                        size={10}
+                        className="shrink-0 text-[#f87171]"
+                      />
+                    )}
                   </div>
                   {!a.isDefault && onRemove && (
                     <button
@@ -144,7 +177,25 @@ export default function AccountSwitcher({
                     </button>
                   )}
                 </div>
-                {u && <MiniUsage usage={u} />}
+                {isDead ? (
+                  onReauth && (
+                    <button
+                      type="button"
+                      className="flex items-center gap-1 mt-1 ml-[18px] px-1.5 py-0.5 rounded text-[10px] text-[#f87171] border border-[#f87171]/40 hover:bg-[#f87171]/10 transition-colors"
+                      title="Session expired — log in again to restore this account"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onReauth(a.id);
+                        setOpen(false);
+                      }}
+                    >
+                      <RefreshCw size={10} className="shrink-0" />
+                      Reconnect — session expired
+                    </button>
+                  )
+                ) : (
+                  u && <MiniUsage usage={u} />
+                )}
               </div>
             );
           })}
