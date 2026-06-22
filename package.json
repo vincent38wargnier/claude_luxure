@@ -18,6 +18,9 @@
     "onCommand:claude-luxure.openChat"
   ],
   "main": "./dist/extension.js",
+  "extensionKind": [
+    "workspace"
+  ],
   "contributes": {
     "viewsContainers": {
       "activitybar": [
@@ -105,6 +108,20 @@
           "group": "navigation"
         }
       ]
+    },
+    "configuration": {
+      "title": "Claude Luxure",
+      "properties": {
+        "claude-luxure.extraAccountDirs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "scope": "machine-overridable",
+          "markdownDescription": "Extra `CLAUDE_CONFIG_DIR` paths to auto-detect as accounts on a remote/SSH host (for logins created by hand with `CLAUDE_CONFIG_DIR=… claude auth login`). Scanned at startup and added to the account switcher if logged in. `~` is expanded. The ambient `~/.claude` login already appears as **Default**."
+        }
+      }
     }
   },
   "scripts": {

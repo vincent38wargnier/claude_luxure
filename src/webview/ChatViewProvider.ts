@@ -232,6 +232,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.model = this.context.workspaceState.get<string>("claude-luxure.model");
     this.effort = this.context.workspaceState.get<EffortLevel>("claude-luxure.effort");
     this.fetchAccountInfo();
+    // On a remote (SSH/WSL/container) host, surface the Claude logins that exist
+    // on THAT machine in the switcher automatically — no manual "Add account".
+    // Local windows are unaffected: vscode.env.remoteName is undefined locally.
+    if (vscode.env.remoteName) {
+      void this.autoDetectAccounts();
+    }
     this.restoreLastSession();
   }
 
@@ -1273,6 +1279,92 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       accounts: this.getAllAccounts(),
       activeAccountId: runtime?.accountId || "default",
     });
+  }
+
+  /** Discover Claude logins present on the current machine and surface them in
+   * the switcher without a manual "Add account". Runs on remote (SSH/WSL/
+   * container) hosts at startup — see the constructor. The ambient ~/.claude
+   * login is already represented as "Default", so only *additional* config-dir
+   * logins are added here, from two sources:
+   *   1. this extension's own isolated-account dirs (<globalStorage>/accounts/*)
+   *      — reconciles dirs that exist on the box but dropped out of globalState;
+   *   2. dirs listed in the `claude-luxure.extraAccountDirs` setting — for
+   *      accounts created by hand with CLAUDE_CONFIG_DIR.
+   * Idempotent: an account already known (by id or configDir), missing, or not
+   * currently logged in is skipped. */
+  private async autoDetectAccounts(): Promise<void> {
+    try {
+      const added = this.getAddedAccounts();
+      const knownIds = new Set(added.map((a) => a.id));
+      const knownDirs = new Set(
+        added.map((a) => a.configDir).filter(Boolean) as string[]
+      );
+
+      const candidates: string[] = [];
+      // (1) This extension's own account dirs on this machine.
+      const accountsRoot = path.join(
+        this.context.globalStorageUri.fsPath,
+        "accounts"
+      );
+      try {
+        for (const e of fs.readdirSync(accountsRoot, { withFileTypes: true })) {
+          if (e.isDirectory()) {
+            candidates.push(path.join(accountsRoot, e.name));
+          }
+        }
+      } catch {
+        // No accounts dir yet — nothing app-created on this machine.
+      }
+      // (2) User-configured extra config dirs (hand-made logins).
+      const extra = vscode.workspace
+        .getConfiguration("claude-luxure")
+        .get<string[]>("extraAccountDirs", []);
+      for (const raw of extra) {
+        candidates.push(raw.replace(/^~(?=$|[/\\])/, os.homedir()));
+      }
+
+      let discovered = 0;
+      for (const dir of candidates) {
+        if (knownDirs.has(dir) || !fs.existsSync(dir)) {
+          continue;
+        }
+        // Reuse the original id for app-created dirs (basename is the former id)
+        // so existing per-session bindings (accountFor.<sessionId>) still resolve.
+        const base = path.basename(dir);
+        const id = /^acct-/.test(base) ? base : `acct-detected-${generateId()}`;
+        if (knownIds.has(id)) {
+          continue;
+        }
+        const info = await this.authStatusForDir(dir);
+        if (!info?.loggedIn) {
+          continue;
+        }
+        knownIds.add(id);
+        knownDirs.add(dir);
+        this.linkSharedAssets(dir);
+        added.push({
+          id,
+          label: info.email || `Account ${added.length + 1}`,
+          email: info.email,
+          subscriptionType: info.subscriptionType,
+          isDefault: false,
+          configDir: dir,
+        });
+        discovered++;
+      }
+
+      if (discovered > 0) {
+        await this.context.globalState.update("claude-luxure.accounts", added);
+        this.sendAccountsList();
+        void this.pollUsageForAll();
+        log(
+          "INFO",
+          `autoDetectAccounts: linked ${discovered} account(s) on remote host`
+        );
+      }
+    } catch (err) {
+      log("ERROR", "autoDetectAccounts failed:", err);
+    }
   }
 
   /** Bind the active conversation to a different account. If a process is
@@ -2921,6 +3013,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         activeTabId: this.activeKey,
         isStreaming: !!runtime.streamingMessageId,
         streamingText: runtime.currentStreamText,
+        // Carry the in-flight turn's live timeline + activity feed so switching
+        // back into a still-running conversation rehydrates the full live view
+        // (tool calls + interleaved prose), not just the prose. Both are []
+        // whenever no turn is streaming (reset on send/finalize), so this stays
+        // cheap on the idle/finished path.
+        streamingTimeline: runtime.currentTimeline,
+        streamingActivities: runtime.currentActivities,
         runningSessionIds: this.getRunningSessionIds(),
         cost: runtime.cost,
         contextInfo: runtime.lastContext,

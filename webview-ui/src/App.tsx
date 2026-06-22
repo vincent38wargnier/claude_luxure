@@ -89,15 +89,20 @@ export default function App() {
 
     switch (msg.type) {
       case "state": {
-        // Only reset the live activity buffer when switching tabs — clearing it on
-        // every state update would wipe the in-progress feed mid-stream.
+        // Only touch the live buffers when switching tabs — overwriting them on
+        // every state update would wipe the in-progress feed mid-stream. On a
+        // real switch, rehydrate them from the snapshot so a conversation that
+        // is still streaming in the background shows its full live view (tool
+        // calls + interleaved prose), not a frozen/collapsed fragment. The
+        // arrays are empty whenever no turn is in flight, so this also correctly
+        // clears the buffers when switching to an idle/finished conversation.
         const tabChanged = activeTabRef.current !== msg.state.activeTabId;
         activeTabRef.current = msg.state.activeTabId;
         setState(msg.state);
         setLiveStreamingText(msg.state.streamingText || "");
         if (tabChanged) {
-          setActivities([]);
-          setLiveTimeline([]);
+          setActivities(msg.state.streamingActivities ?? []);
+          setLiveTimeline(msg.state.streamingTimeline ?? []);
         }
         break;
       }

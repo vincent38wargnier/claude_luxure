@@ -137,6 +137,13 @@ export interface ExtensionState {
   activeTabId?: string;
   isStreaming?: boolean;
   streamingText?: string;
+  /** Ordered prose/activity timeline of the in-flight turn. Sent so a tab
+   * switched back into a still-running conversation can rehydrate the LIVE view
+   * (tool calls + interleaved prose), not just the plain text. Empty when no
+   * turn is streaming. */
+  streamingTimeline?: TimelinePart[];
+  /** Activity feed of the in-flight turn, for the same rehydrate-on-switch. */
+  streamingActivities?: ActivityEvent[];
   runningSessionIds?: string[];
   cost?: CostInfo;
   contextInfo?: ContextInfo;
