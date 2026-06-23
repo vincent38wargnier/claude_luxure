@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback, useEffect, useMemo } from "react";
+import { useState, useRef, useCallback, useEffect, useLayoutEffect, useMemo } from "react";
 import TextareaAutosize from "react-textarea-autosize";
 import {
   Square,
@@ -33,6 +33,8 @@ interface ChatTextAreaProps {
   effort?: EffortLevel;
   cliStatus: string;
   isStreaming: boolean;
+  /** Active conversation id — the composer keeps a separate draft per id. */
+  activeTabId?: string;
   /** Number of messages currently queued for this conversation. */
   queueCount?: number;
   /** Force-send the first queued message (stops the current response). */
@@ -257,6 +259,7 @@ export default function ChatTextArea({
   effort,
   cliStatus,
   isStreaming,
+  activeTabId,
   queueCount = 0,
   onForceNext,
   fileCount = 0,
@@ -301,6 +304,46 @@ export default function ChatTextArea({
   const [mentionStartPos, setMentionStartPos] = useState(-1);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const highlightRef = useRef<HTMLDivElement>(null);
+
+  // --- Per-conversation drafts -------------------------------------------
+  // The composer keeps an independent draft (unsent text + pending images) for
+  // each conversation. Switching tabs parks the outgoing draft and restores the
+  // destination's, so a half-written prompt no longer leaks across conversations
+  // or blocks typing in another one. Kept in a ref — not lifted to the parent —
+  // so each keystroke only re-renders this component, mirroring how the
+  // follow-up queue is scoped per conversation in App.tsx.
+  const draftsRef = useRef<Record<string, { text: string; images: string[] }>>({});
+  const inputValueRef = useRef(inputValue);
+  const selectedImagesRef = useRef(selectedImages);
+  inputValueRef.current = inputValue;
+  selectedImagesRef.current = selectedImages;
+  const draftKey = activeTabId ?? "";
+  const draftKeyRef = useRef(draftKey);
+
+  // Swap drafts before paint when the active conversation changes (layout effect
+  // avoids a one-frame flash of the previous conversation's text).
+  useLayoutEffect(() => {
+    const prevKey = draftKeyRef.current;
+    if (prevKey === draftKey) return;
+    draftKeyRef.current = draftKey;
+
+    const next = draftsRef.current[draftKey];
+    // Startup edge: text typed before this conversation had a real id (prevKey
+    // is the empty pre-init key). Carry it forward instead of dropping it.
+    if (prevKey === "" && !next) return;
+
+    draftsRef.current[prevKey] = {
+      text: inputValueRef.current,
+      images: selectedImagesRef.current,
+    };
+    setInputValue(next?.text ?? "");
+    setSelectedImages(next?.images ?? []);
+    // Any open menus / queries belonged to the previous draft.
+    setShowSlashMenu(false);
+    setShowContextMenu(false);
+    setSlashMenuQuery("");
+    setContextMenuQuery("");
+  }, [draftKey]);
 
   const cliCommands = useMemo(
     () => mergeCliCommands(slashCommands),
@@ -391,11 +434,11 @@ export default function ChatTextArea({
 
     setInputValue("");
     setSelectedImages([]);
-    setInputValue("");
-    setSelectedImages([]);
     setShowContextMenu(false);
     setShowSlashMenu(false);
-  }, [inputValue, selectedImages, onSend]);
+    // Sent — drop this conversation's stored draft so nothing stale is restored.
+    delete draftsRef.current[draftKey];
+  }, [inputValue, selectedImages, onSend, draftKey]);
 
   const insertSlashCommand = useCallback((command: CliCommand) => {
     setInputValue(`${command.name} `);

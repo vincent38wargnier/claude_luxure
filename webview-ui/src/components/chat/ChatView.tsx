@@ -316,6 +316,7 @@ export default function ChatView({
         effort={effort}
         cliStatus={cliStatus}
         isStreaming={isStreaming}
+        activeTabId={activeTabId}
         queueCount={queuedMessages?.length ?? 0}
         onForceNext={onForceNext}
         fileCount={0}
