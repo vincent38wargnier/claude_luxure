@@ -20,6 +20,7 @@ import {
   McpConnectionState,
   McpServerStatus,
   Mode,
+  ProofAnnotation,
   StoredAccount,
   TimelinePart,
   UsageBucket,
@@ -39,6 +40,11 @@ import {
 } from "../shared/cli-commands";
 import { SkillsManager } from "../skills/SkillsManager";
 import type { SkillScope } from "../shared/types";
+import {
+  ProofChannel,
+  type ProofAnnotateRequest,
+  type ProofPresentRequest,
+} from "../mcp/proof-channel";
 
 const ROOT_FORK_ANCHOR = "ROOT";
 
@@ -62,8 +68,11 @@ function attachToolResult(acts: ActivityEvent[], e: ActivityEvent): void {
         if (e.isError) {
           a.result.isError = true;
         }
+        if (e.images && e.images.length > 0) {
+          a.result.images = [...(a.result.images || []), ...e.images];
+        }
       } else {
-        a.result = { content: e.content, isError: e.isError };
+        a.result = { content: e.content, isError: e.isError, images: e.images };
       }
       return;
     }
@@ -231,6 +240,21 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private cachedKeychainTokens = new Map<
     string,
     { record: Record<string, any>; at: number }
+  >();
+  // Visual-proof side-channel: one loopback HTTP server for the extension,
+  // plus a route table from each spawned bridge's id to its conversation (the
+  // runtime object survives draft→session key migration, so this stays valid).
+  private proofChannel: ProofChannel | undefined;
+  private proofChannelFailed = false;
+  private readonly proofRoutes = new Map<string, SessionRuntime>();
+  // In-flight annotate renders awaiting the webview's canvas result.
+  private readonly pendingAnnotations = new Map<
+    string,
+    {
+      resolve: (dataUrl: string) => void;
+      reject: (err: Error) => void;
+      timer: ReturnType<typeof setTimeout>;
+    }
   >();
 
   constructor(
@@ -1328,6 +1352,22 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       case "summarizeSession":
         void this.handleSummarizeSession(message.sessionId);
         break;
+
+      case "annotateResult": {
+        const pending = this.pendingAnnotations.get(message.requestId);
+        if (pending) {
+          this.pendingAnnotations.delete(message.requestId);
+          clearTimeout(pending.timer);
+          if (message.dataUrl) {
+            pending.resolve(message.dataUrl);
+          } else {
+            pending.reject(
+              new Error(message.error || "Annotation rendering failed in the webview.")
+            );
+          }
+        }
+        break;
+      }
 
       case "summarizeAllSessions":
         void this.handleSummarizeAllSessions();
@@ -2557,6 +2597,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     // ports; everything else runs in the workspace root as before.
     const cwd = runtime.worktreeCwd || workspacePath;
 
+    // Visual-proof tools: register the bundled "luxure" MCP server for this
+    // spawn so the model can push screenshots/annotations into this chat.
+    const luxureTools = await this.prepareLuxureTools(runtime);
+
     const bridge = new ClaudeBridge({
       cwd,
       mode: this.mode,
@@ -2567,6 +2611,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       configDir,
       claudePath: resolveClaudePath(),
       env: runtime.worktreeEnv,
+      luxureTools,
     });
 
     runtime.bridge = bridge;
@@ -2578,6 +2623,264 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
 
     await bridge.start();
+  }
+
+  // ── Visual-proof tools (screenshots / annotations pushed into the chat) ──
+
+  /** Start (once) the loopback side-channel the luxure MCP server posts to. */
+  private async ensureProofChannel(): Promise<ProofChannel | undefined> {
+    if (this.proofChannel) {
+      return this.proofChannel;
+    }
+    if (this.proofChannelFailed) {
+      return undefined;
+    }
+    try {
+      const channel = new ProofChannel({
+        present: (req) => this.handleProofPresent(req),
+        annotate: (req) => this.handleProofAnnotate(req),
+      });
+      await channel.start();
+      this.proofChannel = channel;
+      return channel;
+    } catch (err) {
+      // Don't retry every spawn — a bind failure here means no proof tools,
+      // not a broken chat.
+      this.proofChannelFailed = true;
+      log("ERROR", "Proof channel failed to start:", String(err));
+      return undefined;
+    }
+  }
+
+  /** Write the per-spawn --mcp-config for the bundled luxure server and route
+   * its bridge id to this conversation. Returns undefined when unavailable
+   * (channel bind failure / missing bundle) — the chat works without proofs. */
+  private async prepareLuxureTools(
+    runtime: SessionRuntime
+  ): Promise<{ mcpConfigPath: string; env: Record<string, string> } | undefined> {
+    const channel = await this.ensureProofChannel();
+    if (!channel) {
+      return undefined;
+    }
+    const serverScript = path.join(
+      this.context.extensionUri.fsPath,
+      "dist",
+      "luxure-mcp.js"
+    );
+    if (!fs.existsSync(serverScript)) {
+      log("WARN", "luxure-mcp.js not built; visual-proof tools disabled");
+      return undefined;
+    }
+
+    // A restarted bridge gets a fresh id; drop this conversation's old routes.
+    for (const [id, rt] of this.proofRoutes) {
+      if (rt === runtime) {
+        this.proofRoutes.delete(id);
+      }
+    }
+    const bridgeId = crypto.randomUUID();
+    this.proofRoutes.set(bridgeId, runtime);
+
+    const env: Record<string, string> = {
+      LUXURE_BRIDGE_URL: channel.url,
+      LUXURE_BRIDGE_TOKEN: channel.token,
+      LUXURE_BRIDGE_ID: bridgeId,
+    };
+    const config = {
+      mcpServers: {
+        luxure: {
+          // The extension host's own runtime in node mode — works even when
+          // no `node` is on the CLI's PATH.
+          command: process.execPath,
+          args: [serverScript],
+          env: { ...env, ELECTRON_RUN_AS_NODE: "1" },
+        },
+      },
+    };
+
+    const dir = path.join(this.context.globalStorageUri.fsPath, "mcp");
+    fs.mkdirSync(dir, { recursive: true });
+    this.cleanupStaleMcpConfigs(dir);
+    const mcpConfigPath = path.join(dir, `luxure-${bridgeId}.json`);
+    fs.writeFileSync(mcpConfigPath, JSON.stringify(config, null, 2));
+    return { mcpConfigPath, env };
+  }
+
+  /** Best-effort removal of config files from long-gone spawns. */
+  private cleanupStaleMcpConfigs(dir: string): void {
+    try {
+      const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+      for (const name of fs.readdirSync(dir)) {
+        if (!name.startsWith("luxure-") || !name.endsWith(".json")) {
+          continue;
+        }
+        const full = path.join(dir, name);
+        if (fs.statSync(full).mtimeMs < cutoff) {
+          fs.unlinkSync(full);
+        }
+      }
+    } catch {
+      // never let cleanup break a spawn
+    }
+  }
+
+  private runtimeForProof(bridgeId?: string): SessionRuntime {
+    const routed = bridgeId ? this.proofRoutes.get(bridgeId) : undefined;
+    const runtime =
+      routed || (this.activeKey ? this.runtimes.get(this.activeKey) : undefined);
+    if (!runtime) {
+      throw new Error("No active conversation to attach the image to.");
+    }
+    return runtime;
+  }
+
+  private async handleProofPresent(
+    req: ProofPresentRequest
+  ): Promise<Record<string, unknown>> {
+    const runtime = this.runtimeForProof(req.bridgeId);
+    const dataUrl =
+      req.dataUrl && req.dataUrl.startsWith("data:image/")
+        ? req.dataUrl
+        : this.loadImageAsDataUrl(req.path);
+    this.emitProof(runtime, [dataUrl], req.caption);
+    return { shown: true };
+  }
+
+  private async handleProofAnnotate(
+    req: ProofAnnotateRequest
+  ): Promise<Record<string, unknown>> {
+    const runtime = this.runtimeForProof(req.bridgeId);
+    if (!this.webview) {
+      throw new Error(
+        "The Claude Luxure chat panel is not open, so annotations can't be rendered — ask the user to open it and retry."
+      );
+    }
+    const source = this.loadImageAsDataUrl(req.path);
+    const annotated = await this.renderAnnotationsInWebview(
+      source,
+      req.annotations || []
+    );
+    const savedPath = this.saveAnnotatedPng(annotated, req.outputPath, req.path);
+    if (req.show !== false) {
+      this.emitProof(runtime, [annotated], req.caption);
+    }
+    return { savedPath };
+  }
+
+  /** Round-trip an image + drawing instructions through the webview canvas
+   * (the only place with full 2D drawing + typography, no native deps). */
+  private renderAnnotationsInWebview(
+    image: string,
+    annotations: ProofAnnotation[]
+  ): Promise<string> {
+    const requestId = crypto.randomUUID();
+    return new Promise<string>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pendingAnnotations.delete(requestId);
+        reject(
+          new Error(
+            "Annotation rendering timed out — the chat panel may be closed or reloading."
+          )
+        );
+      }, 20000);
+      this.pendingAnnotations.set(requestId, { resolve, reject, timer });
+      this.postMessage({ type: "annotateImage", requestId, image, annotations });
+    });
+  }
+
+  /** Push a presented image into the conversation as a timeline activity, so
+   * it renders exactly where it happened in the assistant's turn. */
+  private emitProof(
+    runtime: SessionRuntime,
+    images: string[],
+    caption?: string
+  ): void {
+    const activity: ActivityEvent = { type: "proof", images, caption };
+    this.appendActivity(runtime, activity);
+    this.pushTimelineActivity(runtime, activity);
+    if (runtime.currentStreamText) {
+      runtime.pendingParagraphBreak = true;
+    }
+    for (const [key, rt] of this.runtimes) {
+      if (rt === runtime) {
+        if (this.isActiveKey(key)) {
+          this.postMessage({ type: "activity", activity });
+        }
+        break;
+      }
+    }
+  }
+
+  private static readonly IMAGE_MIME: Record<string, string> = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+  };
+
+  private loadImageAsDataUrl(p?: string): string {
+    if (!p) {
+      throw new Error("No image path provided.");
+    }
+    const abs = path.isAbsolute(p) ? p : path.join(this.getWorkspacePath() || "", p);
+    if (!fs.existsSync(abs)) {
+      throw new Error(`File not found: ${abs}`);
+    }
+    const mime = ChatViewProvider.IMAGE_MIME[path.extname(abs).toLowerCase()];
+    if (!mime) {
+      throw new Error(`Unsupported image type: ${abs} (use PNG/JPEG/WebP/GIF).`);
+    }
+    const stat = fs.statSync(abs);
+    if (stat.size > 10 * 1024 * 1024) {
+      throw new Error(
+        `Image too large to display (${Math.round(stat.size / 1024 / 1024)}MB > 10MB): ${abs}`
+      );
+    }
+    return `data:${mime};base64,${fs.readFileSync(abs).toString("base64")}`;
+  }
+
+  /** Persist the burned-in PNG next to the original (or at outputPath),
+   * falling back to the tmp dir when the target isn't writable. */
+  private saveAnnotatedPng(
+    dataUrl: string,
+    outputPath: string | undefined,
+    sourcePath: string
+  ): string {
+    const match = dataUrl.match(/^data:image\/png;base64,(.+)$/);
+    if (!match) {
+      throw new Error("Annotation render returned an unexpected format.");
+    }
+    const buffer = Buffer.from(match[1], "base64");
+
+    let target: string;
+    if (outputPath) {
+      target = path.isAbsolute(outputPath)
+        ? outputPath
+        : path.join(this.getWorkspacePath() || path.dirname(sourcePath), outputPath);
+    } else {
+      const dir = path.dirname(sourcePath);
+      const base = path.basename(sourcePath, path.extname(sourcePath));
+      target = path.join(dir, `${base}-annotated.png`);
+      for (let n = 2; fs.existsSync(target); n++) {
+        target = path.join(dir, `${base}-annotated-${n}.png`);
+      }
+    }
+    try {
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      fs.writeFileSync(target, buffer);
+      return target;
+    } catch {
+      const fallback = path.join(
+        os.tmpdir(),
+        "claude-luxure",
+        "screenshots",
+        `annotated-${Date.now()}.png`
+      );
+      fs.mkdirSync(path.dirname(fallback), { recursive: true });
+      fs.writeFileSync(fallback, buffer);
+      return fallback;
+    }
   }
 
   private attachBridgeHandlers(
@@ -2988,6 +3291,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
    * contiguous thinking, drop tool_result. Scoped to whatever array is passed,
    * so it serves both the flat list and a single timeline run. */
   private coalesceInto(acts: ActivityEvent[], e: ActivityEvent): void {
+    if (e.type === "proof") {
+      // Presented screenshots are standalone cards; never merged or deduped.
+      acts.push(e);
+      return;
+    }
     if (e.type === "tool_result") {
       // Don't render the result as its own step — attach it to the tool_use it
       // belongs to (matched by id) so the call + its output stay one entry.
@@ -3273,6 +3581,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       this.persistRuntime(key, runtime);
       runtime.bridge?.stop();
     }
+    for (const pending of this.pendingAnnotations.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(new Error("Extension deactivated"));
+    }
+    this.pendingAnnotations.clear();
+    this.proofChannel?.dispose();
     this.diffManager.dispose();
   }
 }

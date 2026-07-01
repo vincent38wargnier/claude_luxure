@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import vscode from "./vscode";
 import ChatView from "./components/chat/ChatView";
 import { coalesceActivities } from "./components/chat/ActivityFeed";
+import { renderAnnotatedImage } from "./utils/annotate";
 import SkillsPanel from "./components/skills/SkillsPanel";
 import type {
   ExtensionState,
@@ -154,6 +155,26 @@ export default function App() {
           }
           return next;
         });
+        break;
+
+      case "annotateImage":
+        // Burn the requested annotations into the image on a canvas and hand
+        // the PNG back to the extension (which saves it / shows it in chat).
+        renderAnnotatedImage(msg.image, msg.annotations)
+          .then((dataUrl) =>
+            vscode.postMessage({
+              type: "annotateResult",
+              requestId: msg.requestId,
+              dataUrl,
+            })
+          )
+          .catch((err) =>
+            vscode.postMessage({
+              type: "annotateResult",
+              requestId: msg.requestId,
+              error: String(err?.message || err),
+            })
+          );
         break;
 
       case "mcpStatus":

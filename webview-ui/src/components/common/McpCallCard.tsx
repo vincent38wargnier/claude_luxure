@@ -2,12 +2,13 @@ import { useState } from "react";
 import { Waypoints, ChevronsUpDown } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import ZoomableImage from "./ZoomableImage";
 
 export interface McpCall {
   server: string;
   tool: string;
   input: Record<string, unknown>;
-  result?: { content: string; isError?: boolean };
+  result?: { content: string; isError?: boolean; images?: string[] };
 }
 
 /**
@@ -60,6 +61,21 @@ export default function McpCallCard({
 
         <ChevronsUpDown size={14} className="shrink-0 text-vscode-descriptionFg opacity-50" />
       </div>
+
+      {/* Result images (e.g. a browser screenshot) are the payload the user
+          cares about — always visible, no expand needed. */}
+      {result?.images && result.images.length > 0 && (
+        <div className="px-3 pb-2 flex flex-col gap-1.5">
+          {result.images.map((src, i) => (
+            <ZoomableImage
+              key={i}
+              src={src}
+              alt={`${tool} result ${i + 1}`}
+              className="max-h-64 w-auto max-w-full self-start rounded border border-vscode-border cursor-zoom-in"
+            />
+          ))}
+        </div>
+      )}
 
       {/* Expanded — parameters + result */}
       {expanded && (

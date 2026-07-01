@@ -104,6 +104,30 @@ export interface UsageInfo {
 export interface ToolResultData {
   content: string;
   isError?: boolean;
+  /** Images carried by the tool result (e.g. a browser screenshot), as data
+   * URLs, so the card can render the actual pixels instead of an
+   * "[image: image/png]" marker. */
+  images?: string[];
+}
+
+/** One drawing instruction for annotate_screenshot, rendered onto the image by
+ * the webview canvas. Coordinates are pixels by default; `unit: "percent"`
+ * makes every coordinate/size a 0-100 fraction of the image dimensions. */
+export interface ProofAnnotation {
+  kind: "rect" | "ellipse" | "highlight" | "arrow" | "text" | "badge";
+  x?: number;
+  y?: number;
+  width?: number;
+  height?: number;
+  x1?: number;
+  y1?: number;
+  x2?: number;
+  y2?: number;
+  /** Label drawn near the shape; the content for kind "text" / "badge". */
+  text?: string;
+  /** CSS color; defaults to red (#FF3B30). */
+  color?: string;
+  unit?: "px" | "percent";
 }
 
 export type ActivityEvent =
@@ -114,9 +138,18 @@ export type ActivityEvent =
       toolUseId?: string;
       result?: ToolResultData;
     }
-  | { type: "tool_result"; toolUseId: string; content: string; isError?: boolean }
+  | {
+      type: "tool_result";
+      toolUseId: string;
+      content: string;
+      isError?: boolean;
+      images?: string[];
+    }
   | { type: "thinking"; text: string }
-  | { type: "thinking_delta"; text: string };
+  | { type: "thinking_delta"; text: string }
+  /** A screenshot/image Claude explicitly presented to the user (via the
+   * extension's luxure MCP tools) — rendered as a prominent image card. */
+  | { type: "proof"; images: string[]; caption?: string };
 
 export const AVAILABLE_MODELS = [
   { id: "claude-fable-5", alias: "fable", label: "Fable 5" },
@@ -222,7 +255,10 @@ export type WebviewMessage =
   | { type: "reauthAccount"; accountId: string }
   | { type: "refreshUsage" }
   | { type: "summarizeSession"; sessionId: string }
-  | { type: "summarizeAllSessions" };
+  | { type: "summarizeAllSessions" }
+  /** Reply to an "annotateImage" render request: the burned-in PNG (data URL)
+   * or the reason rendering failed. */
+  | { type: "annotateResult"; requestId: string; dataUrl?: string; error?: string };
 
 export type McpConnectionState = "connecting" | "connected" | "stopped" | "error";
 
@@ -280,4 +316,12 @@ export type ExtensionMessage =
       title?: string;
       summary?: string;
     }
-  | { type: "summarizeProgress"; done: number; total: number };
+  | { type: "summarizeProgress"; done: number; total: number }
+  /** Ask the webview to burn annotations into an image on a canvas and answer
+   * with "annotateResult". */
+  | {
+      type: "annotateImage";
+      requestId: string;
+      image: string;
+      annotations: ProofAnnotation[];
+    };

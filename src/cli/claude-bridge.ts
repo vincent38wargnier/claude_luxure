@@ -36,6 +36,12 @@ export interface ClaudeBridgeOptions {
    * binds the right ports and namespaces its docker stack. Merged last, so it
    * wins over the inherited process env. */
   env?: Record<string, string>;
+  /** Extension-provided visual-proof tools (screenshot / present / annotate):
+   * `mcpConfigPath` is passed via --mcp-config so the CLI spawns the bundled
+   * "luxure" MCP server, and `env` (the side-channel URL/token/bridge id) is
+   * also merged into the CLI child env as a fallback for CLIs that propagate
+   * their environment to stdio servers. */
+  luxureTools?: { mcpConfigPath: string; env: Record<string, string> };
 }
 
 const PLAN_MODE_SYSTEM_PROMPT = `You are in PLAN MODE. You must ONLY:
@@ -53,6 +59,14 @@ const NO_BACKGROUND_DEFERRAL_SYSTEM_PROMPT = `You are running inside a request/r
 - NEVER start long-running work in the background and tell the user you will "report back", "let them know", or "check in" later. That message would be the last thing they ever see and the turn would hang forever.
 - If you start something in the background, you MUST poll it to completion within THIS turn (e.g. read its output until done) before you finish — or simply run it in the foreground and wait.
 - If the work is genuinely too long to finish now, do NOT silently wait: end your turn by explicitly telling the user to send a message (e.g. "tell me to check on it") so a new turn can resume the work.`;
+
+// Appended when the bundled "luxure" MCP server is wired in, so the model
+// knows the chat panel can display images and actually uses the tools.
+const VISUAL_PROOF_SYSTEM_PROMPT = `This chat panel can display images inline. You have visual-proof tools on the "luxure" MCP server:
+- mcp__luxure__capture_screen: take a screenshot (full screen, a region, or an app's front window — macOS) and show it in the chat.
+- mcp__luxure__present_screenshot: display an existing image file (PNG/JPEG/WebP/GIF) in the chat panel.
+- mcp__luxure__annotate_screenshot: draw arrows, boxes, highlights, labels or numbered badges onto an image file and show the result.
+Use them to PROVE visual work: after implementing or fixing UI, capture (or save with a browser tool, e.g. chrome-devtools take_screenshot with a filePath) a screenshot of the result and present it in the chat; annotate it first when you want to point at what changed (percent coordinates are the most reliable). These tools show pixels to the USER; to see an image yourself, use the Read tool on its file path.`;
 
 // Always appended so the assistant's prose renders cleanly in the chat webview.
 const MARKDOWN_STYLE_SYSTEM_PROMPT = `Format every response as clean, well-structured GitHub-flavored Markdown:
@@ -143,6 +157,53 @@ function extractToolResultText(content: unknown): string {
   return parts.join("\n");
 }
 
+// Keep persisted per-message state bounded: at most 3 images per tool result,
+// each at most ~4MB of base64 (~3MB binary — a full-page retina screenshot).
+const MAX_RESULT_IMAGES = 3;
+const MAX_RESULT_IMAGE_B64 = 4_000_000;
+
+/**
+ * Collect the image blocks of a tool result as data URLs so the webview can
+ * render the actual screenshot. Handles both the MCP shape
+ * ({type:"image", data, mimeType}) and the Claude API shape
+ * ({type:"image", source:{type:"base64", media_type, data}}).
+ */
+function extractToolResultImages(content: unknown): string[] | undefined {
+  if (!Array.isArray(content)) {
+    return undefined;
+  }
+  const images: string[] = [];
+  for (const block of content) {
+    if (!block || typeof block !== "object") {
+      continue;
+    }
+    const b = block as Record<string, any>;
+    if (b.type !== "image") {
+      continue;
+    }
+    let data: string | undefined;
+    let mime: string | undefined;
+    if (typeof b.data === "string" && b.data) {
+      data = b.data;
+      mime = b.mimeType || b.mime_type;
+    } else if (
+      b.source?.type === "base64" &&
+      typeof b.source.data === "string"
+    ) {
+      data = b.source.data;
+      mime = b.source.media_type;
+    }
+    if (!data || data.length > MAX_RESULT_IMAGE_B64) {
+      continue;
+    }
+    images.push(`data:${mime || "image/png"};base64,${data}`);
+    if (images.length >= MAX_RESULT_IMAGES) {
+      break;
+    }
+  }
+  return images.length > 0 ? images : undefined;
+}
+
 export class ClaudeBridge extends EventEmitter {
   private proc: ChildProcess | null = null;
   private rl: readline.Interface | null = null;
@@ -216,6 +277,13 @@ export class ClaudeBridge extends EventEmitter {
         "Read,Grep,Glob,LS,View,BatchTool"
       );
     }
+    // Visual-proof tools: register the bundled MCP server (additive — the
+    // workspace .mcp.json still loads) and tell the model the panel can
+    // display images. Skipped in plan mode, whose allowlist is read-only.
+    if (this.options.luxureTools && this.options.mode !== "plan") {
+      args.push("--mcp-config", this.options.luxureTools.mcpConfigPath);
+      systemPromptParts.push(VISUAL_PROOF_SYSTEM_PROMPT);
+    }
     args.push("--append-system-prompt", systemPromptParts.join("\n\n"));
 
     // Build the child env with the bound account's auth. A non-default account
@@ -230,6 +298,11 @@ export class ClaudeBridge extends EventEmitter {
       delete childEnv.ANTHROPIC_AUTH_TOKEN;
     } else {
       delete childEnv.CLAUDE_CODE_OAUTH_TOKEN;
+    }
+    // Side-channel coordinates for the luxure MCP server (fallback path; the
+    // authoritative copy lives in the mcp-config's own env block).
+    if (this.options.luxureTools) {
+      Object.assign(childEnv, this.options.luxureTools.env);
     }
     // Per-conversation env (worktree port remap / COMPOSE_PROJECT_NAME) wins last.
     if (this.options.env) {
@@ -387,6 +460,9 @@ export class ClaudeBridge extends EventEmitter {
               // cap to keep persisted state bounded (the card shows full text).
               content: extractToolResultText(block.content).slice(0, 10000),
               isError: block.is_error === true,
+              // Image blocks (e.g. a browser screenshot) ride along as data
+              // URLs so the chat renders the pixels, not a text marker.
+              images: extractToolResultImages(block.content),
             });
           }
         }
@@ -520,6 +596,7 @@ export class ClaudeBridge extends EventEmitter {
       // An empty string clears it → switch back to the Default account.
       if (options.configDir !== undefined) { this.options.configDir = options.configDir; }
       if (options.env !== undefined) { this.options.env = options.env; }
+      if (options.luxureTools !== undefined) { this.options.luxureTools = options.luxureTools; }
     }
     this.start();
   }

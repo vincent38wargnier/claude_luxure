@@ -3,6 +3,7 @@ import { Check } from "lucide-react";
 import type { ActivityEvent } from "../../types";
 import FileChangeCard from "../common/FileChangeCard";
 import McpCallCard, { type McpCall } from "../common/McpCallCard";
+import ProofCard from "../common/ProofCard";
 
 interface Step {
   kind: "thinking" | "tool";
@@ -24,17 +25,22 @@ function attachToolResult(acts: ActivityEvent[], e: ActivityEvent): void {
   for (let i = acts.length - 1; i >= 0; i--) {
     const a = acts[i];
     if (a.type === "tool_use" && a.toolUseId === e.toolUseId) {
+      const images =
+        e.images && e.images.length > 0
+          ? [...(a.result?.images || []), ...e.images]
+          : a.result?.images;
       if (a.result) {
         if (e.content) {
           a.result = {
             content: a.result.content ? `${a.result.content}\n${e.content}` : e.content,
             isError: a.result.isError || e.isError,
+            images,
           };
-        } else if (e.isError) {
-          a.result = { ...a.result, isError: true };
+        } else {
+          a.result = { ...a.result, isError: a.result.isError || e.isError, images };
         }
       } else {
-        a.result = { content: e.content, isError: e.isError };
+        a.result = { content: e.content, isError: e.isError, images };
       }
       return;
     }
@@ -51,6 +57,11 @@ function attachToolResult(acts: ActivityEvent[], e: ActivityEvent): void {
 export function coalesceActivities(events: ActivityEvent[]): ActivityEvent[] {
   const out: ActivityEvent[] = [];
   for (const e of events) {
+    if (e.type === "proof") {
+      // Presented screenshots are standalone cards; never merged or deduped.
+      out.push(e);
+      continue;
+    }
     if (e.type === "tool_result") {
       attachToolResult(out, e);
       continue;
@@ -345,10 +356,16 @@ export default function ActivityFeed({
   const fileEditOrder: string[] = [];
   const steps: Step[] = [];
   const mcpCalls: McpCall[] = [];
+  const proofs: { images: string[]; caption?: string }[] = [];
   const exploredFiles = new Set<string>();
   let searchCount = 0;
   let todos: Todo[] | null = null;
   for (const a of coalesceActivities(activities || [])) {
+    // Screenshots Claude presented render as prominent image cards.
+    if (a.type === "proof") {
+      proofs.push(a);
+      continue;
+    }
     const td = todosFrom(a);
     if (td) {
       todos = td; // keep the latest plan state
@@ -387,7 +404,8 @@ export default function ActivityFeed({
     fileEdits.length === 0 &&
     steps.length === 0 &&
     !todos &&
-    mcpCalls.length === 0
+    mcpCalls.length === 0 &&
+    proofs.length === 0
   )
     return null;
 
@@ -451,6 +469,10 @@ export default function ActivityFeed({
 
       {mcpCalls.map((m, i) => (
         <McpCallCard key={`${m.server}__${m.tool}__${i}`} call={m} live={!!live} />
+      ))}
+
+      {proofs.map((p, i) => (
+        <ProofCard key={`proof-${i}`} images={p.images} caption={p.caption} />
       ))}
 
       {fileEdits.map((f) => (
