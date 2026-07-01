@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 import { ChatViewProvider } from "./webview/ChatViewProvider";
 import { VirtualDocProvider, DIFF_SCHEME } from "./diff/VirtualDocProvider";
 import { log, clearLog } from "./utils/logger";
+import { clearClaudePathCache } from "./utils/claude-path";
 
 export function activate(context: vscode.ExtensionContext) {
   clearLog();
@@ -97,6 +98,15 @@ export function activate(context: vscode.ExtensionContext) {
       await openChat();
       provider.addFileToChat(relativePath);
       log("INFO", "addToChat:", relativePath);
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeConfiguration((e) => {
+      if (e.affectsConfiguration("claude-luxure.claudePath")) {
+        clearClaudePathCache();
+        log("INFO", "claude-luxure.claudePath changed; re-resolving claude binary.");
+      }
     })
   );
 

@@ -7,3 +7,7 @@ webview-ui/dist/
 
 # Local MCP server config — contains secrets (e.g. JARVIO_API_KEY)
 .mcp.json
+
+# Claude Luxure worktree feature — local, regenerable, never pushed
+.claude-luxure/
+docker-compose.cl.yml

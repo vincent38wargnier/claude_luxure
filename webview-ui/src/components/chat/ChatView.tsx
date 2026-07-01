@@ -38,6 +38,7 @@ interface ChatViewProps {
   onModelChange: (model: string) => void;
   onEffortChange: (effort: EffortLevel) => void;
   onNewConversation: () => void;
+  onNewWorktreeConversation: () => void;
   onSwitchSession: (sessionId: string) => void;
   onCloseTab: (sessionId: string) => void;
   onListSessions: () => void;
@@ -103,6 +104,7 @@ export default function ChatView({
   onModelChange,
   onEffortChange,
   onNewConversation,
+  onNewWorktreeConversation,
   onSwitchSession,
   onCloseTab,
   onListSessions,
@@ -214,6 +216,7 @@ export default function ChatView({
         onSelect={onSwitchSession}
         onClose={onCloseTab}
         onNewChat={onNewConversation}
+        onNewWorktree={onNewWorktreeConversation}
         onListSessions={onListSessions}
         summarizingIds={summarizingIds}
         summarizeProgress={summarizeProgress}

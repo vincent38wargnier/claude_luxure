@@ -1,5 +1,8 @@
-import ReactMarkdown from "react-markdown";
+import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { RefreshCw } from "lucide-react";
+import type { ReactNode, MouseEvent as ReactMouseEvent } from "react";
+import vscode from "../../vscode";
 import type { ChatMessage, Mode, ActivityEvent, TimelinePart } from "../../types";
 import Thumbnails from "../common/Thumbnails";
 import FileChangeCard from "../common/FileChangeCard";
@@ -124,10 +127,35 @@ export default function MessageRow({
   const isSystem = message.role === "system";
   const isStreaming = message.isStreaming && streamingContent !== undefined;
 
+  // When a message is tagged with a failed account (a 401/403 from the CLI), show
+  // an inline "Reconnect" button. The tag can land on a system error *or* on the
+  // assistant bubble that carries the "Failed to authenticate" text, so render the
+  // button from one shared element used by both branches below.
+  const authAccountId = message.authErrorAccountId;
+  const reconnectButton = authAccountId ? (
+    <button
+      type="button"
+      onClick={() =>
+        vscode.postMessage({
+          type: "reauthAccount",
+          accountId: authAccountId,
+        })
+      }
+      className="flex items-center gap-1 mt-1.5 px-2 py-1 rounded text-[11px] text-[#f87171] border border-[#f87171]/40 hover:bg-[#f87171]/10 transition-colors"
+      title={`Sign in again to restore ${message.authErrorAccountLabel || "this account"}`}
+    >
+      <RefreshCw size={11} className="shrink-0" />
+      {message.authErrorAccountLabel
+        ? `Reconnect ${message.authErrorAccountLabel}`
+        : "Reconnect"}
+    </button>
+  ) : null;
+
   if (isSystem) {
     return (
       <div className="mx-2 px-2.5 py-1.5 text-xs text-vscode-descriptionFg bg-[rgba(255,255,255,0.03)] rounded border border-[rgba(255,255,255,0.06)]">
         {content}
+        {reconnectButton}
       </div>
     );
   }
@@ -229,6 +257,7 @@ export default function MessageRow({
           {isStreaming && <StreamingCursor />}
         </>
       )}
+      {reconnectButton && <div className="px-1">{reconnectButton}</div>}
     </div>
   );
 }
@@ -237,6 +266,69 @@ export default function MessageRow({
 // typography plugin isn't installed, so prose-* utilities are no-ops). Keep the
 // base size/color here; everything structural (tables, headings, lists) is CSS.
 const MARKDOWN_CLASS = "md px-1 py-0.5 text-sm text-vscode-fg";
+
+const URL_ONLY = /^https?:\/\/\S+$/;
+
+/** Flatten a markdown node's children down to its plain text. */
+function nodeText(children: ReactNode): string {
+  if (typeof children === "string") return children;
+  if (typeof children === "number") return String(children);
+  if (Array.isArray(children)) return children.map(nodeText).join("");
+  return "";
+}
+
+// Open http(s) links through the extension host. VS Code usually opens webview
+// link clicks externally on its own, but routing it explicitly guarantees it
+// (and preventDefault stops any double-open). Returns undefined for non-URLs so
+// the anchor behaves normally.
+function externalClick(href?: string) {
+  if (!href || !/^https?:\/\//i.test(href)) return undefined;
+  return (e: ReactMouseEvent<HTMLAnchorElement>) => {
+    e.preventDefault();
+    vscode.postMessage({ type: "openExternal", url: href });
+  };
+}
+
+// Custom renderers so links the model sends are actually usable:
+//  • <a> opens in the browser and long URLs wrap so they can be selected/copied.
+//  • a code span/block that is *just* a URL (the model loves wrapping links in
+//    backticks) becomes a real clickable link instead of inert <code> text.
+const markdownComponents: Components = {
+  a({ node, href, children, ...props }) {
+    return (
+      <a
+        {...props}
+        href={href}
+        target="_blank"
+        rel="noopener noreferrer"
+        onClick={externalClick(href)}
+      >
+        {children}
+      </a>
+    );
+  },
+  code({ node, className, children, ...props }) {
+    const text = nodeText(children).trim();
+    if (URL_ONLY.test(text)) {
+      return (
+        <a
+          href={text}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="md-code-link"
+          onClick={externalClick(text)}
+        >
+          {text}
+        </a>
+      );
+    }
+    return (
+      <code className={className} {...props}>
+        {children}
+      </code>
+    );
+  },
+};
 
 /** Render an assistant prose string: fenced code that looks like a file edit
  * becomes a card, everything else renders as markdown. */
@@ -254,7 +346,10 @@ function TextContent({ content }: { content: string }) {
           />
         ) : (
           <div key={i} className={MARKDOWN_CLASS}>
-            <ReactMarkdown remarkPlugins={[remarkGfm]}>
+            <ReactMarkdown
+              remarkPlugins={[remarkGfm]}
+              components={markdownComponents}
+            >
               {block.content}
             </ReactMarkdown>
           </div>

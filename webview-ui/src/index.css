@@ -119,8 +119,25 @@ pre code {
 .md li { margin: 0.25em 0; }
 .md li > ul, .md li > ol { margin: 0.25em 0; }
 
-.md a { color: var(--vscode-textLink-foreground); text-decoration: none; }
+.md a {
+  color: var(--vscode-textLink-foreground);
+  text-decoration: none;
+  cursor: pointer;
+  /* Long URLs wrap instead of overflowing, so the whole link is visible,
+     selectable, and copyable. */
+  overflow-wrap: anywhere;
+}
 .md a:hover { text-decoration: underline; }
+/* A URL the model wrapped in a fenced ``` block renders as a link inside <pre>;
+   <pre>'s white-space: pre would stop it wrapping, so force it back to normal. */
+.md-code-link { white-space: normal; overflow-wrap: anywhere; }
+
+/* Assistant prose is always selectable/copyable (some webview hosts otherwise
+   inherit user-select: none from a parent). */
+.md, .md * {
+  -webkit-user-select: text;
+  user-select: text;
+}
 
 .md strong { font-weight: 600; }
 

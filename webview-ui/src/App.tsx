@@ -209,6 +209,8 @@ export default function App() {
               role: "system" as const,
               content: `Error: ${msg.error}`,
               timestamp: Date.now(),
+              authErrorAccountId: msg.authErrorAccountId,
+              authErrorAccountLabel: msg.authErrorAccountLabel,
             },
           ],
         }));
@@ -443,6 +445,10 @@ export default function App() {
     vscode.postMessage({ type: "newConversation" });
   }, []);
 
+  const handleNewWorktreeConversation = useCallback(() => {
+    vscode.postMessage({ type: "newWorktreeConversation" });
+  }, []);
+
   const handleSwitchSession = useCallback((sessionId: string) => {
     vscode.postMessage({ type: "switchSession", sessionId });
   }, []);
@@ -599,6 +605,7 @@ export default function App() {
         onModelChange={handleModelChange}
         onEffortChange={handleEffortChange}
         onNewConversation={handleNewConversation}
+        onNewWorktreeConversation={handleNewWorktreeConversation}
         onSwitchSession={handleSwitchSession}
         onCloseTab={handleCloseTab}
         onListSessions={handleListSessions}

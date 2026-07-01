@@ -28,6 +28,10 @@ import {
 } from "../shared/types";
 import { extractMentions, resolveFromMention } from "../utils/path-mentions";
 import { log } from "../utils/logger";
+import { resolveClaudePath } from "../utils/claude-path";
+import { provisionWorktree } from "../worktree/provisioner";
+import { generateRecipe } from "../worktree/recipe-generator";
+import { validateRecipe, type WorktreeRecipe } from "../worktree/recipe-schema";
 import {
   isCompactCommand,
   isSlashCommand,
@@ -111,6 +115,12 @@ interface SessionRuntime {
   /** Watchdog that ends a turn which has gone silent (no CLI output) for too
    * long — e.g. the model parked work in the background and never resumes. */
   watchdogTimer?: ReturnType<typeof setTimeout>;
+  /** Set for a worktree-backed conversation (yellow "+"): the bridge runs in
+   * this directory instead of the workspace root, with these env overrides
+   * (remapped ports / COMPOSE_PROJECT_NAME) merged into the child. */
+  worktreeCwd?: string;
+  worktreeEnv?: Record<string, string>;
+  worktreeBranch?: string;
 }
 
 function createEmptyRuntime(): SessionRuntime {
@@ -207,6 +217,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private usagePollTimer: ReturnType<typeof setInterval> | undefined;
   private usagePollInFlight = false;
   private usageAllInFlight = false;
+  // Accounts whose CLI process returned a real auth failure (401) this session.
+  // Ground truth that the stored token can't authenticate — flags the account as
+  // disconnected even when {@link isOAuthDead} can't tell (e.g. an expired token
+  // whose refresh token is present but rejected server-side). Cleared once a
+  // usage probe or reconnect succeeds for that account.
+  private readonly authFailedAccountIds = new Set<string>();
   private cachedCliVersion: string | undefined;
   // Cache per keychain service name: the global "Claude Code-credentials"
   // (Default) plus one per config-dir account ("…-<sha256(configDir)[:8]>").
@@ -305,7 +321,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   private fetchAccountInfo(): void {
-    execFile("claude", ["auth", "status"], (err, stdout) => {
+    execFile(resolveClaudePath(), ["auth", "status"], (err, stdout) => {
       if (err) {
         log("WARN", "Failed to fetch account info:", err.message);
         return;
@@ -622,7 +638,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     return new Promise((resolve, reject) => {
       const child = execFile(
-        "claude",
+        resolveClaudePath(),
         [
           "-p",
           prompt,
@@ -842,6 +858,202 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     void this.pollUsageForActive();
   }
 
+  /** Yellow "+": start a conversation in a fresh git worktree with a duplicated,
+   * port-remapped environment. If the project has no duplication config yet, we
+   * ASK before generating it with a one-time Claude research pass. */
+  private async handleNewWorktreeConversation(): Promise<void> {
+    const workspacePath = this.getWorkspacePath();
+    if (!workspacePath) {
+      void vscode.window.showErrorMessage("Open a workspace folder first.");
+      return;
+    }
+
+    // 1. Load the project's recipe — or ask permission to generate it.
+    let recipe = this.tryLoadWorktreeRecipe(workspacePath);
+    if (!recipe) {
+      const choice = await vscode.window.showInformationMessage(
+        "This project has no environment-duplication config yet.\n\n" +
+          "Let Claude analyze the project and generate .claude-luxure/worktree.json " +
+          "(how to copy secrets, clone deps, remap ports, isolate services)? " +
+          "One time per project, takes ~2 minutes.",
+        { modal: true },
+        "Generate config"
+      );
+      if (choice !== "Generate config") {
+        return; // cancelled
+      }
+    }
+
+    // 2. Name the environment (becomes the branch + worktree name).
+    const name = await vscode.window.showInputBox({
+      title: "New worktree conversation",
+      prompt: "Name this environment — becomes the branch + worktree",
+      placeHolder: "e.g. fix login bug",
+      ignoreFocusOut: true,
+    });
+    if (!name || !name.trim()) {
+      return; // cancelled
+    }
+
+    try {
+      // 3. Generate the recipe now if it was missing (user already approved).
+      if (!recipe) {
+        recipe = await this.generateWorktreeRecipe(workspacePath);
+        if (!recipe) {
+          return; // cancelled mid-analysis
+        }
+        void vscode.window.showInformationMessage(
+          "Duplication config generated — review or edit .claude-luxure/worktree.json anytime."
+        );
+      }
+
+      // 4. Full environment or files-only? Only worth asking when the recipe
+      //    actually has heavy steps (setup command / docker services).
+      const setupCmds = recipe.provision
+        .map((s) => ("cmd" in s ? s.cmd : ""))
+        .filter(Boolean)
+        .join(", ");
+      const isCompose = recipe.services.mode === "compose";
+      let full = false;
+      if (setupCmds || isCompose) {
+        const choice = await vscode.window.showInformationMessage(
+          "Duplicate the FULL environment?\n\n" +
+            `Full: also runs the project setup (${setupCmds || "docker compose up"}) so the copy is immediately runnable — can take several minutes.\n\n` +
+            "Files & ports only: instant; the agent can run setup itself later.",
+          { modal: true },
+          "Full environment",
+          "Files & ports only"
+        );
+        if (!choice) {
+          return; // cancelled
+        }
+        full = choice === "Full environment";
+      }
+
+      // 5. Provision (worktree + secrets + deps + remapped ports [+ setup/stack]).
+      const result = await vscode.window.withProgress(
+        {
+          location: vscode.ProgressLocation.Notification,
+          title: "Claude Luxure — duplicating environment",
+          cancellable: false,
+        },
+        (progress) =>
+          provisionWorktree({
+            projectPath: workspacePath,
+            recipe: recipe!,
+            slug: name,
+            runSteps: full,
+            startServices: full,
+            now: new Date().toISOString(),
+            onProgress: (line) => progress.report({ message: line }),
+          })
+      );
+      if (!result.ok) {
+        void vscode.window.showErrorMessage(
+          `Worktree provisioning failed: ${result.warnings.slice(-1)[0] || "unknown error"}`
+        );
+        return;
+      }
+
+      // Open a fresh conversation bound to the worktree's cwd + env.
+      this.persistActiveSession();
+      const draftKey = this.createDraftRuntime();
+      const rt = this.runtimes.get(draftKey)!;
+      rt.accountId =
+        this.context.globalState.get<string>("claude-luxure.lastAccountId") || "default";
+      rt.worktreeCwd = result.cwd;
+      rt.worktreeEnv = result.env;
+      rt.worktreeBranch = result.branch;
+      rt.sessionName = result.branch;
+      this.openTabIds.unshift(draftKey);
+      this.activeKey = draftKey;
+
+      this.sendState();
+      this.sendOpenTabs();
+      this.sendAccountsList();
+      void this.pollUsageForActive();
+
+      const portSummary = result.ports.map((p) => `${p.var}=${p.port}`).join("  ");
+      void vscode.window.showInformationMessage(
+        `Worktree ready: ${result.branch}${portSummary ? ` · ${portSummary}` : ""}` +
+          (result.warnings.length ? `  (${result.warnings.length} warning(s) — see logs)` : "")
+      );
+      for (const w of result.warnings) {
+        log("WARN", "worktree:", w);
+      }
+    } catch (err) {
+      void vscode.window.showErrorMessage(`Worktree setup error: ${String(err)}`);
+      log("ERROR", "handleNewWorktreeConversation failed:", String(err));
+    }
+  }
+
+  /** Read + validate `.claude-luxure/worktree.json`; undefined when absent or
+   * invalid (invalid → we offer to regenerate, same as missing). */
+  private tryLoadWorktreeRecipe(projectPath: string): WorktreeRecipe | undefined {
+    const recipeFile = path.join(projectPath, ".claude-luxure", "worktree.json");
+    if (!fs.existsSync(recipeFile)) {
+      return undefined;
+    }
+    try {
+      const v = validateRecipe(JSON.parse(fs.readFileSync(recipeFile, "utf8")));
+      if (v.valid && v.recipe) {
+        return v.recipe;
+      }
+      log("WARN", "worktree recipe invalid, offering regeneration:", v.errors.join("; "));
+    } catch (e) {
+      log("WARN", "worktree recipe unreadable, offering regeneration:", String(e));
+    }
+    return undefined;
+  }
+
+  /** Run the one-time research pass and write the recipe. Returns undefined on
+   * user cancellation; throws on failure. */
+  private async generateWorktreeRecipe(projectPath: string): Promise<WorktreeRecipe | undefined> {
+    return vscode.window.withProgress(
+      {
+        location: vscode.ProgressLocation.Notification,
+        title: "Claude Luxure — analyzing project (one-time, ~2 min)",
+        cancellable: true,
+      },
+      async (progress, token) => {
+        const controller = new AbortController();
+        token.onCancellationRequested(() => controller.abort());
+        let res;
+        try {
+          res = await generateRecipe({
+            projectPath,
+            claudePath: resolveClaudePath(),
+            signal: controller.signal,
+            onStderr: (s) => {
+              const line = s.trim();
+              if (line && line.length < 120) {
+                progress.report({ message: line });
+              }
+            },
+          });
+        } catch (e) {
+          if (token.isCancellationRequested) {
+            return undefined; // user cancelled — the child was aborted, stay quiet
+          }
+          throw e;
+        }
+        if (token.isCancellationRequested) {
+          return undefined;
+        }
+        if (!res.validation.valid || !res.recipe) {
+          throw new Error(`recipe generation failed: ${res.validation.errors.join("; ")}`);
+        }
+        const recipe: WorktreeRecipe = { ...res.recipe, generatedAt: new Date().toISOString() };
+        fs.mkdirSync(path.join(projectPath, ".claude-luxure"), { recursive: true });
+        fs.writeFileSync(
+          path.join(projectPath, ".claude-luxure", "worktree.json"),
+          JSON.stringify(recipe, null, 2) + "\n"
+        );
+        return recipe;
+      }
+    );
+  }
+
   async reveal(): Promise<void> {
     if (this.webviewView) {
       this.webviewView.show(true);
@@ -1026,6 +1238,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         this.handleNewConversation();
         break;
 
+      case "newWorktreeConversation":
+        await this.handleNewWorktreeConversation();
+        break;
+
       case "switchSession":
         await this.handleSwitchSession(message.sessionId);
         break;
@@ -1045,6 +1261,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       case "openFile": {
         const doc = await vscode.workspace.openTextDocument(message.filePath);
         await vscode.window.showTextDocument(doc, { preview: true });
+        break;
+      }
+
+      case "openExternal": {
+        try {
+          await vscode.env.openExternal(vscode.Uri.parse(message.url));
+        } catch (err) {
+          log("WARN", "openExternal failed:", String(err));
+        }
         break;
       }
 
@@ -1326,7 +1551,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       env: { CLAUDE_CONFIG_DIR: configDir },
     });
     terminal.show();
-    terminal.sendText("claude auth login");
+    terminal.sendText(`${this.shellQuote(resolveClaudePath())} auth login`);
     vscode.window.showInformationMessage(
       "Log in as the account you want to add (use an incognito window if it differs from your current claude.ai login). I'll detect it automatically."
     );
@@ -1420,7 +1645,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private authStatusForDir(configDir: string): Promise<any> {
     return new Promise((resolve) => {
       execFile(
-        "claude",
+        resolveClaudePath(),
         ["auth", "status"],
         { env: { ...process.env, CLAUDE_CONFIG_DIR: configDir } },
         (err, stdout) => {
@@ -1495,6 +1720,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     void this.pollUsageForActive();
   }
 
+  /** Single-quote a path for a POSIX shell so a resolved binary path with spaces
+   * (or the bundled-extension path) runs correctly via `terminal.sendText`. */
+  private shellQuote(p: string): string {
+    return `'${p.replace(/'/g, "'\\''")}'`;
+  }
+
   /** Re-run the browser login for an account whose stored token can no longer
    * authenticate (see {@link isOAuthDead}) — the one-click "Reconnect" action.
    * Same login mechanics as {@link handleAddAccount}, but refreshes an existing
@@ -1511,7 +1742,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       env: configDir ? { CLAUDE_CONFIG_DIR: configDir } : undefined,
     });
     terminal.show();
-    terminal.sendText("claude auth login");
+    terminal.sendText(`${this.shellQuote(resolveClaudePath())} auth login`);
     vscode.window.showInformationMessage(
       `Reconnecting ${label} — finish the login in your browser (use an incognito window if it differs from your current claude.ai login). I'll detect it automatically.`
     );
@@ -1526,6 +1757,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       void this.pollUsageForAll();
       return;
     }
+
+    // Fresh token confirmed — clear any runtime auth-failure flag so the
+    // account stops showing as disconnected.
+    this.authFailedAccountIds.delete(accountId);
 
     // Refresh the stored profile (subscription/email can change on re-login).
     if (configDir) {
@@ -1714,7 +1949,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       return Promise.resolve(this.cachedCliVersion);
     }
     return new Promise((resolve) => {
-      execFile("claude", ["--version"], (_err, stdout) => {
+      execFile(resolveClaudePath(), ["--version"], (_err, stdout) => {
         const m = (stdout || "").match(/(\d+\.\d+\.\d+)/);
         this.cachedCliVersion = m ? m[1] : "2.0.0";
         resolve(this.cachedCliVersion);
@@ -1809,11 +2044,24 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       const entries = await Promise.all(
         accounts.map(async (a) => {
           const record = await this.resolveOAuthRecord(a.id);
-          const dead = this.isOAuthDead(record);
+          const heuristicDead = this.isOAuthDead(record);
           const token = record?.accessToken;
-          // Don't spend a request on a token we already know is dead — it just
-          // 401s/429s (and repeated dead-token calls trip the rate limiter).
-          const usage = !dead && token ? await this.fetchUsage(token) : null;
+          const expiresAt =
+            typeof record?.expiresAt === "number" ? record.expiresAt : 0;
+          const looksRenewed = !!token && expiresAt > Date.now();
+          // A real 401 already proved this account's token can't authenticate.
+          // Don't spend a request on it again (it just 401s/429s and trips the
+          // rate limiter) until its credential looks renewed — at which point we
+          // re-probe so an external re-login can clear the flag automatically.
+          const wasAuthFailed = this.authFailedAccountIds.has(a.id);
+          const shouldFetch =
+            !heuristicDead && !!token && (!wasAuthFailed || looksRenewed);
+          const usage = shouldFetch ? await this.fetchUsage(token) : null;
+          // A successful probe is ground truth that the token works again.
+          if (usage) {
+            this.authFailedAccountIds.delete(a.id);
+          }
+          const dead = heuristicDead || this.authFailedAccountIds.has(a.id);
           return [a.id, usage, dead] as const;
         })
       );
@@ -2305,14 +2553,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       this.linkSharedAssets(configDir);
     }
 
+    // A worktree-backed conversation runs in its own checkout with remapped
+    // ports; everything else runs in the workspace root as before.
+    const cwd = runtime.worktreeCwd || workspacePath;
+
     const bridge = new ClaudeBridge({
-      cwd: workspacePath,
+      cwd,
       mode: this.mode,
       model: this.model,
       effort: this.effort,
       sessionId: runtime.sessionId,
       sessionName: runtime.sessionName,
       configDir,
+      claudePath: resolveClaudePath(),
+      env: runtime.worktreeEnv,
     });
 
     runtime.bridge = bridge;
@@ -2470,9 +2724,60 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         return;
       }
       log("INFO", "result received, finalizing message");
+
+      // A 401/403 is NOT delivered as an "error" event — the CLI reports it as a
+      // result with is_error=true and api_error_status set (the "Failed to
+      // authenticate" text arrives just before, as an assistant bubble). Detect it
+      // from those structured fields, flag the account, and tag the assistant
+      // bubble so a Reconnect button renders directly on it. Restrict to auth
+      // statuses so a 429 rate-limit etc. doesn't offer a pointless reconnect.
+      const apiErrorStatus = (event as ClaudeEvent & { api_error_status?: number | null })
+        .api_error_status;
+      const resultText =
+        typeof (event as ClaudeEvent & { result?: unknown }).result === "string"
+          ? ((event as ClaudeEvent & { result?: string }).result as string)
+          : "";
+      const isAuthError =
+        (event as ClaudeEvent & { is_error?: boolean }).is_error === true &&
+        (apiErrorStatus === 401 ||
+          apiErrorStatus === 403 ||
+          /\b401\b|\b403\b|invalid bearer|authentication_failed|invalid authentication|unauthor|credential/i.test(
+            resultText
+          ));
+
+      let auth: { id: string; label: string } | undefined;
+      let taggedBubble = false;
+      if (isAuthError) {
+        auth = this.noteAuthFailure(runtime.accountId || "default");
+        const streamingMsg = runtime.streamingMessageId
+          ? runtime.messages.find((m) => m.id === runtime.streamingMessageId)
+          : undefined;
+        if (streamingMsg) {
+          streamingMsg.authErrorAccountId = auth.id;
+          streamingMsg.authErrorAccountLabel = auth.label;
+          taggedBubble = true;
+        }
+        this.outputChannel.appendLine(
+          `[AUTH] ${auth.id} failed to authenticate (status ${apiErrorStatus}): ${resultText}`
+        );
+      }
+
       this.finalizeStreamingMessage(runtimeKey, runtime, isActive());
+
+      // No assistant bubble to tag (the failure carried no text) — surface a
+      // standalone system error that carries the Reconnect button instead.
+      if (auth && !taggedBubble && isActive()) {
+        this.postMessage({
+          type: "error",
+          error: resultText || "Failed to authenticate.",
+          authErrorAccountId: auth.id,
+          authErrorAccountLabel: auth.label,
+        });
+      }
+
       // A turn just consumed quota — refresh the usage bars for the active tab.
-      if (isActive()) {
+      // (Auth failures already trigger a re-poll via noteAuthFailure.)
+      if (isActive() && !auth) {
         void this.pollUsageForActive();
       }
       if (event.total_cost_usd !== undefined) {
@@ -2526,16 +2831,28 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       if (runtime.streamingMessageId) {
         this.finalizeStreamingMessage(runtimeKey, runtime, isActive());
       }
+      // A spawn/process-level failure can also be an auth failure (rare; most
+      // 401s arrive via the "result" event instead — see bridge.on("result")).
+      // Flag the account so the switcher shows it disconnected, and tag the error
+      // so the webview renders an inline "Reconnect" button on the message.
+      const isAuthError =
+        /401|invalid authentication|unauthor|oauth|credential/i.test(err);
+      const auth = isAuthError
+        ? this.noteAuthFailure(runtime.accountId || "default")
+        : undefined;
       if (isActive()) {
-        this.postMessage({ type: "error", error: err });
+        this.postMessage({
+          type: "error",
+          error: err,
+          ...(auth
+            ? {
+                authErrorAccountId: auth.id,
+                authErrorAccountLabel: auth.label,
+              }
+            : {}),
+        });
       }
       this.outputChannel.appendLine(`[ERROR] ${err}`);
-      // An auth failure (e.g. "401 Invalid authentication credentials") means
-      // this account's stored token is likely dead — re-poll so the Reconnect
-      // button surfaces immediately instead of after the next 180s tick.
-      if (/401|invalid authentication|unauthor|oauth|credential/i.test(err)) {
-        void this.pollUsageForAll();
-      }
     });
 
     bridge.on("stderr", (text: string) => {
@@ -2753,6 +3070,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       "\n\n---\n⏳ *This turn went quiet. The model may have left work running in the background, which this view can't resume on its own — send a message to continue.*";
     runtime.currentStreamText = (runtime.currentStreamText || "") + notice;
     this.finalizeStreamingMessage(runtimeKey, runtime, this.isActiveKey(runtimeKey));
+  }
+
+  /**
+   * Record that an account's stored token failed to authenticate (a 401/403 from
+   * the CLI). Flags it so the account switcher shows the account disconnected and
+   * kicks an immediate re-poll so that state surfaces now instead of on the next
+   * tick. Returns the account's id + human label for building a Reconnect button.
+   */
+  private noteAuthFailure(accountId: string): { id: string; label: string } {
+    this.authFailedAccountIds.add(accountId);
+    // Re-poll so the disconnected state surfaces immediately in the switcher.
+    void this.pollUsageForAll();
+    return { id: accountId, label: this.labelFor(accountId) };
   }
 
   private finalizeStreamingMessage(

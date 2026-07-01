@@ -105,6 +105,16 @@
           "group": "navigation"
         }
       ]
+    },
+    "configuration": {
+      "title": "Claude Luxure",
+      "properties": {
+        "claude-luxure.claudePath": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Absolute path to the `claude` CLI binary. Leave empty to auto-detect (PATH, common install locations, and the native binary bundled with the official Claude Code extension). Set this if sends fail with `spawn claude ENOENT`."
+        }
+      }
     }
   },
   "scripts": {

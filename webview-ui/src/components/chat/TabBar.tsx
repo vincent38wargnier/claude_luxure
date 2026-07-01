@@ -10,6 +10,8 @@ interface TabBarProps {
   onSelect: (sessionId: string) => void;
   onClose: (sessionId: string) => void;
   onNewChat: () => void;
+  /** Start a chat in a fresh git worktree with a duplicated, port-remapped env. */
+  onNewWorktree?: () => void;
   onListSessions: () => void;
   summarizingIds?: string[];
   summarizeProgress?: { done: number; total: number } | null;
@@ -66,6 +68,7 @@ export default function TabBar({
   onSelect,
   onClose,
   onNewChat,
+  onNewWorktree,
   onListSessions,
   summarizingIds,
   summarizeProgress,
@@ -194,6 +197,22 @@ export default function TabBar({
             <path d="M12 5v14M5 12h14" />
           </svg>
         </button>
+
+        {onNewWorktree && (
+          <button
+            onClick={onNewWorktree}
+            className="p-1 rounded text-[#eab308] hover:text-[#facc15] hover:bg-[rgba(234,179,8,0.15)] transition-colors"
+            title="New conversation in an isolated git worktree + duplicated environment (remapped ports)"
+          >
+            {/* git-branch glyph — signals a separate, isolated working copy */}
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <line x1="6" y1="3" x2="6" y2="15" />
+              <circle cx="18" cy="6" r="3" />
+              <circle cx="6" cy="18" r="3" />
+              <path d="M18 9a9 9 0 0 1-9 9" />
+            </svg>
+          </button>
+        )}
 
         {onSummarizeAll && (
           <button

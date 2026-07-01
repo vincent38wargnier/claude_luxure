@@ -27,6 +27,10 @@ export interface ChatMessage {
   /** Marks the message after which the context was summarized (/compact or
    * auto-compaction). Anchors the "Context summarized" divider in the chat. */
   compactBoundary?: boolean;
+  /** Set when this message reflects an auth failure (a 401/403) for the given
+   * account — the webview renders an inline "Reconnect <label>" button on it. */
+  authErrorAccountId?: string;
+  authErrorAccountLabel?: string;
 }
 
 /** One segment of an assistant turn's timeline: either a run of prose, or a
@@ -154,6 +158,7 @@ export type WebviewMessage =
   | { type: "changeModel"; model: string }
   | { type: "changeEffort"; effort: EffortLevel }
   | { type: "newConversation" }
+  | { type: "newWorktreeConversation" }
   | { type: "switchSession"; sessionId: string }
   | { type: "closeTab"; sessionId: string }
   | { type: "listSessions" }
@@ -164,6 +169,7 @@ export type WebviewMessage =
   | { type: "searchFiles"; query: string }
   | { type: "openFile"; filePath: string }
   | { type: "openDiff"; filePath: string }
+  | { type: "openExternal"; url: string }
   | { type: "ready" }
   | { type: "listSkills" }
   | { type: "readSkill"; skillId: string }
@@ -197,7 +203,15 @@ export type ExtensionMessage =
   | { type: "streamToken"; text: string }
   | { type: "streamEnd" }
   | { type: "message"; message: ChatMessage }
-  | { type: "error"; error: string }
+  | {
+      type: "error";
+      error: string;
+      /** Set when `error` is an auth failure (401) — the account whose token
+       * couldn't authenticate, so the webview can render an inline "Reconnect"
+       * button that re-runs the login for it. */
+      authErrorAccountId?: string;
+      authErrorAccountLabel?: string;
+    }
   | { type: "fileSearchResults"; files: string[] }
   | { type: "diffUpdate"; filePath: string; diff: string; status: "pending" | "accepted" | "rejected" }
   | { type: "costUpdate"; cost: CostInfo }

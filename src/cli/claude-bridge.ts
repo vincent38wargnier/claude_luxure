@@ -26,6 +26,16 @@ export interface ClaudeBridgeOptions {
    * authenticates as that account (full scope); when unset, the process uses
    * the ambient keychain login (the "Default" account). */
   configDir?: string;
+  /** Absolute path to the `claude` binary. When unset, falls back to a bare
+   * "claude" PATH lookup. Callers should pass a resolved path so the spawn
+   * doesn't fail with ENOENT when `claude` isn't on the GUI process PATH. */
+  claudePath?: string;
+  /** Per-conversation env overrides merged into the spawned child's environment.
+   * This is how a worktree-backed chat gets its remapped ports / COMPOSE_PROJECT_NAME
+   * (from the provisioner) so the agent — and anything it spawns, e.g. `make run` —
+   * binds the right ports and namespaces its docker stack. Merged last, so it
+   * wins over the inherited process env. */
+  env?: Record<string, string>;
 }
 
 const PLAN_MODE_SYSTEM_PROMPT = `You are in PLAN MODE. You must ONLY:
@@ -221,9 +231,13 @@ export class ClaudeBridge extends EventEmitter {
     } else {
       delete childEnv.CLAUDE_CODE_OAUTH_TOKEN;
     }
+    // Per-conversation env (worktree port remap / COMPOSE_PROJECT_NAME) wins last.
+    if (this.options.env) {
+      Object.assign(childEnv, this.options.env);
+    }
 
     try {
-      this.proc = spawn("claude", args, {
+      this.proc = spawn(this.options.claudePath || "claude", args, {
         cwd: this.cwd,
         stdio: ["pipe", "pipe", "pipe"],
         env: childEnv,
@@ -505,6 +519,7 @@ export class ClaudeBridge extends EventEmitter {
       if (options.sessionName !== undefined) { this.options.sessionName = options.sessionName; }
       // An empty string clears it → switch back to the Default account.
       if (options.configDir !== undefined) { this.options.configDir = options.configDir; }
+      if (options.env !== undefined) { this.options.env = options.env; }
     }
     this.start();
   }
