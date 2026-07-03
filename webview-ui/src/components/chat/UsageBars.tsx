@@ -30,9 +30,10 @@ function Bar({
   return (
     <div className="flex items-center gap-2">
       <div className="relative flex-1 h-[3px] rounded-full bg-[rgba(255,255,255,0.07)] overflow-hidden">
+        {/* scaleX, not width — layout properties shouldn't animate. */}
         <div
-          className="absolute inset-y-0 left-0 rounded-full transition-[width] duration-500"
-          style={{ width: `${pct}%`, backgroundColor: color }}
+          className="absolute inset-0 rounded-full origin-left transition-transform duration-500"
+          style={{ transform: `scaleX(${pct / 100})`, backgroundColor: color }}
         />
       </div>
       <span className="text-[9px] text-vscode-descriptionFg opacity-70 tabular-nums whitespace-nowrap">

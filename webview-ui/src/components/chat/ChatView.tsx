@@ -1,10 +1,32 @@
 import { useRef, useEffect, useState, useCallback, Fragment } from "react";
-import type { ChatMessage, CostInfo, ContextInfo, ActivityEvent, TimelinePart, SessionInfo, Mode, EffortLevel, PendingDiff, McpServerStatus, StoredAccount, UsageInfo, QueuedMessage } from "../../types";
+import type { ChatMessage, CostInfo, ContextInfo, ActivityEvent, TaskActivity, TimelinePart, SessionInfo, SessionMarker, Mode, EffortLevel, PendingDiff, McpServerStatus, StoredAccount, UsageInfo, QueuedMessage } from "../../types";
 import MessageRow from "./MessageRow";
 import ChatTextArea from "./ChatTextArea";
 import TabBar from "./TabBar";
+import SessionPostIt from "./SessionPostIt";
 import QueuedMessages from "./QueuedMessages";
 import DiffPanel from "../common/DiffPanel";
+import WorkingDots from "../common/WorkingDots";
+
+/** "92s" / "1m32s" for the dock chips' elapsed counters. */
+function fmtElapsed(ms?: number): string | null {
+  if (!ms) return null;
+  const s = Math.round(ms / 1000);
+  if (s < 60) return `${s}s`;
+  return `${Math.floor(s / 60)}m${String(s % 60).padStart(2, "0")}s`;
+}
+
+/** Scroll the transcript to an agent's card and pulse a ring on it, so the
+ * dock chip answers "which card is this?" without visual matching. */
+function jumpToTask(toolUseId: string) {
+  const el = document.getElementById(`task-${toolUseId}`);
+  if (!el) return;
+  el.scrollIntoView({ behavior: "smooth", block: "center" });
+  el.classList.remove("flash-ring");
+  // Force a reflow so re-adding the class restarts the animation.
+  void (el as HTMLElement).offsetWidth;
+  el.classList.add("flash-ring");
+}
 
 interface ChatViewProps {
   messages: ChatMessage[];
@@ -16,6 +38,14 @@ interface ChatViewProps {
   sessions: SessionInfo[];
   openTabIds: string[];
   tabNames?: Record<string, string>;
+  /** Post-it identity per open tab — the emoji rides along in the tab strip. */
+  tabMarkers?: Record<string, SessionMarker>;
+  /** The active conversation's post-it (pinned top-right of the transcript). */
+  marker?: SessionMarker | null;
+  /** True while an emoji pick for the active conversation is in flight. */
+  markerBusy?: boolean;
+  /** Post-it clicked: re-pick the emoji from recent conversation context. */
+  onReevaluateMarker?: () => void;
   runningSessionIds: string[];
   cliStatus: string;
   pendingDiffs: PendingDiff[];
@@ -23,6 +53,12 @@ interface ChatViewProps {
   isStreaming: boolean;
   activities: ActivityEvent[];
   liveTimeline: TimelinePart[];
+  /** Agents still working (live turn or background) — drives the status strip. */
+  runningTasks?: TaskActivity[];
+  /** Live thinking-token estimate for the streaming turn (0 when idle). */
+  thinkingTokens?: number;
+  /** API retry / rate-limit chip; null when all is well. */
+  transientStatus?: { kind: string; text: string } | null;
   cost: CostInfo | null;
   contextInfo: ContextInfo | null;
   accountEmail?: string;
@@ -82,6 +118,10 @@ export default function ChatView({
   sessions,
   openTabIds,
   tabNames,
+  tabMarkers,
+  marker,
+  markerBusy,
+  onReevaluateMarker,
   runningSessionIds,
   cliStatus,
   pendingDiffs,
@@ -89,6 +129,9 @@ export default function ChatView({
   isStreaming,
   activities,
   liveTimeline,
+  runningTasks,
+  thinkingTokens,
+  transientStatus,
   cost,
   contextInfo,
   accountEmail,
@@ -180,11 +223,12 @@ export default function ChatView({
     setShowReview((prev) => !prev);
   }, []);
 
+  // Editing is allowed even while a turn is streaming: submitting the edit
+  // stops the current run and resends from that message (the provider's
+  // handleEditMessage already stops the bridge before forking).
   const handleStartEdit = useCallback((messageId: string) => {
-    if (!isStreaming) {
-      setEditingMessageId(messageId);
-    }
-  }, [isStreaming]);
+    setEditingMessageId(messageId);
+  }, []);
 
   const handleCancelEdit = useCallback(() => {
     setEditingMessageId(null);
@@ -198,11 +242,6 @@ export default function ChatView({
     [onEditMessage]
   );
 
-  useEffect(() => {
-    if (isStreaming) {
-      setEditingMessageId(null);
-    }
-  }, [isStreaming]);
 
   return (
     <div className="flex flex-col h-full">
@@ -211,6 +250,7 @@ export default function ChatView({
         sessions={sessions}
         openTabIds={openTabIds}
         tabNames={tabNames}
+        tabMarkers={tabMarkers}
         currentTabId={activeTabId || sessionId}
         runningSessionIds={runningSessionIds}
         onSelect={onSwitchSession}
@@ -224,11 +264,21 @@ export default function ChatView({
         onSummarizeAll={onSummarizeAll}
       />
 
-      {/* Messages area */}
+      {/* Messages area — relative wrapper so the conversation's post-it can
+          pin to the top-right corner, above the scrolling transcript. */}
+      <div className="relative flex-1 min-h-0">
+        {marker && (
+          <SessionPostIt
+            tabKey={activeTabId || sessionId || "chat"}
+            marker={marker}
+            busy={markerBusy}
+            onReevaluate={onReevaluateMarker}
+          />
+        )}
       <div
         ref={scrollContainerRef}
         onScroll={handleScroll}
-        className="flex-1 overflow-y-auto py-2 space-y-1"
+        className="chat-scroll h-full overflow-y-auto py-2 space-y-1"
       >
         {messages.length === 0 && !isStreaming && (
           <div className="flex items-center justify-center h-full">
@@ -260,7 +310,8 @@ export default function ChatView({
                 }
                 liveTimeline={isLastAssistant ? liveTimeline : undefined}
                 isEditing={editingMessageId === msg.id}
-                canEdit={msg.role === "user" && !isStreaming && !editingMessageId}
+                canEdit={msg.role === "user" && !editingMessageId}
+                editWillStopRun={isStreaming}
                 mode={mode}
                 model={model}
                 onStartEdit={() => handleStartEdit(msg.id)}
@@ -283,6 +334,7 @@ export default function ChatView({
 
         <div ref={messagesEndRef} />
       </div>
+      </div>
 
       {/* Review panel (collapsible) */}
       {showReview && pendingDiffs.length > 0 && (
@@ -297,10 +349,65 @@ export default function ChatView({
 
       {/* Cost bar */}
       {cost && (
-        <div className="px-3 py-0.5 text-[10px] text-vscode-descriptionFg border-t border-[rgba(255,255,255,0.04)] flex items-center gap-3">
-          <span>${cost.totalCostUsd.toFixed(4)}</span>
-          <span className="opacity-50">↑{cost.inputTokens.toLocaleString()}</span>
-          <span className="opacity-50">↓{cost.outputTokens.toLocaleString()}</span>
+        <div
+          className="px-3 py-0.5 text-[10px] text-vscode-descriptionFg border-t border-[rgba(255,255,255,0.04)] flex items-center gap-3"
+          title={`Session cost $${cost.totalCostUsd.toFixed(4)} · ${cost.inputTokens.toLocaleString()} tokens in · ${cost.outputTokens.toLocaleString()} tokens out`}
+        >
+          <span>${cost.totalCostUsd.toFixed(2)}</span>
+          <span>↑{cost.inputTokens.toLocaleString()}</span>
+          <span>↓{cost.outputTokens.toLocaleString()}</span>
+        </div>
+      )}
+
+      {/* Live status strip: the agent dock (one clickable chip per working
+          agent — click scrolls to its card), retry/limit chip, thinking
+          ticker. Survives the turn ending, for background agents. */}
+      {(transientStatus ||
+        (runningTasks && runningTasks.length > 0) ||
+        (isStreaming && (thinkingTokens ?? 0) > 0)) && (
+        <div className="px-2 pt-1 space-y-1" role="status" aria-live="polite">
+          {transientStatus && (
+            <div className="flex items-center gap-2 text-[11px] rounded-md border border-[rgba(245,158,11,0.4)] bg-[rgba(245,158,11,0.08)] px-2.5 py-1.5 text-[#f59e0b]">
+              <span className="w-1.5 h-1.5 rounded-full bg-[#f59e0b] animate-pulse shrink-0" />
+              <span className="truncate">{transientStatus.text}</span>
+            </div>
+          )}
+          {runningTasks && runningTasks.length > 0 && (
+            <div className="flex items-center flex-wrap gap-x-2 gap-y-1 text-[11px] rounded-md border border-[rgba(139,92,246,0.35)] bg-[rgba(139,92,246,0.07)] px-2.5 py-1.5">
+              <WorkingDots color="#a78bfa" />
+              <span className="text-[#a78bfa] shrink-0">
+                {runningTasks.length} agent{runningTasks.length === 1 ? "" : "s"} working
+              </span>
+              {runningTasks.map((t) => {
+                const label =
+                  t.progressSummary || t.description || t.subagentType || "agent";
+                const elapsed = fmtElapsed(t.durationMs);
+                return (
+                  <button
+                    key={t.toolUseId}
+                    type="button"
+                    onClick={() => jumpToTask(t.toolUseId)}
+                    title={`${t.subagentType || "agent"} — ${label}. Click to show its card.`}
+                    className="flex items-center gap-1 min-w-0 max-w-[240px] px-1.5 py-0.5 rounded border border-[rgba(139,92,246,0.35)] text-vscode-descriptionFg hover:text-vscode-fg hover:bg-[rgba(139,92,246,0.15)] transition-colors"
+                  >
+                    <span className="truncate">{label}</span>
+                    {elapsed && (
+                      <span className="shrink-0 tabular-nums text-[10px] opacity-70">
+                        {elapsed}
+                      </span>
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+          )}
+          {isStreaming && (thinkingTokens ?? 0) > 0 && (!runningTasks || runningTasks.length === 0) && (
+            <div className="flex items-center gap-2 text-[11px] px-2.5 py-0.5 text-vscode-descriptionFg">
+              <span className="italic">
+                Thinking… ~{(thinkingTokens ?? 0) >= 1000 ? `${((thinkingTokens ?? 0) / 1000).toFixed(1)}k` : thinkingTokens} tokens
+              </span>
+            </div>
+          )}
         </div>
       )}
 
@@ -359,7 +466,7 @@ function SummaryDivider() {
   return (
     <div className="px-4 py-3 flex items-center gap-3 select-none">
       <div className="flex-1 h-px bg-[rgba(255,255,255,0.06)]" />
-      <span className="text-[11px] text-vscode-descriptionFg opacity-45 shrink-0">
+      <span className="text-[11px] text-vscode-descriptionFg shrink-0">
         Context summarized
       </span>
       <div className="flex-1 h-px bg-[rgba(255,255,255,0.06)]" />

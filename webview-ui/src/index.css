@@ -52,6 +52,171 @@ body {
   background: rgba(255, 255, 255, 0.15);
 }
 
+/* ---------------------------------------------------------------------------
+   Chat image grids. The messages scroller is a size container so image sets
+   can pick their column count from the panel's real width (the webview can be
+   a narrow sidebar or a wide editor tab): 1 column when narrow, 2 from 440px,
+   3 from 760px. Tiles are uniform (cropped to 16:10) and zoom on click; a
+   solitary image never tiles — it keeps its natural aspect (see ImageGrid).
+   Browsers without container queries just keep the 1-column fallback.
+--------------------------------------------------------------------------- */
+.chat-scroll {
+  container-type: inline-size;
+}
+
+.img-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 6px;
+}
+
+@container (min-width: 440px) {
+  .img-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@container (min-width: 760px) {
+  .img-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
+.img-cell {
+  width: 100%;
+  aspect-ratio: 16 / 10;
+  object-fit: cover;
+}
+
+/* ---------------------------------------------------------------------------
+   Focus. One visible keyboard-focus vocabulary for the whole panel, driven by
+   the editor's own focusBorder token. The composer textarea is exempt — its
+   wrapper card shows the focus ring instead (border swap below).
+--------------------------------------------------------------------------- */
+:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder, #0078d4);
+  outline-offset: 1px;
+}
+textarea:focus-visible {
+  outline: none;
+}
+.composer-shell:focus-within {
+  border-color: var(--vscode-focusBorder, #0078d4);
+}
+
+/* The composer's control labels ("Fable 5", "Agent") must never wrap inside
+   their own buttons; the bar wraps as a whole instead (flex-wrap). */
+.composer-bar button {
+  white-space: nowrap;
+}
+
+/* ---------------------------------------------------------------------------
+   Working indicator: three dots with a soft staggered opacity pulse — the
+   panel's single "running" vocabulary (no bouncing). Color comes from the
+   caller via background-color on the dots.
+--------------------------------------------------------------------------- */
+.working-dots {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+.working-dots > span {
+  width: 4px;
+  height: 4px;
+  border-radius: 9999px;
+  opacity: 0.25;
+  animation: dot-fade 1.4s ease-in-out infinite;
+}
+.working-dots > span:nth-child(2) {
+  animation-delay: 0.2s;
+}
+.working-dots > span:nth-child(3) {
+  animation-delay: 0.4s;
+}
+@keyframes dot-fade {
+  0%, 100% { opacity: 0.25; }
+  40% { opacity: 1; }
+}
+
+/* Brief ring pulse on an agent card after jumping to it from the status dock. */
+.flash-ring {
+  animation: flash-ring 1.2s ease-out 1;
+}
+@keyframes flash-ring {
+  0% { box-shadow: 0 0 0 2px rgba(167, 139, 250, 0.9); }
+  100% { box-shadow: 0 0 0 2px rgba(167, 139, 250, 0); }
+}
+
+/* Conversation post-it: the sticky note pinned top-right of the chat carrying
+   the session's emoji. Paper look = flat pastel + soft drop shadow + a faint
+   top-light gradient; each conversation keeps a stable little tilt. */
+.postit {
+  position: absolute;
+  top: 6px;
+  right: 12px;
+  z-index: 20;
+  width: 40px;
+  height: 40px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 2px;
+  color: rgba(30, 25, 10, 0.75); /* ink for the "?" placeholder + refresh glyph */
+  transform: rotate(var(--postit-rot, -2deg));
+  box-shadow:
+    0 2px 6px rgba(0, 0, 0, 0.3),
+    0 0.5px 1.5px rgba(0, 0, 0, 0.25);
+  background-image: linear-gradient(
+    175deg,
+    rgba(255, 255, 255, 0.35),
+    rgba(255, 255, 255, 0) 45%,
+    rgba(0, 0, 0, 0.05)
+  );
+  transition: transform 0.15s ease, box-shadow 0.15s ease;
+}
+.postit:hover:not(:disabled) {
+  transform: rotate(0deg) scale(1.06);
+  box-shadow:
+    0 4px 10px rgba(0, 0, 0, 0.35),
+    0 1px 2px rgba(0, 0, 0, 0.25);
+}
+.postit:active:not(:disabled) {
+  transform: rotate(0deg) scale(0.98);
+}
+.postit:disabled {
+  cursor: default;
+}
+.postit-refresh {
+  position: absolute;
+  right: 2px;
+  bottom: 2px;
+  display: flex;
+  padding: 1.5px;
+  border-radius: 9999px;
+  background: rgba(0, 0, 0, 0.28);
+  color: rgba(255, 255, 255, 0.95);
+  transition: opacity 0.12s ease;
+}
+.postit-spin {
+  animation: postit-spin 0.9s linear infinite;
+}
+@keyframes postit-spin {
+  to { transform: rotate(360deg); }
+}
+
+/* Motion is informational here (progress, working state); when the user asks
+   for reduced motion, freeze it rather than making them watch it. */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+  .working-dots > span {
+    opacity: 0.8;
+  }
+}
+
 /* Mentions highlight in textarea */
 .mention-highlight {
   color: var(--vscode-textLink-foreground);
@@ -97,6 +262,9 @@ pre code {
 .md {
   line-height: 1.6;
   overflow-wrap: break-word;
+  /* Cap the prose measure — in a wide editor-tab panel, full-bleed 160-char
+     lines are unreadable. Cards and images still span the panel. */
+  max-width: 74ch;
 }
 .md > :first-child { margin-top: 0; }
 .md > :last-child { margin-bottom: 0; }
@@ -165,7 +333,7 @@ pre code {
 
 .md blockquote {
   margin: 0.7em 0;
-  padding: 0.1em 0 0.1em 0.85em;
+  padding: 0.3em 0 0.3em 0.85em;
   border-left: 2px solid var(--app-border);
   color: var(--vscode-descriptionForeground);
 }

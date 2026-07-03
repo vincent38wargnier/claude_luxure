@@ -1,3 +1,4 @@
+import { useEffect, useRef, useState } from "react";
 import type { PendingDiff } from "../../types";
 import FileChangeCard from "./FileChangeCard";
 
@@ -16,6 +17,28 @@ export default function DiffPanel({
   onAcceptAll,
   onRejectAll,
 }: DiffPanelProps) {
+  // Rejecting everything discards every pending change — one mis-click used to
+  // be enough. First click arms; a second within 3s confirms.
+  const [confirmingReject, setConfirmingReject] = useState(false);
+  const confirmTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(
+    () => () => {
+      if (confirmTimer.current) clearTimeout(confirmTimer.current);
+    },
+    []
+  );
+
+  const handleRejectAll = () => {
+    if (!confirmingReject) {
+      setConfirmingReject(true);
+      confirmTimer.current = setTimeout(() => setConfirmingReject(false), 3000);
+      return;
+    }
+    if (confirmTimer.current) clearTimeout(confirmTimer.current);
+    setConfirmingReject(false);
+    onRejectAll();
+  };
+
   return (
     <div className="border-t border-[var(--app-border)] bg-[var(--app-surface)]">
       {/* Header */}
@@ -31,10 +54,19 @@ export default function DiffPanel({
             Accept All
           </button>
           <button
-            onClick={onRejectAll}
-            className="px-2 py-0.5 text-[10px] rounded font-medium bg-[rgba(239,68,68,0.12)] text-[#f87171] hover:bg-[rgba(239,68,68,0.2)] transition-colors"
+            onClick={handleRejectAll}
+            className={`px-2 py-0.5 text-[10px] rounded font-medium transition-colors ${
+              confirmingReject
+                ? "bg-[rgba(239,68,68,0.3)] text-[#fca5a5]"
+                : "bg-[rgba(239,68,68,0.12)] text-[#f87171] hover:bg-[rgba(239,68,68,0.2)]"
+            }`}
+            title={
+              confirmingReject
+                ? "Click again to discard every pending change"
+                : "Discard all pending changes (asks to confirm)"
+            }
           >
-            Reject All
+            {confirmingReject ? "Click to confirm" : "Reject All"}
           </button>
         </div>
       </div>

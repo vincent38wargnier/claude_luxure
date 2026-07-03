@@ -13,6 +13,36 @@ export interface ClaudeEvent {
   [key: string]: unknown;
 }
 
+/** Normalized system:task_* event — the CLI's live reporting for subagent runs
+ * (Agent tool) and background shell tasks. task_progress carries a live
+ * one-line `description` ("Reading a.txt") plus usage counters; task_notification
+ * fires on completion (and, for background tasks, precedes an automatic resume
+ * of the conversation). Verified against CLI 2.1.197 stream-json output. */
+export interface TaskUpdateEvent {
+  kind: "task_started" | "task_progress" | "task_updated" | "task_notification";
+  taskId?: string;
+  /** tool_use id of the spawning Agent call — joins the event to its card. */
+  toolUseId?: string;
+  description?: string;
+  subagentType?: string;
+  taskType?: string;
+  prompt?: string;
+  status?: string;
+  summary?: string;
+  outputFile?: string;
+  lastToolName?: string;
+  usage?: { tool_uses?: number; total_tokens?: number; duration_ms?: number };
+}
+
+/** system:api_retry — emitted before each retry of a failed API request. */
+export interface ApiRetryEvent {
+  attempt: number;
+  maxRetries: number;
+  delayMs: number;
+  error: string;
+  status: number | null;
+}
+
 export interface ClaudeBridgeOptions {
   cwd: string;
   mode?: Mode;
@@ -51,14 +81,15 @@ const PLAN_MODE_SYSTEM_PROMPT = `You are in PLAN MODE. You must ONLY:
 4. NEVER use Write, Edit, Bash, or any tool that modifies files
 Present your analysis and proposed changes clearly in markdown.`;
 
-// This UI drives the CLI in request/response (stream-json) mode: there is no
-// loop that re-invokes the model when a background task finishes. If the model
-// defers work to the background and ends its turn, the turn never produces a
-// `result` and the conversation hangs. So forbid that pattern outright.
-const NO_BACKGROUND_DEFERRAL_SYSTEM_PROMPT = `You are running inside a request/response chat UI. There is NO mechanism that re-invokes you when a background task or process finishes — once your turn ends, nothing will resume it. Therefore:
-- NEVER start long-running work in the background and tell the user you will "report back", "let them know", or "check in" later. That message would be the last thing they ever see and the turn would hang forever.
-- If you start something in the background, you MUST poll it to completion within THIS turn (e.g. read its output until done) before you finish — or simply run it in the foreground and wait.
-- If the work is genuinely too long to finish now, do NOT silently wait: end your turn by explicitly telling the user to send a message (e.g. "tell me to check on it") so a new turn can resume the work.`;
+// The CLI DOES resume the conversation when a tracked background task finishes:
+// it injects a task-notification and re-invokes the model (verified against CLI
+// 2.1.197 — system:task_notification in stream-json, followed by a fresh turn
+// with no user input). The panel renders a live progress card per task, so tell
+// the model the truth and let it fan work out instead of forbidding it.
+const BACKGROUND_TASKS_SYSTEM_PROMPT = `You are running inside a chat panel that tracks background work. Agents you launch with the Agent tool and background shell tasks each get a LIVE progress card in the chat (status, current action, tool/token counters), and when a background task finishes you are automatically re-invoked with a task-notification carrying its result. Therefore:
+- For long or parallelizable work, freely launch agents (including run_in_background) and end your turn with a one-line status of what is running — you WILL be resumed when each task completes; report its results then.
+- Only claim work is running in the background if you actually started it this turn as an Agent or background shell task; untracked promises ("I'll get back to you") are never fulfilled.
+- For quick work, staying in the foreground remains simpler — don't background trivial commands.`;
 
 // Appended when the bundled "luxure" MCP server is wired in, so the model
 // knows the chat panel can display images and actually uses the tools.
@@ -268,7 +299,7 @@ export class ClaudeBridge extends EventEmitter {
     // always on, with the plan-mode constraints layered in when relevant.
     const systemPromptParts = [
       MARKDOWN_STYLE_SYSTEM_PROMPT,
-      NO_BACKGROUND_DEFERRAL_SYSTEM_PROMPT,
+      BACKGROUND_TASKS_SYSTEM_PROMPT,
     ];
     if (this.options.mode === "plan") {
       systemPromptParts.push(PLAN_MODE_SYSTEM_PROMPT);
@@ -395,6 +426,69 @@ export class ClaudeBridge extends EventEmitter {
       this.emit("compactBoundary", event);
     }
 
+    // Live subagent / background-task reporting. task_progress fires on every
+    // tool call inside the agent with a one-line summary + usage counters;
+    // task_notification fires on completion (for background tasks the CLI then
+    // resumes the conversation on its own — a turn with no user input).
+    if (
+      event.type === "system" &&
+      (event.subtype === "task_started" ||
+        event.subtype === "task_progress" ||
+        event.subtype === "task_updated" ||
+        event.subtype === "task_notification")
+    ) {
+      const ev = event as Record<string, any>;
+      const patch = (ev.patch || {}) as Record<string, unknown>;
+      const update: TaskUpdateEvent = {
+        kind: event.subtype,
+        taskId: typeof ev.task_id === "string" ? ev.task_id : undefined,
+        toolUseId: typeof ev.tool_use_id === "string" ? ev.tool_use_id : undefined,
+        description: typeof ev.description === "string" ? ev.description : undefined,
+        subagentType: typeof ev.subagent_type === "string" ? ev.subagent_type : undefined,
+        taskType: typeof ev.task_type === "string" ? ev.task_type : undefined,
+        prompt: typeof ev.prompt === "string" ? ev.prompt : undefined,
+        status:
+          typeof ev.status === "string"
+            ? ev.status
+            : typeof patch.status === "string"
+              ? (patch.status as string)
+              : undefined,
+        summary: typeof ev.summary === "string" ? ev.summary : undefined,
+        outputFile: typeof ev.output_file === "string" ? ev.output_file : undefined,
+        lastToolName: typeof ev.last_tool_name === "string" ? ev.last_tool_name : undefined,
+        usage:
+          ev.usage && typeof ev.usage === "object"
+            ? (ev.usage as TaskUpdateEvent["usage"])
+            : undefined,
+      };
+      this.emit("taskUpdate", update);
+    }
+
+    // Live thinking-token counter while the model reasons (before any output).
+    if (event.type === "system" && event.subtype === "thinking_tokens") {
+      this.emit("thinkingTokens", {
+        tokens: (event as any).estimated_tokens as number || 0,
+      });
+    }
+
+    // Emitted before each retry of a failed API request — surfaces "why is
+    // nothing happening" (overloaded / rate_limit / server_error) to the UI.
+    if (event.type === "system" && event.subtype === "api_retry") {
+      const ev = event as Record<string, any>;
+      const retry: ApiRetryEvent = {
+        attempt: (ev.attempt as number) || 0,
+        maxRetries: (ev.max_retries as number) || 0,
+        delayMs: (ev.retry_delay_ms as number) || 0,
+        error: typeof ev.error === "string" ? ev.error : "",
+        status: typeof ev.error_status === "number" ? ev.error_status : null,
+      };
+      this.emit("apiRetry", retry);
+    }
+
+    if (event.type === "rate_limit_event") {
+      this.emit("rateLimit", ((event as any).rate_limit_info as Record<string, unknown>) || {});
+    }
+
     if (event.type === "result") {
       this._status = "ready";
       this.emit("status", this._status);
@@ -424,10 +518,18 @@ export class ClaudeBridge extends EventEmitter {
     if (event.type === "assistant") {
       this.emit("assistant", event);
 
+      // Set when this message was produced INSIDE a subagent (the id of the
+      // Agent call that spawned it) — those activities nest under the task
+      // card, and the subagent's prose must never leak into the main answer.
+      const parentToolUseId =
+        typeof (event as any).parent_tool_use_id === "string"
+          ? ((event as any).parent_tool_use_id as string)
+          : undefined;
+
       const message = (event as any).message;
       if (message?.content) {
         for (const block of message.content) {
-          if (block.type === "text" && block.text) {
+          if (block.type === "text" && block.text && !parentToolUseId) {
             this.emit("assistantText", block.text);
           }
           if (block.type === "tool_use") {
@@ -436,12 +538,14 @@ export class ClaudeBridge extends EventEmitter {
               toolName: block.name as string,
               toolInput: block.input as Record<string, unknown>,
               toolUseId: block.id as string,
+              parentToolUseId,
             });
           }
           if (block.type === "thinking") {
             this.emit("activity", {
               type: "thinking",
               text: (block.thinking as string) || "",
+              parentToolUseId,
             });
           }
         }
@@ -449,6 +553,10 @@ export class ClaudeBridge extends EventEmitter {
     }
 
     if (event.type === "tool_result" || (event.type === "user" && (event as any).message?.content)) {
+      const parentToolUseId =
+        typeof (event as any).parent_tool_use_id === "string"
+          ? ((event as any).parent_tool_use_id as string)
+          : undefined;
       const content = (event as any).message?.content;
       if (Array.isArray(content)) {
         for (const block of content) {
@@ -463,6 +571,7 @@ export class ClaudeBridge extends EventEmitter {
               // Image blocks (e.g. a browser screenshot) ride along as data
               // URLs so the chat renders the pixels, not a text marker.
               images: extractToolResultImages(block.content),
+              parentToolUseId,
             });
           }
         }

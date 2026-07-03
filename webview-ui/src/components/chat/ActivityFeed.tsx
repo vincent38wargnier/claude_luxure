@@ -1,9 +1,11 @@
 import { useState } from "react";
 import { Check } from "lucide-react";
-import type { ActivityEvent } from "../../types";
+import type { ActivityEvent, TaskActivity } from "../../types";
+import AgentTaskCard from "../common/AgentTaskCard";
 import FileChangeCard from "../common/FileChangeCard";
 import McpCallCard, { type McpCall } from "../common/McpCallCard";
 import ProofCard from "../common/ProofCard";
+import WorkingDots from "../common/WorkingDots";
 
 interface Step {
   kind: "thinking" | "tool";
@@ -60,6 +62,31 @@ export function coalesceActivities(events: ActivityEvent[]): ActivityEvent[] {
     if (e.type === "proof") {
       // Presented screenshots are standalone cards; never merged or deduped.
       out.push(e);
+      continue;
+    }
+    if (e.type === "task") {
+      // One card per Agent call: re-emissions merge into the existing card,
+      // newer non-empty fields winning (status only moves off "running").
+      const existing = out.find(
+        (o): o is TaskActivity => o.type === "task" && o.toolUseId === e.toolUseId
+      );
+      if (existing) {
+        if (e.taskId) existing.taskId = e.taskId;
+        if (e.description) existing.description = e.description;
+        if (e.subagentType) existing.subagentType = e.subagentType;
+        if (e.prompt && !existing.prompt) existing.prompt = e.prompt;
+        if (e.background) existing.background = true;
+        if (e.progressSummary) existing.progressSummary = e.progressSummary;
+        if (e.lastToolName) existing.lastToolName = e.lastToolName;
+        if (e.toolUses !== undefined) existing.toolUses = e.toolUses;
+        if (e.totalTokens !== undefined) existing.totalTokens = e.totalTokens;
+        if (e.durationMs !== undefined) existing.durationMs = e.durationMs;
+        if (e.result) existing.result = e.result;
+        if (e.children) existing.children = e.children;
+        if (e.status !== "running") existing.status = e.status;
+      } else {
+        out.push({ ...e });
+      }
       continue;
     }
     if (e.type === "tool_result") {
@@ -155,7 +182,10 @@ function toStep(a: ActivityEvent): Step | null {
       case "LS":
       case "ls":
         return { kind: "tool", label: "Listed", detail: truncate(input.path || input.directory || ".") };
+      // Legacy fallback for messages persisted before task cards existed —
+      // new Agent calls become {type:"task"} activities and never reach here.
       case "Task":
+      case "Agent":
         return { kind: "tool", label: "Ran agent", detail: truncate(input.description) };
       case "TodoWrite":
         return { kind: "tool", label: "Updated plan" };
@@ -357,13 +387,20 @@ export default function ActivityFeed({
   const steps: Step[] = [];
   const mcpCalls: McpCall[] = [];
   const proofs: { images: string[]; caption?: string }[] = [];
+  const tasks: TaskActivity[] = [];
   const exploredFiles = new Set<string>();
   let searchCount = 0;
+  let commandCount = 0;
   let todos: Todo[] | null = null;
   for (const a of coalesceActivities(activities || [])) {
     // Screenshots Claude presented render as prominent image cards.
     if (a.type === "proof") {
       proofs.push(a);
+      continue;
+    }
+    // Subagent runs render as live cards with their own progress/children.
+    if (a.type === "task") {
+      tasks.push(a);
       continue;
     }
     const td = todosFrom(a);
@@ -395,6 +432,8 @@ export default function ActivityFeed({
     const read = readFileTarget(a);
     if (read) exploredFiles.add(read);
     if (a.type === "tool_use" && SEARCH_TOOLS.has(a.toolName)) searchCount++;
+    if (a.type === "tool_use" && (a.toolName === "Bash" || a.toolName === "bash"))
+      commandCount++;
     const st = toStep(a);
     if (st) steps.push(st);
   }
@@ -405,7 +444,8 @@ export default function ActivityFeed({
     steps.length === 0 &&
     !todos &&
     mcpCalls.length === 0 &&
-    proofs.length === 0
+    proofs.length === 0 &&
+    tasks.length === 0
   )
     return null;
 
@@ -421,22 +461,17 @@ export default function ActivityFeed({
           <button
             type="button"
             onClick={() => setExpanded((v) => !v)}
-            className="flex items-center gap-1.5 max-w-full text-left text-[11px] text-vscode-descriptionFg opacity-50 hover:opacity-90 transition-opacity"
+            aria-expanded={expanded}
+            className="flex items-center gap-1.5 max-w-full text-left text-[11px] text-vscode-descriptionFg hover:text-vscode-fg transition-colors"
           >
             <span
               className={`inline-block text-[8px] leading-none transition-transform ${expanded ? "rotate-90" : ""}`}
             >
               ▶
             </span>
-            {live && (
-              <span className="flex gap-0.5 shrink-0">
-                <span className="w-1 h-1 rounded-full bg-[#f59e0b] animate-bounce" style={{ animationDelay: "0ms" }} />
-                <span className="w-1 h-1 rounded-full bg-[#f59e0b] animate-bounce" style={{ animationDelay: "150ms" }} />
-                <span className="w-1 h-1 rounded-full bg-[#f59e0b] animate-bounce" style={{ animationDelay: "300ms" }} />
-              </span>
-            )}
+            {live && <WorkingDots />}
             <span className="truncate">
-              {stepSummary(steps, exploredFiles.size, searchCount, !!live)}
+              {stepSummary(steps, exploredFiles.size, searchCount, commandCount, !!live)}
             </span>
           </button>
 
@@ -451,10 +486,10 @@ export default function ActivityFeed({
                         live && isLast ? "bg-[#f59e0b] animate-pulse" : "bg-[rgba(255,255,255,0.25)]"
                       }`}
                     />
-                    <span className="text-vscode-fg/70 min-w-0">
+                    <span className="text-vscode-fg/80 min-w-0">
                       <span className={st.kind === "thinking" ? "italic opacity-80" : ""}>{st.label}</span>
                       {st.detail ? (
-                        <span className="text-vscode-descriptionFg opacity-60"> {st.detail}</span>
+                        <span className="text-vscode-descriptionFg"> {st.detail}</span>
                       ) : null}
                     </span>
                   </div>
@@ -466,6 +501,10 @@ export default function ActivityFeed({
       )}
 
       {todos && <TodoList todos={todos} />}
+
+      {tasks.map((t) => (
+        <AgentTaskCard key={t.toolUseId} task={t} live={!!live} />
+      ))}
 
       {mcpCalls.map((m, i) => (
         <McpCallCard key={`${m.server}__${m.tool}__${i}`} call={m} live={!!live} />
@@ -553,11 +592,13 @@ function TodoList({ todos }: { todos: Todo[] }) {
 
 /** The quiet one-liner for the collapsed steps: the current action while live,
  * "Explored N files" for read-heavy runs, a single action verbatim, else a
- * generic recap. File edits are shown separately as cards. */
+ * generic recap. Counts everything it hides (reads, searches, commands) so the
+ * summary never understates the work. File edits are shown separately as cards. */
 function stepSummary(
   steps: Step[],
   exploredCount: number,
   searchCount: number,
+  commandCount: number,
   live: boolean
 ): string {
   if (live) {
@@ -567,15 +608,20 @@ function stepSummary(
     }
     return "Working…";
   }
+  const bits: string[] = [];
   if (exploredCount > 0) {
-    const bits = [`${exploredCount} file${exploredCount === 1 ? "" : "s"}`];
-    if (searchCount > 0) {
-      bits.push(`${searchCount} search${searchCount === 1 ? "" : "es"}`);
-    }
-    return `Explored ${bits.join(", ")}`;
+    bits.push(`${exploredCount} file${exploredCount === 1 ? "" : "s"}`);
   }
   if (searchCount > 0) {
-    return `Searched ${searchCount} time${searchCount === 1 ? "" : "s"}`;
+    bits.push(`${searchCount} search${searchCount === 1 ? "" : "es"}`);
+  }
+  if (commandCount > 0) {
+    bits.push(`${commandCount} command${commandCount === 1 ? "" : "s"}`);
+  }
+  if (bits.length > 0) {
+    return exploredCount > 0
+      ? `Explored ${bits.join(", ")}`
+      : `Ran ${bits.join(", ")}`;
   }
   if (steps.length === 1) {
     const s = steps[0];

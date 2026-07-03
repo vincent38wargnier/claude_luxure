@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import vscode from "./vscode";
 import ChatView from "./components/chat/ChatView";
 import { coalesceActivities } from "./components/chat/ActivityFeed";
@@ -8,8 +8,11 @@ import type {
   ExtensionState,
   ExtensionMessage,
   ActivityEvent,
+  ChatMessage,
+  TaskActivity,
   TimelinePart,
   SessionInfo,
+  SessionMarker,
   Mode,
   EffortLevel,
   SkillInfo,
@@ -19,6 +22,31 @@ import type {
   UsageInfo,
   QueuedMessage,
 } from "./types";
+
+/** Replace a task card (matched by toolUseId) inside timeline parts,
+ * immutably, so React re-renders just the patched run. */
+function patchTaskInParts(
+  parts: TimelinePart[],
+  task: TaskActivity
+): { parts: TimelinePart[]; found: boolean } {
+  let found = false;
+  const next = parts.map((p) => {
+    if (p.type !== "activities") {
+      return p;
+    }
+    const idx = p.activities.findIndex(
+      (a) => a.type === "task" && a.toolUseId === task.toolUseId
+    );
+    if (idx < 0) {
+      return p;
+    }
+    found = true;
+    const acts = p.activities.slice();
+    acts[idx] = task;
+    return { type: "activities" as const, activities: acts };
+  });
+  return { parts: next, found };
+}
 
 const initialState: ExtensionState = {
   mode: "agent",
@@ -36,6 +64,10 @@ export default function App() {
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
   const [activities, setActivities] = useState<ActivityEvent[]>([]);
   const [liveTimeline, setLiveTimeline] = useState<TimelinePart[]>([]);
+  // Live thinking-token counter (system:thinking_tokens) for the current turn.
+  const [thinkingTokens, setThinkingTokens] = useState(0);
+  // API retry / rate-limit chip; cleared when tokens flow again.
+  const [transient, setTransient] = useState<{ kind: string; text: string } | null>(null);
   const [mcpServers, setMcpServers] = useState<McpServerStatus[]>([]);
   const [accounts, setAccounts] = useState<StoredAccount[]>([]);
   const [activeAccountId, setActiveAccountId] = useState<string>("default");
@@ -52,6 +84,10 @@ export default function App() {
   >(null);
   const [openTabIds, setOpenTabIds] = useState<string[]>([]);
   const [tabNames, setTabNames] = useState<Record<string, string>>({});
+  // Post-it identity per conversation key, and which keys have an emoji pick
+  // in flight (drives the spinner on the post-it).
+  const [tabMarkers, setTabMarkers] = useState<Record<string, SessionMarker>>({});
+  const [markerBusyKeys, setMarkerBusyKeys] = useState<Record<string, boolean>>({});
   const [externalFiles, setExternalFiles] = useState<string[]>([]);
   const [skillsOpen, setSkillsOpen] = useState(false);
   const [skills, setSkills] = useState<SkillInfo[]>([]);
@@ -90,15 +126,29 @@ export default function App() {
 
     switch (msg.type) {
       case "state": {
-        // Only reset the live activity buffer when switching tabs — clearing it on
-        // every state update would wipe the in-progress feed mid-stream.
         const tabChanged = activeTabRef.current !== msg.state.activeTabId;
         activeTabRef.current = msg.state.activeTabId;
         setState(msg.state);
         setLiveStreamingText(msg.state.streamingText || "");
+        // The provider's per-session buffers are authoritative: restoring them
+        // here is what brings a running conversation's streamed feed back when
+        // switching to its tab (it used to be wiped and lost until the turn
+        // finalized). Older providers without the fields keep the old
+        // wipe-on-switch behavior.
+        setLiveTimeline((prev) =>
+          msg.state.liveTimeline ?? (tabChanged ? [] : prev)
+        );
+        setActivities((prev) =>
+          msg.state.liveActivities ?? (tabChanged ? [] : prev)
+        );
         if (tabChanged) {
-          setActivities([]);
-          setLiveTimeline([]);
+          setThinkingTokens(0);
+          setTransient(null);
+        }
+        if (msg.state.marker && msg.state.activeTabId) {
+          const key = msg.state.activeTabId;
+          const marker = msg.state.marker;
+          setTabMarkers((prev) => ({ ...prev, [key]: marker }));
         }
         break;
       }
@@ -111,6 +161,7 @@ export default function App() {
         break;
 
       case "streamToken":
+        setTransient(null); // tokens flowing again — retry/limit chip is stale
         setLiveStreamingText((prev) => prev + msg.text);
         setLiveTimeline((prev) => {
           const next = prev.slice();
@@ -128,6 +179,8 @@ export default function App() {
         setLiveStreamingText("");
         setActivities([]);
         setLiveTimeline([]);
+        setThinkingTokens(0);
+        setTransient(null);
         setState((prev) => ({
           ...prev,
           isStreaming: false,
@@ -155,6 +208,76 @@ export default function App() {
           }
           return next;
         });
+        break;
+
+      case "taskUpdate": {
+        // In-place patch of an agent card — live progress for a running
+        // subagent, including after its parent turn already finalized.
+        const task = msg.task;
+        if (msg.messageId) {
+          setState((prev) => ({
+            ...prev,
+            messages: prev.messages.map((m): ChatMessage => {
+              if (m.id !== msg.messageId) {
+                return m;
+              }
+              const patched: ChatMessage = { ...m };
+              if (m.timeline && m.timeline.length > 0) {
+                const r = patchTaskInParts(m.timeline, task);
+                patched.timeline = r.found
+                  ? r.parts
+                  : [...m.timeline, { type: "activities", activities: [task] }];
+              } else {
+                patched.timeline = [{ type: "activities", activities: [task] }];
+              }
+              if (m.activities) {
+                patched.activities = m.activities.map((a) =>
+                  a.type === "task" && a.toolUseId === task.toolUseId ? task : a
+                );
+              }
+              return patched;
+            }),
+          }));
+        } else {
+          setLiveTimeline((prev) => {
+            const r = patchTaskInParts(prev, task);
+            if (r.found) {
+              return r.parts;
+            }
+            // Not in the live buffer yet (e.g. panel re-opened mid-run) — append.
+            const next = prev.slice();
+            const last = next[next.length - 1];
+            if (last && last.type === "activities") {
+              next[next.length - 1] = {
+                type: "activities",
+                activities: [...last.activities, task],
+              };
+            } else {
+              next.push({ type: "activities", activities: [task] });
+            }
+            return next;
+          });
+          setActivities((prev) => {
+            const idx = prev.findIndex(
+              (a) => a.type === "task" && a.toolUseId === task.toolUseId
+            );
+            if (idx < 0) {
+              return [...prev.slice(-60), task];
+            }
+            const next = prev.slice();
+            next[idx] = task;
+            return next;
+          });
+        }
+        break;
+      }
+
+      case "thinkingTokens":
+        setThinkingTokens(msg.tokens);
+        break;
+
+      case "transientStatus":
+        setTransient(msg.status);
         break;
 
       case "annotateImage":
@@ -255,7 +378,20 @@ export default function App() {
       case "openTabs":
         setOpenTabIds(msg.tabIds);
         setTabNames(msg.names ?? {});
+        // Merge (don't replace): a draft key that just migrated to a session id
+        // may briefly be referenced under its old key elsewhere.
+        if (msg.markers) {
+          const incoming = msg.markers;
+          setTabMarkers((prev) => ({ ...prev, ...incoming }));
+        }
         break;
+
+      case "markerUpdate": {
+        const { key, marker, busy } = msg;
+        setTabMarkers((prev) => ({ ...prev, [key]: marker }));
+        setMarkerBusyKeys((prev) => ({ ...prev, [key]: !!busy }));
+        break;
+      }
 
       case "slashCommands":
         setState((prev) => ({ ...prev, slashCommands: msg.commands }));
@@ -265,11 +401,10 @@ export default function App() {
         setState((prev) => ({ ...prev, cliStatus: msg.status }));
         break;
 
-      case "addFile" as any:
+      case "addFile":
         setExternalFiles((prev) => {
-          const filePath = (msg as any).filePath as string;
-          if (prev.includes(filePath)) return prev;
-          return [...prev, filePath];
+          if (prev.includes(msg.filePath)) return prev;
+          return [...prev, msg.filePath];
         });
         break;
 
@@ -318,6 +453,34 @@ export default function App() {
     vscode.postMessage({ type: "ready" });
     return () => window.removeEventListener("message", handleMessage);
   }, [handleMessage]);
+
+  // Agents still working right now — from finalized messages AND the live turn
+  // (a background agent outlives its turn). Last sighting of a card wins, so a
+  // completion patch removes it from the strip.
+  const runningTasks = useMemo(() => {
+    const all = new Map<string, TaskActivity>();
+    const scan = (acts?: ActivityEvent[]) => {
+      for (const a of acts || []) {
+        if (a.type === "task") {
+          all.set(a.toolUseId, a);
+        }
+      }
+    };
+    for (const m of state.messages) {
+      scan(m.activities);
+      for (const p of m.timeline || []) {
+        if (p.type === "activities") {
+          scan(p.activities);
+        }
+      }
+    }
+    for (const p of liveTimeline) {
+      if (p.type === "activities") {
+        scan(p.activities);
+      }
+    }
+    return [...all.values()].filter((t) => t.status === "running");
+  }, [state.messages, liveTimeline]);
 
   // Drain the queue when the active conversation goes streaming→idle. A parked
   // "send now" message (pendingForceRef) takes priority over the FIFO head.
@@ -554,6 +717,10 @@ export default function App() {
     vscode.postMessage({ type: "summarizeAllSessions" });
   }, []);
 
+  const handleReevaluateMarker = useCallback(() => {
+    vscode.postMessage({ type: "reevaluateMarker" });
+  }, []);
+
   const handleSwitchAccount = useCallback((accountId: string) => {
     vscode.postMessage({ type: "switchAccount", accountId });
   }, []);
@@ -604,6 +771,10 @@ export default function App() {
         sessions={sessions}
         openTabIds={openTabIds}
         tabNames={tabNames}
+        tabMarkers={tabMarkers}
+        marker={tabMarkers[state.activeTabId ?? ""] ?? state.marker ?? null}
+        markerBusy={!!markerBusyKeys[state.activeTabId ?? ""]}
+        onReevaluateMarker={handleReevaluateMarker}
         runningSessionIds={state.runningSessionIds || []}
         cliStatus={state.cliStatus}
         workspacePath={state.workspacePath}
@@ -614,6 +785,9 @@ export default function App() {
         isStreaming={isStreaming}
         activities={activities}
         liveTimeline={isStreaming ? liveTimeline : []}
+        runningTasks={runningTasks}
+        thinkingTokens={thinkingTokens}
+        transientStatus={transient}
         cost={state.cost ?? null}
         contextInfo={state.contextInfo ?? null}
         accountEmail={state.accountEmail}

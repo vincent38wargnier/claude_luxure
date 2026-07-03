@@ -1,5 +1,5 @@
-import { useState, useEffect, useCallback } from "react";
-import { X, Plus, Save, Trash2, ExternalLink } from "lucide-react";
+import { useState, useEffect, useCallback, useMemo } from "react";
+import { X, Plus, Save, Trash2, ExternalLink, Search } from "lucide-react";
 import type { SkillInfo, SkillScope } from "../../types";
 import SkillListItem from "./SkillListItem";
 
@@ -50,14 +50,27 @@ export default function SkillsPanel({
   const [createScope, setCreateScope] = useState<SkillScope>("global");
   const [createName, setCreateName] = useState("");
   const [showCreate, setShowCreate] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
 
   useEffect(() => {
     if (open) {
       onListSkills();
+      setSearchQuery("");
     }
   }, [open, onListSkills]);
 
   const selectedSkill = skills.find((s) => s.id === selectedSkillId);
+
+  const filteredSkills = useMemo(() => {
+    const q = searchQuery.trim().toLowerCase();
+    if (!q) return skills;
+    return skills.filter(
+      (s) =>
+        s.name.toLowerCase().includes(q) ||
+        s.command.toLowerCase().includes(q) ||
+        (s.description ?? "").toLowerCase().includes(q)
+    );
+  }, [skills, searchQuery]);
 
   const handleCreate = useCallback(() => {
     const name = createName.trim().toLowerCase();
@@ -71,7 +84,9 @@ export default function SkillsPanel({
     return null;
   }
 
-  const { global: globalSkills, project: projectSkills } = groupByScope(skills);
+  const { global: globalSkills, project: projectSkills } =
+    groupByScope(filteredSkills);
+  const isFiltering = searchQuery.trim().length > 0;
 
   return (
     <div className="absolute inset-0 z-40 flex flex-col bg-vscode-bg">
@@ -101,7 +116,7 @@ export default function SkillsPanel({
 
       <div className="flex flex-1 min-h-0">
         <div className="w-[200px] shrink-0 border-r border-[rgba(255,255,255,0.06)] flex flex-col min-h-0">
-          <div className="p-2 border-b border-[rgba(255,255,255,0.04)]">
+          <div className="p-2 border-b border-[rgba(255,255,255,0.04)] space-y-2">
             <button
               type="button"
               onClick={() => setShowCreate((v) => !v)}
@@ -110,6 +125,37 @@ export default function SkillsPanel({
               <Plus size={12} />
               New skill
             </button>
+            <div className="relative">
+              <Search
+                size={11}
+                className="absolute left-2 top-1/2 -translate-y-1/2 text-vscode-descriptionFg pointer-events-none"
+              />
+              <input
+                type="text"
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Escape" && searchQuery) {
+                    e.stopPropagation();
+                    setSearchQuery("");
+                  }
+                }}
+                placeholder="Search skills…"
+                aria-label="Search skills by name"
+                className="w-full text-xs pl-6 pr-6 py-1 rounded bg-vscode-inputBg text-vscode-fg border border-vscode-border placeholder:text-vscode-descriptionFg"
+              />
+              {searchQuery && (
+                <button
+                  type="button"
+                  onClick={() => setSearchQuery("")}
+                  className="absolute right-1.5 top-1/2 -translate-y-1/2 p-0.5 text-vscode-descriptionFg hover:text-vscode-fg"
+                  title="Clear search"
+                  aria-label="Clear search"
+                >
+                  <X size={11} />
+                </button>
+              )}
+            </div>
           </div>
 
           {showCreate && (
@@ -155,7 +201,7 @@ export default function SkillsPanel({
               </p>
               {globalSkills.length === 0 ? (
                 <p className="px-2 text-[10px] text-vscode-descriptionFg opacity-50">
-                  No global skills
+                  {isFiltering ? "No matches" : "No global skills"}
                 </p>
               ) : (
                 globalSkills.map((skill) => (
@@ -176,7 +222,7 @@ export default function SkillsPanel({
                 </p>
                 {projectSkills.length === 0 ? (
                   <p className="px-2 text-[10px] text-vscode-descriptionFg opacity-50">
-                    No project skills
+                    {isFiltering ? "No matches" : "No project skills"}
                   </p>
                 ) : (
                   projectSkills.map((skill) => (

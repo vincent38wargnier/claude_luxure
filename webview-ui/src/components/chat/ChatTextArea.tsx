@@ -70,6 +70,10 @@ interface ChatTextAreaProps {
 }
 
 const MAX_IMAGES = 10;
+// External drops travel through postMessage as base64 — cap them so a stray
+// video doesn't stall the webview bridge.
+const MAX_DROP_FILE_MB = 25;
+const MAX_DROP_FILE_BYTES = MAX_DROP_FILE_MB * 1024 * 1024;
 
 /** A small colored dot summarizing overall MCP health, derived from the live
  * session lifecycle: green = connected, amber (pulsing) = connecting/restarting,
@@ -293,6 +297,10 @@ export default function ChatTextArea({
 }: ChatTextAreaProps) {
   const [inputValue, setInputValue] = useState("");
   const [selectedImages, setSelectedImages] = useState<string[]>([]);
+  // Transient composer notice (image cap hit, folder dropped, oversized file…)
+  // — these used to fail silently.
+  const [composerNotice, setComposerNotice] = useState<string | null>(null);
+  const noticeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [isDragOver, setIsDragOver] = useState(false);
   const [showContextMenu, setShowContextMenu] = useState(false);
   const [showSlashMenu, setShowSlashMenu] = useState(false);
@@ -530,9 +538,16 @@ export default function ChatTextArea({
         return;
       }
 
+      // Ctrl/Cmd+C cancels the run ONLY on an empty selection — with text
+      // selected it must stay the OS copy chord, otherwise copying something
+      // out of the composer mid-turn silently kills the whole turn.
       if (e.key === "c" && (e.ctrlKey || e.metaKey) && isStreaming) {
-        e.preventDefault();
-        onCancel();
+        const ta = textareaRef.current;
+        const hasSelection = !!ta && ta.selectionStart !== ta.selectionEnd;
+        if (!hasSelection) {
+          e.preventDefault();
+          onCancel();
+        }
       }
     },
     [
@@ -614,22 +629,22 @@ export default function ChatTextArea({
     [inputValue, mentionStartPos]
   );
 
-  const handlePaste = useCallback(
-    (e: React.ClipboardEvent) => {
-      const items = e.clipboardData?.items;
-      if (!items) return;
+  const showNotice = useCallback((text: string) => {
+    setComposerNotice(text);
+    if (noticeTimer.current) clearTimeout(noticeTimer.current);
+    noticeTimer.current = setTimeout(() => setComposerNotice(null), 4000);
+  }, []);
 
-      const imageItems = Array.from(items).filter((item) =>
-        ACCEPTED_IMAGE_TYPES.includes(item.type)
-      );
-
-      if (imageItems.length === 0) return;
-
-      e.preventDefault();
-      for (const item of imageItems) {
-        if (selectedImages.length >= MAX_IMAGES) break;
-        const blob = item.getAsFile();
-        if (!blob) continue;
+  /** Attach image blobs as data-URL thumbnails, surfacing any cut by the cap. */
+  const attachImageFiles = useCallback(
+    (imageFiles: File[]) => {
+      const room = Math.max(0, MAX_IMAGES - selectedImages.length);
+      if (imageFiles.length > room) {
+        showNotice(
+          `Only ${MAX_IMAGES} images per message — ${imageFiles.length - room} not added`
+        );
+      }
+      for (const file of imageFiles.slice(0, room)) {
         const reader = new FileReader();
         reader.onload = () => {
           const dataUrl = reader.result as string;
@@ -637,10 +652,28 @@ export default function ChatTextArea({
             [...prev, dataUrl].slice(0, MAX_IMAGES)
           );
         };
-        reader.readAsDataURL(blob);
+        reader.readAsDataURL(file);
       }
     },
-    [selectedImages]
+    [selectedImages, showNotice]
+  );
+
+  const handlePaste = useCallback(
+    (e: React.ClipboardEvent) => {
+      const items = e.clipboardData?.items;
+      if (!items) return;
+
+      const imageFiles = Array.from(items)
+        .filter((item) => ACCEPTED_IMAGE_TYPES.includes(item.type))
+        .map((item) => item.getAsFile())
+        .filter((f): f is File => f !== null);
+
+      if (imageFiles.length === 0) return;
+
+      e.preventDefault();
+      attachImageFiles(imageFiles);
+    },
+    [attachImageFiles]
   );
 
   const handleDragOver = useCallback((e: React.DragEvent) => {
@@ -653,37 +686,9 @@ export default function ChatTextArea({
     setIsDragOver(false);
   }, []);
 
-  const handleDrop = useCallback(
-    (e: React.DragEvent) => {
-      e.preventDefault();
-      setIsDragOver(false);
-
-      const files = e.dataTransfer.files;
-      if (files.length > 0) {
-        const imageFiles = Array.from(files).filter((f) =>
-          ACCEPTED_IMAGE_TYPES.includes(f.type)
-        );
-        if (imageFiles.length > 0) {
-          for (const file of imageFiles) {
-            if (selectedImages.length >= MAX_IMAGES) break;
-            const reader = new FileReader();
-            reader.onload = () => {
-              const dataUrl = reader.result as string;
-              setSelectedImages((prev) =>
-                [...prev, dataUrl].slice(0, MAX_IMAGES)
-              );
-            };
-            reader.readAsDataURL(file);
-          }
-          return;
-        }
-      }
-
-      const text = e.dataTransfer.getData("text/plain");
-      const uriList = e.dataTransfer.getData("application/vnd.code.uri-list");
-      const rawPaths = (uriList || text || "").trim();
-      if (!rawPaths) return;
-
+  /** Insert `@path` mentions for a newline-separated path/uri list. */
+  const insertPathMentions = useCallback(
+    (rawPaths: string) => {
       const paths = rawPaths
         .split("\n")
         .map((p: string) => p.trim())
@@ -701,7 +706,114 @@ export default function ChatTextArea({
       const mentions = paths.map((p: string) => `@${p}`).join(" ");
       insertTextAtCursor(mentions + " ");
     },
-    [inputValue, selectedImages, workspacePath, insertTextAtCursor]
+    [workspacePath, insertTextAtCursor]
+  );
+
+  const handleDrop = useCallback(
+    (e: React.DragEvent) => {
+      e.preventDefault();
+      setIsDragOver(false);
+
+      // Drags that carry real paths (VS Code explorer / editor tabs, and any
+      // source that sets file:// uris) mention the original file directly.
+      const codeUriList = e.dataTransfer.getData(
+        "application/vnd.code.uri-list"
+      );
+      const fileUris = e.dataTransfer
+        .getData("text/uri-list")
+        .split("\n")
+        .map((l) => l.trim())
+        .filter((l) => l.startsWith("file://"))
+        .join("\n");
+      const pathList = (codeUriList || fileUris).trim();
+      if (pathList) {
+        insertPathMentions(pathList);
+        return;
+      }
+
+      // Drops from outside VS Code (Finder, browsers…) arrive as blobs only —
+      // the sandboxed webview never sees their real path. Collect the files,
+      // skipping folders, which FileReader can't ingest.
+      const items = Array.from(e.dataTransfer.items ?? []).filter(
+        (it) => it.kind === "file"
+      );
+      let droppedFiles: File[] = [];
+      let folderCount = 0;
+      if (items.length > 0) {
+        for (const it of items) {
+          if (it.webkitGetAsEntry?.()?.isDirectory) {
+            folderCount++;
+            continue;
+          }
+          const f = it.getAsFile();
+          if (f) droppedFiles.push(f);
+        }
+      } else {
+        droppedFiles = Array.from(e.dataTransfer.files);
+      }
+      if (folderCount > 0) {
+        showNotice(
+          "Folders can't be dropped from outside VS Code — drop files instead"
+        );
+      }
+
+      if (droppedFiles.length > 0) {
+        const images = droppedFiles.filter((f) =>
+          ACCEPTED_IMAGE_TYPES.includes(f.type)
+        );
+        if (images.length > 0) {
+          attachImageFiles(images);
+        }
+
+        // Everything else goes to the extension host, which writes a temp
+        // copy and answers with an `addFile` → `@mention` for each.
+        const others = droppedFiles.filter(
+          (f) => !ACCEPTED_IMAGE_TYPES.includes(f.type)
+        );
+        const sendable = others.filter((f) => f.size <= MAX_DROP_FILE_BYTES);
+        if (others.length > sendable.length) {
+          showNotice(
+            `Files over ${MAX_DROP_FILE_MB}MB can't be attached — ${others.length - sendable.length} skipped`
+          );
+        }
+        if (sendable.length > 0) {
+          void Promise.all(
+            sendable.map(
+              (f) =>
+                new Promise<{ name: string; dataBase64: string } | null>(
+                  (resolve) => {
+                    const reader = new FileReader();
+                    reader.onload = () => {
+                      const dataUrl = reader.result as string;
+                      resolve({
+                        name: f.name,
+                        dataBase64: dataUrl.slice(dataUrl.indexOf(",") + 1),
+                      });
+                    };
+                    reader.onerror = () => resolve(null);
+                    reader.readAsDataURL(f);
+                  }
+                )
+            )
+          ).then((results) => {
+            const files = results.filter(
+              (r): r is { name: string; dataBase64: string } => r !== null
+            );
+            if (files.length > 0) {
+              vscode.postMessage({ type: "saveDroppedFiles", files });
+            }
+          });
+        }
+        return;
+      }
+
+      // Last resort: dragged text (a path from a terminal, etc.).
+      const text = e.dataTransfer.getData("text/plain").trim();
+      if (text) {
+        insertPathMentions(text);
+      }
+    },
+    [insertPathMentions, attachImageFiles, showNotice]
   );
 
   const removeImage = useCallback((index: number) => {
@@ -714,7 +826,7 @@ export default function ChatTextArea({
     (inputValue.trim().length > 0 || selectedImages.length > 0);
 
   return (
-    <div className="mx-2 mb-2 rounded-xl border border-[var(--app-border)] bg-[var(--app-surface-2)]">
+    <div className="composer-shell mx-2 mb-2 rounded-xl border border-[var(--app-border)] bg-[var(--app-surface-2)] transition-colors">
       {/* Toolbar row */}
       {(isStreaming || pendingDiffCount > 0 || fileCount > 0) && (
         <div className="flex items-center justify-between px-3 py-1 border-b border-[rgba(255,255,255,0.04)] text-[11px]">
@@ -775,6 +887,12 @@ export default function ChatTextArea({
           position={{ top: 0, left: 0 }}
         />
 
+        {composerNotice && (
+          <div className="mb-1.5 text-[10px] text-[#f59e0b]" role="status">
+            {composerNotice}
+          </div>
+        )}
+
         {selectedImages.length > 0 && (
           <Thumbnails images={selectedImages} onRemove={removeImage} />
         )}
@@ -821,9 +939,10 @@ export default function ChatTextArea({
         </div>
       </div>
 
-      {/* Bottom bar */}
-      <div className="flex items-center justify-between px-3 py-1.5 border-t border-[rgba(255,255,255,0.04)]">
-        <div className="flex items-center gap-1.5">
+      {/* Bottom bar. Wraps at narrow panel widths so the send button and
+          account controls never clip off-screen in a docked sidebar. */}
+      <div className="composer-bar flex items-center justify-between flex-wrap gap-y-1 px-3 py-1.5 border-t border-[rgba(255,255,255,0.04)]">
+        <div className="flex items-center flex-wrap gap-1.5 min-w-0">
           <ModeSelector mode={mode} onChange={onModeChange} />
           <span className="text-[10px] text-vscode-descriptionFg opacity-30 select-none">|</span>
           <ModelSelector model={model} onChange={onModelChange} />
@@ -866,6 +985,7 @@ export default function ChatTextArea({
                   onClick={onRestartMcp}
                   className="flex items-center text-vscode-descriptionFg hover:text-vscode-fg transition-colors px-0.5"
                   title="Restart / reconnect MCP servers (e.g. after refreshing a token)"
+                  aria-label="Restart MCP servers"
                 >
                   <RotateCw size={11} />
                 </button>
@@ -874,7 +994,7 @@ export default function ChatTextArea({
           )}
         </div>
 
-        <div className="flex items-center gap-1.5">
+        <div className="flex items-center gap-1.5 min-w-0 ml-auto">
           <AccountSwitcher
             accounts={accounts}
             activeAccountId={activeAccountId}
@@ -890,12 +1010,14 @@ export default function ChatTextArea({
           <button
             className="p-1 rounded opacity-40 hover:opacity-70 transition-opacity text-vscode-fg"
             title="Attach file"
+            aria-label="Attach file"
           >
             <Paperclip size={14} />
           </button>
           <button
             className="p-1 rounded opacity-40 hover:opacity-70 transition-opacity text-vscode-fg"
             title="Paste or drag an image"
+            aria-label="Paste or drag an image"
           >
             <ImageIcon size={14} />
           </button>
@@ -905,6 +1027,7 @@ export default function ChatTextArea({
               onClick={onCancel}
               className="p-0.5 text-[#f87171] hover:text-[#ef4444] transition-colors"
               title="Stop generation"
+              aria-label="Stop generation"
             >
               <Square size={20} fill="currentColor" />
             </button>
@@ -918,6 +1041,7 @@ export default function ChatTextArea({
                   : "text-vscode-descriptionFg opacity-40"
               }`}
               title="Send (Enter)"
+              aria-label="Send message"
             >
               <ArrowUp size={14} strokeWidth={2.5} />
             </button>

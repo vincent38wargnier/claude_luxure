@@ -31,6 +31,15 @@ export interface ChatMessage {
    * account — the webview renders an inline "Reconnect <label>" button on it. */
   authErrorAccountId?: string;
   authErrorAccountLabel?: string;
+  /** Facts about the finished turn (set on finalize) — drives the quiet
+   * "Done · 4m12s · …" settle line that anchors the end of a turn. */
+  turnStats?: TurnStats;
+}
+
+/** Summary of a completed assistant turn. Counts are derived from the
+ * timeline at render time; only what the webview can't compute lives here. */
+export interface TurnStats {
+  durationMs?: number;
 }
 
 /** One segment of an assistant turn's timeline: either a run of prose, or a
@@ -139,6 +148,9 @@ export type ActivityEvent =
       toolInput: Record<string, unknown>;
       toolUseId?: string;
       result?: ToolResultData;
+      /** Set when this call was made by a subagent: the tool_use id of the
+       * Agent call that spawned it — used to nest it under that task card. */
+      parentToolUseId?: string;
     }
   | {
       type: "tool_result";
@@ -146,12 +158,43 @@ export type ActivityEvent =
       content: string;
       isError?: boolean;
       images?: string[];
+      parentToolUseId?: string;
     }
-  | { type: "thinking"; text: string }
-  | { type: "thinking_delta"; text: string }
+  | { type: "thinking"; text: string; parentToolUseId?: string }
+  | { type: "thinking_delta"; text: string; parentToolUseId?: string }
   /** A screenshot/image Claude explicitly presented to the user (via the
    * extension's luxure MCP tools) — rendered as a prominent image card. */
-  | { type: "proof"; images: string[]; caption?: string };
+  | { type: "proof"; images: string[]; caption?: string }
+  /** A subagent run spawned via the Agent tool — a live card updated in place
+   * from the CLI's system:task_started/task_progress/task_updated/
+   * task_notification events. The agent's own tool calls (tagged with
+   * parentToolUseId) nest under it as `children`. */
+  | {
+      type: "task";
+      /** tool_use id of the spawning Agent call — the join key for progress
+       * events, child activities and the final tool_result. */
+      toolUseId: string;
+      /** CLI-assigned task id (from system:task_started). */
+      taskId?: string;
+      subagentType?: string;
+      description?: string;
+      prompt?: string;
+      /** Launched with run_in_background: keeps running after the parent turn
+       * ends; a task-notification later resumes the model automatically. */
+      background?: boolean;
+      status: "running" | "completed" | "failed";
+      /** One-line live summary from the latest task_progress event. */
+      progressSummary?: string;
+      lastToolName?: string;
+      toolUses?: number;
+      totalTokens?: number;
+      durationMs?: number;
+      /** The agent's own activity, nested under the card (capped). */
+      children?: ActivityEvent[];
+      result?: ToolResultData;
+    };
+
+export type TaskActivity = Extract<ActivityEvent, { type: "task" }>;
 
 export const AVAILABLE_MODELS = [
   { id: "claude-fable-5", alias: "fable", label: "Fable 5" },
@@ -171,6 +214,14 @@ export interface SessionInfo {
   title?: string;
   /** Claude-generated 1-2 sentence summary, shown on hover. */
   summary?: string;
+}
+
+/** Visual identity mark for a conversation: a post-it color assigned when the
+ * tab is created plus an emoji picked by a Haiku one-shot from the content.
+ * Clicking the post-it re-evaluates the emoji against recent context. */
+export interface SessionMarker {
+  emoji?: string;
+  color: string;
 }
 
 export type SkillScope = "global" | "project";
@@ -202,6 +253,13 @@ export type WebviewMessage =
   | { type: "acceptAllChanges" }
   | { type: "rejectAllChanges" }
   | { type: "searchFiles"; query: string }
+  | {
+      // Files dragged in from outside VS Code: the webview only gets blob
+      // content (no filesystem path), so the host writes temp copies and
+      // answers with `addFile` mentions pointing at them.
+      type: "saveDroppedFiles";
+      files: { name: string; dataBase64: string }[];
+    }
   | { type: "openFile"; filePath: string }
   | { type: "openDiff"; filePath: string }
   | { type: "openExternal"; url: string }
@@ -220,6 +278,8 @@ export type WebviewMessage =
   | { type: "refreshUsage" }
   | { type: "summarizeSession"; sessionId: string }
   | { type: "summarizeAllSessions" }
+  /** Post-it clicked: re-pick the active conversation's emoji from recent context. */
+  | { type: "reevaluateMarker" }
   /** Reply to an "annotateImage" render request: the burned-in PNG (data URL)
    * or the reason rendering failed. */
   | { type: "annotateResult"; requestId: string; dataUrl?: string; error?: string };
@@ -251,13 +311,33 @@ export type ExtensionMessage =
       authErrorAccountLabel?: string;
     }
   | { type: "fileSearchResults"; files: string[] }
+  | { type: "addFile"; filePath: string }
   | { type: "diffUpdate"; filePath: string; diff: string; status: "pending" | "accepted" | "rejected" }
   | { type: "costUpdate"; cost: CostInfo }
   | { type: "contextUpdate"; context: ContextInfo }
   | { type: "activity"; activity: ActivityEvent }
+  /** In-place update of a task card (matched by task.toolUseId). When messageId
+   * is set the task lives in that finalized message's timeline — background
+   * agents keep reporting after their parent turn already ended. */
+  | { type: "taskUpdate"; task: TaskActivity; messageId?: string }
+  /** Live thinking-token counter for the streaming turn (system:thinking_tokens). */
+  | { type: "thinkingTokens"; tokens: number }
+  /** Transient status chip above the composer (API retry / rate limit); null clears. */
+  | {
+      type: "transientStatus";
+      status: { kind: "retry" | "rate-limit"; text: string } | null;
+    }
   | { type: "accountInfo"; account: AccountInfo }
   | { type: "sessionList"; sessions: SessionInfo[] }
-  | { type: "openTabs"; tabIds: string[]; names?: Record<string, string> }
+  | {
+      type: "openTabs";
+      tabIds: string[];
+      names?: Record<string, string>;
+      /** Post-it identity per tab (emoji shows in the tab strip). */
+      markers?: Record<string, SessionMarker>;
+    }
+  /** In-place update of one conversation's post-it (emoji picked / picking). */
+  | { type: "markerUpdate"; key: string; marker: SessionMarker; busy?: boolean }
   | { type: "cliStatus"; status: "starting" | "ready" | "busy" | "error" | "stopped" }
   | { type: "slashCommands"; commands: string[] }
   | { type: "skillsList"; skills: SkillInfo[] }
@@ -313,4 +393,11 @@ export interface ExtensionState {
   accounts?: StoredAccount[];
   activeAccountId?: string;
   usage?: UsageInfo | null;
+  /** Live buffers of the in-flight turn (ordered timeline + raw activities),
+   * so switching back to a running conversation restores the streamed feed
+   * instead of losing it until the turn finalizes. */
+  liveTimeline?: TimelinePart[];
+  liveActivities?: ActivityEvent[];
+  /** The active conversation's post-it (color + picked emoji). */
+  marker?: SessionMarker;
 }

@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { ChevronDown, ChevronRight, Sparkles, Check, X } from "lucide-react";
+import { ChevronDown, ChevronRight, FileDiff, Check, X } from "lucide-react";
 import vscode from "../../vscode";
 
 // Real diffs are condensed (context collapsed around changes), so a small edit
@@ -41,20 +41,30 @@ export default function FileChangeCard({
 
   return (
     <div className="my-1.5 rounded-md overflow-hidden border border-[var(--app-border)] bg-[var(--app-surface)]">
-      {/* Header */}
+      {/* Header. The div click is a pointer convenience; the chevron is the
+          real (keyboard-reachable) expand control, so no nested-button issue. */}
       <div
         className="flex items-center gap-2 px-2.5 py-1.5 cursor-pointer hover:bg-[rgba(255,255,255,0.03)] transition-colors"
         onClick={() => setExpanded(!expanded)}
       >
-        <button className="shrink-0 opacity-50 hover:opacity-80">
+        <button
+          type="button"
+          aria-expanded={expanded}
+          aria-label={`${expanded ? "Collapse" : "Expand"} diff of ${fileName}`}
+          onClick={(e) => {
+            e.stopPropagation();
+            setExpanded(!expanded);
+          }}
+          className="shrink-0 opacity-50 hover:opacity-80"
+        >
           {expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
         </button>
 
-        {/* AI-edit marker */}
-        <Sparkles size={12} className="shrink-0 text-[#a78bfa]" />
+        <FileDiff size={12} className="shrink-0 text-vscode-descriptionFg" />
 
         {/* File name */}
-        <span
+        <button
+          type="button"
           className="text-xs text-vscode-fg hover:text-vscode-linkFg cursor-pointer truncate"
           onClick={(e) => {
             e.stopPropagation();
@@ -63,7 +73,7 @@ export default function FileChangeCard({
           title="Open file & view changes"
         >
           {fileName}
-        </span>
+        </button>
 
         {/* Line count badges */}
         {lineCount !== undefined && lineCount > 0 && (

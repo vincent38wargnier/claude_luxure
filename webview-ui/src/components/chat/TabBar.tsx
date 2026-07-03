@@ -1,10 +1,12 @@
 import { useRef, useEffect, useState, useMemo } from "react";
-import type { SessionInfo } from "../../types";
+import type { SessionInfo, SessionMarker } from "../../types";
 
 interface TabBarProps {
   sessions: SessionInfo[];
   openTabIds: string[];
   tabNames?: Record<string, string>;
+  /** Post-it identity per tab: emoji when picked, else a tiny color swatch. */
+  tabMarkers?: Record<string, SessionMarker>;
   currentTabId?: string;
   runningSessionIds: string[];
   onSelect: (sessionId: string) => void;
@@ -63,6 +65,7 @@ export default function TabBar({
   sessions,
   openTabIds,
   tabNames,
+  tabMarkers,
   currentTabId,
   runningSessionIds,
   onSelect,
@@ -154,28 +157,45 @@ export default function TabBar({
           return (
             <div
               key={tab.id}
-              className={`group relative flex items-center gap-1 pl-3 pr-1 py-1.5 text-[11px] whitespace-nowrap border-r border-[rgba(255,255,255,0.04)] transition-colors shrink-0 cursor-pointer ${
+              className={`group relative flex items-center border-r border-[rgba(255,255,255,0.04)] transition-colors shrink-0 ${
                 isCurrent
                   ? "bg-[var(--app-surface-2)] text-vscode-fg"
                   : "text-vscode-descriptionFg hover:text-vscode-fg hover:bg-[rgba(255,255,255,0.04)]"
               }`}
-              onClick={() => onSelect(tab.id)}
             >
-              {running && !isCurrent && (
-                <span
-                  className="w-1.5 h-1.5 rounded-full bg-[#f59e0b] shrink-0 animate-pulse"
-                  title="Running in background"
-                />
-              )}
-              <span className={`truncate max-w-[130px] ${tab.isDraft ? "italic opacity-70" : ""}`}>
-                {tab.label}
-              </span>
               <button
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onClose(tab.id);
-                }}
-                className="ml-0.5 p-0.5 rounded opacity-0 group-hover:opacity-60 hover:!opacity-100 hover:bg-[rgba(255,255,255,0.1)] transition-all"
+                type="button"
+                onClick={() => onSelect(tab.id)}
+                aria-current={isCurrent ? "page" : undefined}
+                className="flex items-center gap-1 pl-3 pr-0.5 py-1.5 text-[11px] whitespace-nowrap min-w-0"
+              >
+                {running && !isCurrent && (
+                  <span
+                    className="w-1.5 h-1.5 rounded-full bg-[#f59e0b] shrink-0 animate-pulse"
+                    title="Running in background"
+                  />
+                )}
+                {tabMarkers?.[tab.id] &&
+                  (tabMarkers[tab.id].emoji ? (
+                    <span className="shrink-0 text-[12px] leading-none" aria-hidden="true">
+                      {tabMarkers[tab.id].emoji}
+                    </span>
+                  ) : (
+                    <span
+                      className="shrink-0 w-2 h-2 rounded-[1px]"
+                      style={{ backgroundColor: tabMarkers[tab.id].color }}
+                      aria-hidden="true"
+                    />
+                  ))}
+                <span className={`truncate max-w-[130px] ${tab.isDraft ? "italic opacity-70" : ""}`}>
+                  {tab.label}
+                </span>
+              </button>
+              <button
+                type="button"
+                onClick={() => onClose(tab.id)}
+                aria-label={`Close ${tab.label}`}
+                className="mr-1 p-0.5 rounded opacity-0 group-hover:opacity-60 group-focus-within:opacity-60 focus-visible:opacity-100 hover:!opacity-100 hover:bg-[rgba(255,255,255,0.1)] transition-all"
                 title="Close tab"
               >
                 <svg width="10" height="10" viewBox="0 0 12 12" stroke="currentColor" strokeWidth="1.5" fill="none" strokeLinecap="round">
@@ -190,6 +210,7 @@ export default function TabBar({
       <div className="flex items-center shrink-0 border-l border-[rgba(255,255,255,0.06)] px-1 gap-0.5">
         <button
           onClick={onNewChat}
+          aria-label="New conversation"
           className="p-1 rounded text-vscode-descriptionFg hover:text-vscode-fg hover:bg-[rgba(255,255,255,0.06)] transition-colors"
           title="New conversation"
         >
@@ -201,6 +222,7 @@ export default function TabBar({
         {onNewWorktree && (
           <button
             onClick={onNewWorktree}
+            aria-label="New conversation in an isolated git worktree"
             className="p-1 rounded text-[#eab308] hover:text-[#facc15] hover:bg-[rgba(234,179,8,0.15)] transition-colors"
             title="New conversation in an isolated git worktree + duplicated environment (remapped ports)"
           >
@@ -218,6 +240,7 @@ export default function TabBar({
           <button
             onClick={onSummarizeAll}
             disabled={!!summarizeProgress}
+            aria-label="Generate titles and summaries for all conversations"
             title="Generate titles & summaries for all conversations"
             className={`p-1 rounded transition-colors flex items-center gap-1 ${
               summarizeProgress
@@ -247,6 +270,8 @@ export default function TabBar({
               setShowHistory((prev) => !prev);
               setSearch("");
             }}
+            aria-label="Conversation history"
+            aria-expanded={showHistory}
             className={`p-1 rounded transition-colors ${
               showHistory
                 ? "text-vscode-fg bg-[rgba(255,255,255,0.06)]"
@@ -261,7 +286,7 @@ export default function TabBar({
           </button>
 
           {showHistory && (
-            <div className="absolute top-full right-0 mt-1 w-[280px] max-h-[400px] bg-[var(--vscode-dropdown-background,var(--vscode-input-background))] border border-[rgba(255,255,255,0.1)] rounded-lg shadow-2xl z-50 flex flex-col overflow-hidden">
+            <div className="absolute top-full right-0 mt-1 w-[min(280px,calc(100vw-16px))] max-h-[400px] bg-[var(--vscode-dropdown-background,var(--vscode-input-background))] border border-[rgba(255,255,255,0.1)] rounded-lg shadow-2xl z-50 flex flex-col overflow-hidden">
               <div className="px-2 py-1.5 border-b border-[rgba(255,255,255,0.06)]">
                 <input
                   ref={searchRef}
@@ -339,7 +364,7 @@ export default function TabBar({
                                     ? "Regenerate title & summary"
                                     : "Generate title & summary"
                                 }
-                                className="shrink-0 p-0.5 rounded text-vscode-descriptionFg opacity-0 group-hover:opacity-70 hover:!opacity-100 hover:bg-[rgba(255,255,255,0.1)] transition-all"
+                                className="shrink-0 p-0.5 rounded text-vscode-descriptionFg opacity-0 group-hover:opacity-70 group-focus-within:opacity-70 focus-visible:opacity-100 hover:!opacity-100 hover:bg-[rgba(255,255,255,0.1)] transition-all"
                               >
                                 {isSummarizing ? (
                                   <Spinner />

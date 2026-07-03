@@ -5,7 +5,12 @@ import * as os from "os";
 import * as https from "https";
 import * as crypto from "crypto";
 import { execFile } from "child_process";
-import { ClaudeBridge, ClaudeEvent } from "../cli/claude-bridge";
+import {
+  ClaudeBridge,
+  ClaudeEvent,
+  type ApiRetryEvent,
+  type TaskUpdateEvent,
+} from "../cli/claude-bridge";
 import { DiffManager } from "../diff/DiffManager";
 import { SnapshotManager } from "../diff/SnapshotManager";
 import { SessionManager } from "../sessions/SessionManager";
@@ -21,7 +26,9 @@ import {
   McpServerStatus,
   Mode,
   ProofAnnotation,
+  SessionMarker,
   StoredAccount,
+  TaskActivity,
   TimelinePart,
   UsageBucket,
   UsageInfo,
@@ -79,6 +86,50 @@ function attachToolResult(acts: ActivityEvent[], e: ActivityEvent): void {
   }
 }
 
+/** Merge a re-emitted task activity into the card already on screen (the CLI
+ * emits the Agent call twice: a placeholder at content_block_start, then the
+ * completed assistant event with full input). Newer non-empty fields win;
+ * status only moves away from "running". */
+function mergeTaskInto(into: TaskActivity, from: TaskActivity): void {
+  if (from.taskId) { into.taskId = from.taskId; }
+  if (from.description) { into.description = from.description; }
+  if (from.subagentType) { into.subagentType = from.subagentType; }
+  if (from.prompt && !into.prompt) { into.prompt = from.prompt; }
+  if (from.background) { into.background = true; }
+  if (from.progressSummary) { into.progressSummary = from.progressSummary; }
+  if (from.lastToolName) { into.lastToolName = from.lastToolName; }
+  if (from.toolUses !== undefined) { into.toolUses = from.toolUses; }
+  if (from.totalTokens !== undefined) { into.totalTokens = from.totalTokens; }
+  if (from.durationMs !== undefined) { into.durationMs = from.durationMs; }
+  if (from.result) { into.result = from.result; }
+  if (from.status !== "running") { into.status = from.status; }
+}
+
+/** Rehydrate persisted messages: clear streaming flags and settle task cards
+ * that were still "running" when the window closed — the CLI (and its agents)
+ * died with the extension host, so a still-running card would spin forever. */
+function restoreMessages(cached: ChatMessage[]): ChatMessage[] {
+  const settle = (acts?: ActivityEvent[]) => {
+    for (const a of acts || []) {
+      if (a.type === "task" && a.status === "running") {
+        a.status = a.result ? "completed" : "failed";
+        if (!a.result) {
+          a.progressSummary = "Interrupted — the panel was reloaded while this agent ran";
+        }
+      }
+    }
+  };
+  return cached.map((m) => {
+    settle(m.activities);
+    for (const p of m.timeline || []) {
+      if (p.type === "activities") {
+        settle(p.activities);
+      }
+    }
+    return { ...m, isStreaming: false };
+  });
+}
+
 interface ForkVersion {
   sessionId?: string;
   tail: ChatMessage[];
@@ -130,6 +181,11 @@ interface SessionRuntime {
   worktreeCwd?: string;
   worktreeEnv?: Record<string, string>;
   worktreeBranch?: string;
+  /** Post-it identity: color assigned at tab creation, emoji picked by a
+   * Haiku one-shot over the conversation (auto after the first turn, and on
+   * demand when the post-it is clicked). */
+  markerColor?: string;
+  markerEmoji?: string;
 }
 
 function createEmptyRuntime(): SessionRuntime {
@@ -167,6 +223,69 @@ const SUMMARY_PROMPT_MARKER =
  * in headless mode) and unstick the UI. Generous, so a long-but-live foreground
  * tool isn't cut short. */
 const STREAM_WATCHDOG_MS = 180000; // 3 minutes
+
+/** Cap on nested activities kept per task card, so a chatty subagent can't
+ * grow the persisted message state without bound (oldest entries drop off;
+ * the usage counters still reflect the full run). */
+const MAX_TASK_CHILDREN = 150;
+
+/** Curated post-it palette — classic sticky-note pastels, distinct from each
+ * other and readable behind an emoji glyph on both dark and light themes. */
+const POSTIT_COLORS = [
+  "#F5DE7A", // canary
+  "#F8B87C", // peach
+  "#F49FB6", // rose
+  "#C9B6F0", // lavender
+  "#8FCFF0", // sky
+  "#9FE0B0", // mint
+  "#D6E67E", // lime
+  "#F4A28C", // coral
+];
+
+/** Keyword fallback when the one-shot emoji pick fails (offline, usage limit):
+ * a coarse topic match beats a broken blank post-it. */
+const EMOJI_HEURISTICS: [RegExp, string][] = [
+  [/\b(bug|fix|error|crash|broken|fail)/i, "🐛"],
+  [/\b(ui|css|design|style|layout|component|theme)/i, "🎨"],
+  [/\b(deploy|release|ship|publish)/i, "🚀"],
+  [/\b(database|db|sql|postgres|mongo|schema|migration)/i, "🗄️"],
+  [/\b(auth|login|oauth|token|password|permission)/i, "🔐"],
+  [/\b(test|spec|e2e|coverage)/i, "🧪"],
+  [/\b(perf|performance|slow|optimi[sz]e|memory|cpu|cache)/i, "⚡"],
+  [/\b(docs?|readme|documentation|comment)/i, "📝"],
+  [/\b(refactor|cleanup|rename|restructure)/i, "🧹"],
+  [/\b(search|find|investigate|explore|research|analy[sz]e)/i, "🔍"],
+];
+
+function heuristicEmoji(excerpt: string): string {
+  for (const [re, emoji] of EMOJI_HEURISTICS) {
+    if (re.test(excerpt)) {
+      return emoji;
+    }
+  }
+  return "✨";
+}
+
+/** First emoji grapheme in the model's reply — grapheme segmentation keeps ZWJ
+ * sequences (👨‍💻), skin tones and flags intact, and skips any stray words. */
+function extractFirstEmoji(text: string): string | undefined {
+  const trimmed = text.trim();
+  if (!trimmed) return undefined;
+  try {
+    const seg = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+    for (const { segment } of seg.segment(trimmed)) {
+      if (/\p{Extended_Pictographic}/u.test(segment)) {
+        return segment;
+      }
+    }
+  } catch {
+    const m = trimmed.match(
+      /\p{Extended_Pictographic}(?:️|‍\p{Extended_Pictographic})*/u
+    );
+    return m?.[0];
+  }
+  return undefined;
+}
 
 /**
  * Render prior conversation turns as a context block for a rewound (edited)
@@ -299,7 +418,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private createDraftRuntime(): string {
     const draftKey = `draft-${generateId()}`;
     this.runtimes.set(draftKey, createEmptyRuntime());
-    this.runtimes.get(draftKey)!.draftId = draftKey;
+    const runtime = this.runtimes.get(draftKey)!;
+    runtime.draftId = draftKey;
+    // Every conversation gets its post-it color at birth, so a brand-new tab
+    // is visually distinguishable before any message is sent.
+    runtime.markerColor = this.pickMarkerColor();
     return draftKey;
   }
 
@@ -331,6 +454,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     runtime.sessionId = sessionId;
     delete runtime.draftId;
     this.runtimes.set(sessionId, runtime);
+    // The color chosen at draft time can be persisted now that a real id exists.
+    this.persistMarker(runtime);
 
     const tabIdx = this.openTabIds.indexOf(draftKey);
     if (tabIdx >= 0) {
@@ -386,7 +511,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       runtime.contextSummarized = this.loadContextSummarized(lastSessionId);
       const cached = this.context.workspaceState.get<ChatMessage[]>(`claude-luxure.messages.${lastSessionId}`);
       if (cached && cached.length > 0) {
-        runtime.messages = cached.map((m) => ({ ...m, isStreaming: false }));
+        runtime.messages = restoreMessages(cached);
         log("INFO", `Restored ${cached.length} messages for session ${lastSessionId}`);
       }
       this.runtimes.set(lastSessionId, runtime);
@@ -404,7 +529,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             `claude-luxure.messages.${this.activeKey}`
           );
           if (cached) {
-            runtime.messages = cached.map((m) => ({ ...m, isStreaming: false }));
+            runtime.messages = restoreMessages(cached);
           }
         }
         this.runtimes.set(this.activeKey, runtime);
@@ -432,6 +557,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       );
     }
     this.context.workspaceState.update("claude-luxure.openTabs", this.openTabIds);
+    this.persistMarker(runtime);
   }
 
   private loadContextSummarized(key: string): boolean {
@@ -632,10 +758,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       .join("\n");
   }
 
-  /** Spawn a headless `claude -p` (Haiku, JSON output) and parse {title,summary}.
-   * Runs under the active conversation's account so auth matches the UI, and in
-   * a throwaway cwd so the transient print-mode session is NOT written into the
-   * project's transcript folder (which would otherwise pollute the history). */
+  /** Ask Claude for a {title, summary} of a transcript (headless one-shot). */
   private runClaudeSummary(
     transcript: string
   ): Promise<{ title: string; summary: string }> {
@@ -646,7 +769,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       `<conversation>\n${transcript}\n</conversation>`;
 
     const runtime = this.activeKey ? this.runtimes.get(this.activeKey) : undefined;
-    const configDir = this.getConfigDirForAccount(runtime?.accountId);
+    return this.runClaudePrint(prompt, runtime?.accountId).then((text) =>
+      this.parseTitleSummary(text)
+    );
+  }
+
+  /** Spawn a headless `claude -p` (Haiku, JSON output) and return the model's
+   * reply text. Runs under the given account so auth matches the conversation,
+   * and in a throwaway cwd so the transient print-mode session is NOT written
+   * into the project's transcript folder (which would otherwise pollute the
+   * history); the transcript it does write is deleted afterwards. */
+  private runClaudePrint(prompt: string, accountId?: string): Promise<string> {
+    const configDir = this.getConfigDirForAccount(accountId);
     const env: NodeJS.ProcessEnv = { ...process.env };
     if (configDir) {
       env.CLAUDE_CONFIG_DIR = configDir;
@@ -679,17 +813,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           }
           try {
             // The CLI wraps the model reply in a result envelope; the model's
-            // text (our JSON) is in `.result`. It also writes a transcript for
-            // this throwaway session — delete it so it never lingers anywhere.
+            // text is in `.result`. It also writes a transcript for this
+            // throwaway session — delete it so it never lingers anywhere.
             const envelope = JSON.parse(stdout.trim());
             if (typeof envelope.session_id === "string") {
               this.deleteTransientSession(configDir, cwd, envelope.session_id);
             }
-            const text =
-              typeof envelope.result === "string" ? envelope.result : stdout;
-            resolve(this.parseTitleSummary(text));
+            resolve(
+              typeof envelope.result === "string" ? envelope.result : stdout
+            );
           } catch {
-            resolve(this.parseTitleSummary(stdout));
+            resolve(stdout);
           }
         }
       );
@@ -744,6 +878,148 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     };
   }
 
+  // ─────────────────────── Conversation post-it markers ───────────────────────
+  // Each conversation gets a post-it: a palette color assigned when the tab is
+  // created, and an emoji picked by a Haiku one-shot over the transcript — once
+  // automatically after the first completed turn (a first message alone is often
+  // not enough context), and again whenever the post-it is clicked.
+
+  /** Runtimes with an emoji pick in flight, to dedupe concurrent requests. */
+  private markerBusy = new Set<SessionRuntime>();
+
+  private markerKeyFor(runtime: SessionRuntime): string {
+    return runtime.sessionId || runtime.draftId || "";
+  }
+
+  /** Lazily give a runtime its marker: restore the persisted one for a real
+   * session, else assign a fresh color avoiding those already on open tabs. */
+  private ensureMarker(key: string, runtime: SessionRuntime): void {
+    if (runtime.markerColor) {
+      return;
+    }
+    if (key && !isDraftKey(key)) {
+      const persisted = this.context.workspaceState.get<SessionMarker>(
+        `claude-luxure.sessionMarker.${key}`
+      );
+      if (persisted?.color) {
+        runtime.markerColor = persisted.color;
+        if (!runtime.markerEmoji) {
+          runtime.markerEmoji = persisted.emoji;
+        }
+        return;
+      }
+    }
+    runtime.markerColor = this.pickMarkerColor();
+    this.persistMarker(runtime);
+  }
+
+  /** Random palette color, preferring one no open tab is already using. */
+  private pickMarkerColor(): string {
+    const used = new Set<string>();
+    for (const id of this.openTabIds) {
+      const c = this.runtimes.get(id)?.markerColor;
+      if (c) {
+        used.add(c);
+      }
+    }
+    const free = POSTIT_COLORS.filter((c) => !used.has(c));
+    const pool = free.length > 0 ? free : POSTIT_COLORS;
+    return pool[Math.floor(Math.random() * pool.length)];
+  }
+
+  private persistMarker(runtime: SessionRuntime): void {
+    if (!runtime.sessionId || !runtime.markerColor) {
+      return;
+    }
+    const marker: SessionMarker = {
+      emoji: runtime.markerEmoji,
+      color: runtime.markerColor,
+    };
+    this.context.workspaceState.update(
+      `claude-luxure.sessionMarker.${runtime.sessionId}`,
+      marker
+    );
+  }
+
+  private postMarkerUpdate(runtime: SessionRuntime, busy: boolean): void {
+    const key = this.markerKeyFor(runtime);
+    if (!key || !runtime.markerColor) {
+      return;
+    }
+    this.postMessage({
+      type: "markerUpdate",
+      key,
+      marker: { emoji: runtime.markerEmoji, color: runtime.markerColor },
+      busy,
+    });
+  }
+
+  /** Compact excerpt of the most recent turns — the emoji pick's input. */
+  private buildMarkerExcerpt(runtime: SessionRuntime): string | null {
+    const recent = runtime.messages
+      .filter(
+        (m) =>
+          (m.role === "user" || m.role === "assistant") && m.content.trim()
+      )
+      .slice(-8);
+    if (!recent.some((m) => m.role === "user")) {
+      return null;
+    }
+    return recent
+      .map(
+        (m) =>
+          `${m.role.toUpperCase()}: ${m.content
+            .replace(/\s+/g, " ")
+            .slice(0, 300)}`
+      )
+      .join("\n");
+  }
+
+  private markerPrompt(excerpt: string): string {
+    return (
+      `${SUMMARY_PROMPT_MARKER} Reply with exactly ONE emoji character that ` +
+      "best represents the conversation's dominant topic or activity — it " +
+      "will visually label this chat. Prefer specific over generic " +
+      "(🐛 debugging, 🎨 UI/design, 🚀 deploy, 🗄️ database, 🔐 auth, " +
+      "🧪 testing, ⚡ performance, 📦 dependencies, 📝 docs, 🔍 research). " +
+      "Never reply with 💻 🤖 💬. No words, no punctuation — just the single " +
+      "emoji.\n\n" +
+      `<conversation>\n${excerpt}\n</conversation>`
+    );
+  }
+
+  /** Pick (or re-pick) the emoji for a conversation from its recent content.
+   * Fire-and-forget: a failed one-shot falls back to a keyword heuristic so
+   * the post-it never stays blank once there is content to label. */
+  private async evaluateMarker(runtime: SessionRuntime): Promise<void> {
+    if (this.markerBusy.has(runtime)) {
+      return;
+    }
+    this.ensureMarker(this.markerKeyFor(runtime), runtime);
+    const excerpt = this.buildMarkerExcerpt(runtime);
+    if (!excerpt) {
+      return;
+    }
+    this.markerBusy.add(runtime);
+    this.postMarkerUpdate(runtime, true);
+    try {
+      const reply = await this.runClaudePrint(
+        this.markerPrompt(excerpt),
+        runtime.accountId
+      );
+      runtime.markerEmoji =
+        extractFirstEmoji(reply) || runtime.markerEmoji || heuristicEmoji(excerpt);
+    } catch (err) {
+      log("WARN", "Emoji pick failed, falling back to heuristic:", String(err));
+      runtime.markerEmoji = runtime.markerEmoji || heuristicEmoji(excerpt);
+    } finally {
+      this.markerBusy.delete(runtime);
+      this.persistMarker(runtime);
+      this.postMarkerUpdate(runtime, false);
+      this.sendOpenTabs(); // the tab strip shows the emoji too
+    }
+  }
+
   private async loadRuntimeMessages(key: string, runtime: SessionRuntime): Promise<void> {
     if (isDraftKey(key)) {
       runtime.messages = [];
@@ -754,7 +1030,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     runtime.contextSummarized = this.loadContextSummarized(key);
     const cached = this.context.workspaceState.get<ChatMessage[]>(`claude-luxure.messages.${key}`);
     if (cached && cached.length > 0) {
-      runtime.messages = cached.map((m) => ({ ...m, isStreaming: false }));
+      runtime.messages = restoreMessages(cached);
       return;
     }
 
@@ -838,10 +1114,30 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   private sendOpenTabs(): void {
     const names: Record<string, string> = {};
+    const markers: Record<string, SessionMarker> = {};
     for (const id of this.openTabIds) {
       names[id] = this.tabNameFor(id);
+      const rt = this.runtimes.get(id);
+      if (rt) {
+        this.ensureMarker(id, rt);
+        markers[id] = { emoji: rt.markerEmoji, color: rt.markerColor! };
+      } else {
+        // Tab not loaded into a runtime yet — its persisted marker still
+        // identifies it in the strip.
+        const persisted = this.context.workspaceState.get<SessionMarker>(
+          `claude-luxure.sessionMarker.${id}`
+        );
+        if (persisted?.color) {
+          markers[id] = persisted;
+        }
+      }
     }
-    this.postMessage({ type: "openTabs", tabIds: this.openTabIds, names });
+    this.postMessage({
+      type: "openTabs",
+      tabIds: this.openTabIds,
+      names,
+      markers,
+    });
   }
 
   /** A human-readable tab label: the session's name, else its first real user
@@ -1192,6 +1488,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         await this.handleSwitchFork(message.anchorId, message.index);
         break;
 
+      case "saveDroppedFiles":
+        this.handleSaveDroppedFiles(message.files);
+        break;
+
       case "cancelRequest": {
         const runtime = this.getActiveRuntime();
         this.stopRuntimeBridge(this.activeKey, runtime);
@@ -1347,6 +1647,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
       case "refreshUsage":
         void this.pollUsageForAll();
+        break;
+
+      case "reevaluateMarker":
+        void this.evaluateMarker(this.getActiveRuntime());
         break;
 
       case "summarizeSession":
@@ -2972,6 +3276,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       if (isStale()) {
         return;
       }
+      // A background task finishing re-invokes the model with no user message;
+      // open a fresh assistant bubble so that resumed output isn't dropped.
+      this.ensureStreamingTurn(runtimeKey, runtime, isActive());
       // The assistant emits its answer as several text blocks split by tool
       // calls. Re-paragraph them so they don't run together ("...wiring.Handler").
       if (
@@ -3007,6 +3314,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         return;
       }
       log("INFO", "assistantText received, length:", text.length);
+      this.ensureStreamingTurn(runtimeKey, runtime, isActive());
       if (runtime.streamingMessageId && !runtime.currentStreamText) {
         runtime.currentStreamText = text;
         this.pushTimelineText(runtime, text);
@@ -3067,6 +3375,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
       this.finalizeStreamingMessage(runtimeKey, runtime, isActive());
 
+      // First completed turn: pick the conversation's post-it emoji from the
+      // real content (one user message alone is usually not enough context).
+      if (
+        !runtime.markerEmoji &&
+        (event as ClaudeEvent & { is_error?: boolean }).is_error !== true
+      ) {
+        void this.evaluateMarker(runtime);
+      }
+
       // No assistant bubble to tag (the failure carried no text) — surface a
       // standalone system error that carries the Reconnect button instead.
       if (auth && !taggedBubble && isActive()) {
@@ -3105,21 +3422,147 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     });
 
     bridge.on("activity", (activity: ActivityEvent) => {
-      this.appendActivity(runtime, activity);
-      this.pushTimelineActivity(runtime, activity);
+      if (isStale()) {
+        return;
+      }
+
+      // A subagent's own tool calls/results (tagged with the id of the Agent
+      // call that spawned them) nest under that task card — never in the main
+      // feed, where they'd read as the main agent's work.
+      if ("parentToolUseId" in activity && activity.parentToolUseId) {
+        this.routeChildActivity(runtimeKey, runtime, activity, isActive());
+        return;
+      }
+
+      // The Agent call's final tool_result belongs to its task card, wherever
+      // that card lives (possibly several prose segments back).
+      if (activity.type === "tool_result") {
+        const owner = this.findTaskActivity(runtime, activity.toolUseId);
+        if (owner) {
+          const t = owner.task;
+          t.result = {
+            content:
+              (t.result?.content ? `${t.result.content}\n` : "") +
+              (activity.content || ""),
+            isError: t.result?.isError || activity.isError,
+            images:
+              activity.images && activity.images.length > 0
+                ? [...(t.result?.images || []), ...activity.images]
+                : t.result?.images,
+          };
+          t.status = activity.isError ? "failed" : "completed";
+          if (owner.messageId) {
+            this.persistRuntime(runtimeKey, runtime);
+          }
+          this.postTaskUpdate(t, owner.messageId, isActive());
+          return;
+        }
+      }
+
+      // An Agent launch becomes a live task card instead of a dead one-liner.
+      let a = activity;
+      if (
+        a.type === "tool_use" &&
+        (a.toolName === "Agent" || a.toolName === "Task")
+      ) {
+        const input = a.toolInput || {};
+        const existing = a.toolUseId
+          ? this.findTaskActivity(runtime, a.toolUseId)
+          : undefined;
+        if (existing) {
+          // Second emission of the same call (placeholder → full input): merge
+          // into the card already on screen instead of adding a duplicate.
+          mergeTaskInto(existing.task, {
+            type: "task",
+            toolUseId: existing.task.toolUseId,
+            status: "running",
+            description: input.description ? String(input.description) : undefined,
+            subagentType: input.subagent_type ? String(input.subagent_type) : undefined,
+            prompt: typeof input.prompt === "string" ? input.prompt : undefined,
+            background: input.run_in_background === true,
+          });
+          this.postTaskUpdate(existing.task, existing.messageId, isActive());
+          return;
+        }
+        a = {
+          type: "task",
+          toolUseId: a.toolUseId || generateId(),
+          description: input.description ? String(input.description) : undefined,
+          subagentType: input.subagent_type ? String(input.subagent_type) : undefined,
+          prompt: typeof input.prompt === "string" ? input.prompt : undefined,
+          background: input.run_in_background === true,
+          status: "running",
+        };
+      }
+
+      // A background task finishing re-invokes the model with no user message;
+      // give that resumed output a fresh assistant bubble.
+      this.ensureStreamingTurn(runtimeKey, runtime, isActive());
+
+      this.appendActivity(runtime, a);
+      this.pushTimelineActivity(runtime, a);
       // A tool call or thinking block means the assistant paused its prose; flag
       // a paragraph break so the next text delta doesn't fuse onto the last one.
       if (
         runtime.currentStreamText &&
-        (activity.type === "tool_use" ||
-          activity.type === "thinking" ||
-          activity.type === "thinking_delta")
+        (a.type === "tool_use" ||
+          a.type === "thinking" ||
+          a.type === "thinking_delta" ||
+          a.type === "task")
       ) {
         runtime.pendingParagraphBreak = true;
       }
       if (isActive()) {
-        this.postMessage({ type: "activity", activity });
+        this.postMessage({ type: "activity", activity: a });
       }
+    });
+
+    bridge.on("taskUpdate", (update: TaskUpdateEvent) => {
+      if (isStale()) {
+        return;
+      }
+      this.applyTaskUpdate(runtimeKey, runtime, update, isActive());
+    });
+
+    bridge.on("thinkingTokens", (info: { tokens: number }) => {
+      if (isStale() || !isActive()) {
+        return;
+      }
+      this.postMessage({ type: "thinkingTokens", tokens: info.tokens });
+    });
+
+    bridge.on("apiRetry", (retry: ApiRetryEvent) => {
+      if (isStale() || !isActive()) {
+        return;
+      }
+      const secs = Math.max(1, Math.round((retry.delayMs || 0) / 1000));
+      this.postMessage({
+        type: "transientStatus",
+        status: {
+          kind: "retry",
+          text: `API ${retry.error || "error"}${retry.status ? ` (${retry.status})` : ""} — retry ${retry.attempt}/${retry.maxRetries} in ${secs}s`,
+        },
+      });
+    });
+
+    bridge.on("rateLimit", (info: Record<string, unknown>) => {
+      if (isStale() || !isActive()) {
+        return;
+      }
+      const usingOverage = info.isUsingOverage === true || info.overageInUse === true;
+      if (String(info.status || "") !== "rejected" && !usingOverage) {
+        return; // within limits — nothing worth a chip
+      }
+      const bucket = String(info.rateLimitType || "").replace(/_/g, " ");
+      this.postMessage({
+        type: "transientStatus",
+        status: {
+          kind: "rate-limit",
+          text: usingOverage
+            ? `Usage limit reached (${bucket}) — continuing on overage`
+            : `Rate limited (${bucket})`,
+        },
+      });
     });
 
     bridge.on("controlRequest", (event: ClaudeEvent) => {
@@ -3263,6 +3706,228 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.coalesceInto(runtime.currentActivities, e);
   }
 
+  /** A turn can start with no user message: when a background task finishes,
+   * the CLI injects a task-notification and re-invokes the model on its own.
+   * Open a fresh assistant bubble for that resumed output — without one, the
+   * tokens have no message to land in and silently vanish. */
+  private ensureStreamingTurn(
+    runtimeKey: string,
+    runtime: SessionRuntime,
+    notifyWebview: boolean
+  ): void {
+    if (runtime.streamingMessageId) {
+      return;
+    }
+    runtime.streamingMessageId = generateId();
+    runtime.currentStreamText = "";
+    runtime.pendingParagraphBreak = false;
+    runtime.currentActivities = [];
+    runtime.currentTimeline = [];
+    const assistantMessage: ChatMessage = {
+      id: runtime.streamingMessageId,
+      role: "assistant",
+      content: "",
+      timestamp: Date.now(),
+      isStreaming: true,
+    };
+    runtime.messages.push(assistantMessage);
+    if (notifyWebview) {
+      this.postMessage({ type: "message", message: assistantMessage });
+      this.sendState();
+    }
+    this.armStreamWatchdog(runtimeKey, runtime);
+  }
+
+  /** Find a task card by the spawning Agent call's tool_use id (or the CLI
+   * task id) — live turn first, then finalized messages newest-first, since a
+   * background agent keeps reporting after its parent turn already ended. */
+  private findTaskActivity(
+    runtime: SessionRuntime,
+    toolUseId?: string,
+    taskId?: string
+  ): { task: TaskActivity; messageId?: string } | undefined {
+    const match = (acts?: ActivityEvent[]): TaskActivity | undefined =>
+      (acts || []).find(
+        (a): a is TaskActivity =>
+          a.type === "task" &&
+          ((!!toolUseId && a.toolUseId === toolUseId) ||
+            (!!taskId && !!a.taskId && a.taskId === taskId))
+      );
+    for (const part of runtime.currentTimeline) {
+      if (part.type === "activities") {
+        const t = match(part.activities);
+        if (t) {
+          return { task: t };
+        }
+      }
+    }
+    const inCurrent = match(runtime.currentActivities);
+    if (inCurrent) {
+      return { task: inCurrent };
+    }
+    for (let i = runtime.messages.length - 1; i >= 0; i--) {
+      const msg = runtime.messages[i];
+      for (const part of msg.timeline || []) {
+        if (part.type === "activities") {
+          const t = match(part.activities);
+          if (t) {
+            return { task: t, messageId: msg.id };
+          }
+        }
+      }
+      const t = match(msg.activities);
+      if (t) {
+        return { task: t, messageId: msg.id };
+      }
+    }
+    return undefined;
+  }
+
+  /** Send a snapshot of a task card to the webview for an in-place patch.
+   * Shallow-copied so later mutations here don't alias the posted object. */
+  private postTaskUpdate(
+    task: TaskActivity,
+    messageId: string | undefined,
+    active: boolean
+  ): void {
+    if (!active) {
+      return;
+    }
+    this.postMessage({
+      type: "taskUpdate",
+      task: { ...task, children: task.children ? [...task.children] : undefined },
+      messageId,
+    });
+  }
+
+  /** Fold a system:task_* event into its card. task_progress carries the live
+   * one-liner ("Reading a.txt") + usage counters; task_notification marks
+   * completion — for background agents that lands after the turn finalized,
+   * so the card may live in an already-persisted message. */
+  private applyTaskUpdate(
+    runtimeKey: string,
+    runtime: SessionRuntime,
+    u: TaskUpdateEvent,
+    active: boolean
+  ): void {
+    let found = this.findTaskActivity(runtime, u.toolUseId, u.taskId);
+    if (!found) {
+      // No card yet (e.g. panel reloaded mid-run, or a background shell task
+      // that never had an Agent tool_use) — give it one so it's trackable.
+      const task: TaskActivity = {
+        type: "task",
+        toolUseId: u.toolUseId || u.taskId || generateId(),
+        status: "running",
+      };
+      if (runtime.streamingMessageId) {
+        this.appendActivity(runtime, task);
+        this.pushTimelineActivity(runtime, task);
+        found = { task };
+      } else {
+        const lastAssistant = [...runtime.messages]
+          .reverse()
+          .find((m) => m.role === "assistant");
+        if (!lastAssistant) {
+          return;
+        }
+        if (!lastAssistant.timeline) {
+          lastAssistant.timeline = [];
+        }
+        let lastPart = lastAssistant.timeline[lastAssistant.timeline.length - 1];
+        if (!lastPart || lastPart.type !== "activities") {
+          lastPart = { type: "activities", activities: [] };
+          lastAssistant.timeline.push(lastPart);
+        }
+        lastPart.activities.push(task);
+        found = { task, messageId: lastAssistant.id };
+      }
+    }
+
+    const t = found.task;
+    if (u.taskId) {
+      t.taskId = u.taskId;
+    }
+    if (u.subagentType) {
+      t.subagentType = u.subagentType;
+    }
+    if (u.prompt && !t.prompt) {
+      t.prompt = u.prompt;
+    }
+    switch (u.kind) {
+      case "task_started":
+        if (u.description) {
+          t.description = u.description;
+        }
+        t.status = "running";
+        break;
+      case "task_progress":
+        // Here `description` is the live one-liner, not the task's name.
+        if (u.description) {
+          t.progressSummary = u.description;
+        }
+        if (u.lastToolName) {
+          t.lastToolName = u.lastToolName;
+        }
+        break;
+      case "task_updated":
+        if (u.status === "completed" || u.status === "failed") {
+          t.status = u.status;
+        }
+        break;
+      case "task_notification":
+        t.status = u.status === "failed" ? "failed" : "completed";
+        if (u.summary) {
+          t.progressSummary = u.summary;
+        }
+        break;
+    }
+    if (u.usage) {
+      if (typeof u.usage.tool_uses === "number") {
+        t.toolUses = u.usage.tool_uses;
+      }
+      if (typeof u.usage.total_tokens === "number") {
+        t.totalTokens = u.usage.total_tokens;
+      }
+      if (typeof u.usage.duration_ms === "number") {
+        t.durationMs = u.usage.duration_ms;
+      }
+    }
+
+    // Status transitions on an already-finalized message must survive a reload;
+    // per-tool progress ticks need not (finalize persists the latest anyway).
+    if (
+      found.messageId &&
+      (u.kind === "task_notification" || u.kind === "task_updated")
+    ) {
+      this.persistRuntime(runtimeKey, runtime);
+    }
+    this.postTaskUpdate(t, found.messageId, active);
+  }
+
+  /** Nest a subagent's own activity (tagged with parentToolUseId) under its
+   * task card instead of the main feed. */
+  private routeChildActivity(
+    runtimeKey: string,
+    runtime: SessionRuntime,
+    activity: ActivityEvent,
+    active: boolean
+  ): void {
+    const parentId = (activity as { parentToolUseId?: string }).parentToolUseId;
+    const found = this.findTaskActivity(runtime, parentId);
+    if (!found) {
+      return; // unknown parent — drop rather than misattribute to the main agent
+    }
+    const t = found.task;
+    if (!t.children) {
+      t.children = [];
+    }
+    this.coalesceInto(t.children, activity);
+    if (t.children.length > MAX_TASK_CHILDREN) {
+      t.children.splice(0, t.children.length - MAX_TASK_CHILDREN);
+    }
+    this.postTaskUpdate(t, found.messageId, active);
+  }
+
   /** Push (and coalesce) an activity onto the timeline's trailing activity run,
    * starting a new run if the previous segment was prose. */
   private pushTimelineActivity(runtime: SessionRuntime, e: ActivityEvent): void {
@@ -3294,6 +3959,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (e.type === "proof") {
       // Presented screenshots are standalone cards; never merged or deduped.
       acts.push(e);
+      return;
+    }
+    if (e.type === "task") {
+      // One card per Agent call: re-emissions merge into the existing card.
+      const existing = acts.find(
+        (a): a is TaskActivity => a.type === "task" && a.toolUseId === e.toolUseId
+      );
+      if (existing) {
+        mergeTaskInto(existing, e);
+      } else {
+        acts.push(e);
+      }
       return;
     }
     if (e.type === "tool_result") {
@@ -3413,6 +4090,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       if (runtime.currentTimeline.length > 0) {
         msg.timeline = runtime.currentTimeline;
       }
+      msg.turnStats = {
+        durationMs: Math.max(0, Date.now() - msg.timestamp),
+      };
     }
     runtime.currentActivities = [];
     runtime.currentTimeline = [];
@@ -3499,10 +4179,58 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   addFileToChat(relativePath: string): void {
-    this.webview?.postMessage({
-      type: "addFile",
-      filePath: relativePath,
-    } as any);
+    this.postMessage({ type: "addFile", filePath: relativePath });
+  }
+
+  /**
+   * Files dragged in from outside VS Code arrive in the webview as content-only
+   * blobs — the sandboxed iframe never sees their real filesystem path. Write
+   * each one to a temp folder and answer with an `addFile` mention so the
+   * composer references the copy (which the CLI can then read).
+   */
+  private handleSaveDroppedFiles(
+    files: { name: string; dataBase64: string }[]
+  ): void {
+    if (!files || files.length === 0) {
+      return;
+    }
+    const dropDir = path.join(
+      os.tmpdir(),
+      "claude-luxure-drops",
+      crypto.randomBytes(4).toString("hex")
+    );
+    try {
+      fs.mkdirSync(dropDir, { recursive: true });
+    } catch (err) {
+      log("ERROR", "saveDroppedFiles mkdir failed:", String(err));
+      vscode.window.showErrorMessage(
+        "Could not create a temp folder for the dropped files."
+      );
+      return;
+    }
+    const used = new Set<string>();
+    for (const file of files) {
+      // Keep the original name readable but @mention-safe: the composer's
+      // mention regex stops at spaces and most punctuation.
+      const base =
+        path.basename(file.name || "file").replace(/[^\w.-]+/g, "-") || "file";
+      let name = base;
+      for (let i = 2; used.has(name); i++) {
+        const ext = path.extname(base);
+        name = `${path.basename(base, ext)}-${i}${ext}`;
+      }
+      used.add(name);
+      const dest = path.join(dropDir, name);
+      try {
+        fs.writeFileSync(dest, Buffer.from(file.dataBase64, "base64"));
+        this.postMessage({ type: "addFile", filePath: dest });
+      } catch (err) {
+        log("ERROR", "saveDroppedFiles write failed:", file.name, String(err));
+        vscode.window.showErrorMessage(
+          `Could not save dropped file: ${file.name}`
+        );
+      }
+    }
   }
 
   private postMessage(message: ExtensionMessage): void {
@@ -3546,9 +4274,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   private sendState(): void {
     const runtime = this.getActiveRuntime();
+    this.ensureMarker(this.activeKey!, runtime);
     this.postMessage({
       type: "state",
       state: {
+        marker: runtime.markerColor
+          ? { emoji: runtime.markerEmoji, color: runtime.markerColor }
+          : undefined,
         mode: this.mode,
         model: this.model,
         effort: this.effort,
@@ -3567,6 +4299,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         accountOrg: this.accountOrg,
         slashCommands: this.slashCommands,
         contextSummarized: runtime.contextSummarized ?? false,
+        // Live turn buffers — lets the webview restore the in-progress feed
+        // when the user switches back to a running conversation.
+        liveTimeline: runtime.currentTimeline,
+        liveActivities: runtime.currentActivities,
       },
     });
   }

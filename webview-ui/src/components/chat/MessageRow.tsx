@@ -1,11 +1,10 @@
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { RefreshCw } from "lucide-react";
+import { Check, RefreshCw } from "lucide-react";
 import type { ReactNode, MouseEvent as ReactMouseEvent } from "react";
 import vscode from "../../vscode";
 import type { ChatMessage, Mode, ActivityEvent, TimelinePart } from "../../types";
-import Thumbnails from "../common/Thumbnails";
-import FileChangeCard from "../common/FileChangeCard";
+import ImageGrid from "../common/ImageGrid";
 import EditableUserMessage from "./EditableUserMessage";
 import ActivityFeed from "./ActivityFeed";
 
@@ -16,6 +15,8 @@ interface MessageRowProps {
   liveTimeline?: TimelinePart[];
   isEditing?: boolean;
   canEdit?: boolean;
+  /** A turn is currently streaming — submitting an edit will stop it first. */
+  editWillStopRun?: boolean;
   mode?: Mode;
   model?: string;
   onStartEdit?: () => void;
@@ -24,79 +25,6 @@ interface MessageRowProps {
   onModeChange?: (mode: Mode) => void;
   onModelChange?: (model: string) => void;
   onSwitchFork?: (anchorId: string, index: number) => void;
-}
-
-interface ParsedBlock {
-  type: "text" | "file";
-  content: string;
-  filePath?: string;
-  lineCount?: number;
-}
-
-function parseAssistantContent(content: string): ParsedBlock[] {
-  const blocks: ParsedBlock[] = [];
-  const fileBlockRegex =
-    /```[\w]*\n[\s\S]*?```|(?:(?:Created|Modified|Wrote|Updated|Edited|Reading|Read)\s+(?:file\s+)?[`"]?([^\s`"]+\.\w+)[`"]?)/gi;
-
-  let lastIndex = 0;
-  const codeBlockRegex = /```(\w+)?\n([\s\S]*?)```/g;
-  let match;
-
-  while ((match = codeBlockRegex.exec(content)) !== null) {
-    if (match.index > lastIndex) {
-      const textBefore = content.slice(lastIndex, match.index).trim();
-      if (textBefore) {
-        blocks.push({ type: "text", content: textBefore });
-      }
-    }
-
-    const lang = match[1] || "";
-    const code = match[2] || "";
-
-    const linesBefore = content.slice(
-      Math.max(0, match.index - 200),
-      match.index
-    );
-    const fileHint = linesBefore.match(
-      /[`"]?([^\s`"]+\.\w{1,6})[`"]?\s*(?:\n|$)/
-    );
-
-    if (fileHint) {
-      blocks.push({
-        type: "file",
-        filePath: fileHint[1],
-        content: code,
-        lineCount: code.split("\n").length,
-      });
-    } else if (lang && !["bash", "sh", "shell", "diff"].includes(lang)) {
-      blocks.push({
-        type: "file",
-        filePath: `snippet.${lang}`,
-        content: code,
-        lineCount: code.split("\n").length,
-      });
-    } else {
-      blocks.push({
-        type: "text",
-        content: match[0],
-      });
-    }
-
-    lastIndex = match.index + match[0].length;
-  }
-
-  if (lastIndex < content.length) {
-    const remaining = content.slice(lastIndex).trim();
-    if (remaining) {
-      blocks.push({ type: "text", content: remaining });
-    }
-  }
-
-  if (blocks.length === 0 && content.trim()) {
-    blocks.push({ type: "text", content });
-  }
-
-  return blocks;
 }
 
 function cleanUserContent(content: string): string {
@@ -113,6 +41,7 @@ export default function MessageRow({
   liveTimeline,
   isEditing,
   canEdit,
+  editWillStopRun,
   mode,
   model,
   onStartEdit,
@@ -168,6 +97,7 @@ export default function MessageRow({
       return (
         <EditableUserMessage
           initialText={cleanContent}
+          willStopRun={editWillStopRun}
           mode={mode || "agent"}
           model={model}
           onModeChange={onModeChange}
@@ -218,7 +148,9 @@ export default function MessageRow({
           </div>
         )}
         {message.images && message.images.length > 0 && (
-          <Thumbnails images={message.images} />
+          <div className="mb-2">
+            <ImageGrid images={message.images} altPrefix="Attachment" />
+          </div>
         )}
         <button
           type="button"
@@ -229,7 +161,13 @@ export default function MessageRow({
               ? "cursor-pointer hover:ring-1 hover:ring-[rgba(255,255,255,0.1)]"
               : "cursor-default"
           }`}
-          title={canEdit ? "Click to edit and resend from here" : undefined}
+          title={
+            canEdit
+              ? editWillStopRun
+                ? "Click to edit — resending stops the current run and restarts from here"
+                : "Click to edit and resend from here"
+              : undefined
+          }
         >
           <div className="text-sm text-vscode-fg whitespace-pre-wrap">
             {cleanContent}
@@ -257,6 +195,7 @@ export default function MessageRow({
           {isStreaming && <StreamingCursor />}
         </>
       )}
+      {!message.isStreaming && <TurnSettle message={message} />}
       {reconnectButton && <div className="px-1">{reconnectButton}</div>}
     </div>
   );
@@ -330,32 +269,81 @@ const markdownComponents: Components = {
   },
 };
 
-/** Render an assistant prose string: fenced code that looks like a file edit
- * becomes a card, everything else renders as markdown. */
+/** Render an assistant prose string as markdown. Fenced code stays a code
+ * block — real file-edit cards come only from actual Edit/Write tool activity
+ * in the timeline, so a card never claims an edit that didn't happen. */
 function TextContent({ content }: { content: string }) {
   if (!content.trim()) return null;
   return (
-    <>
-      {parseAssistantContent(content).map((block, i) =>
-        block.type === "file" && block.filePath ? (
-          <FileChangeCard
-            key={i}
-            filePath={block.filePath}
-            lineCount={block.lineCount}
-            codePreview={block.content}
-          />
-        ) : (
-          <div key={i} className={MARKDOWN_CLASS}>
-            <ReactMarkdown
-              remarkPlugins={[remarkGfm]}
-              components={markdownComponents}
-            >
-              {block.content}
-            </ReactMarkdown>
-          </div>
-        )
-      )}
-    </>
+    <div className={MARKDOWN_CLASS}>
+      <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
+        {content}
+      </ReactMarkdown>
+    </div>
+  );
+}
+
+const SETTLE_FILE_TOOLS = new Set([
+  "Write",
+  "write_to_file",
+  "WriteToFile",
+  "Edit",
+  "edit_file",
+  "EditFile",
+  "MultiEdit",
+  "apply_diff",
+]);
+
+/** The quiet anchor at the end of a finished turn: "Done · 4m12s · 23 tools ·
+ * 3 files · 2 agents". Turns end by things disappearing otherwise; this line
+ * is the settle. Skipped for quick text-only replies. */
+function TurnSettle({ message }: { message: ChatMessage }) {
+  const stats = message.turnStats;
+  if (!stats) return null;
+
+  let tools = 0;
+  let agents = 0;
+  const files = new Set<string>();
+  const scan = (acts?: ActivityEvent[]) => {
+    for (const a of acts || []) {
+      if (a.type === "task") {
+        agents++;
+        tools++;
+      } else if (a.type === "tool_use") {
+        tools++;
+        if (SETTLE_FILE_TOOLS.has(a.toolName)) {
+          const p = a.toolInput?.file_path || a.toolInput?.path;
+          if (p) files.add(String(p));
+        }
+      }
+    }
+  };
+  if (message.timeline && message.timeline.length > 0) {
+    for (const p of message.timeline) {
+      if (p.type === "activities") scan(p.activities);
+    }
+  } else {
+    scan(message.activities);
+  }
+
+  const durS = stats.durationMs ? Math.round(stats.durationMs / 1000) : 0;
+  // A quick prose-only answer doesn't need a settle line.
+  if (tools === 0 && durS < 10) return null;
+
+  const bits: string[] = [
+    durS >= 60
+      ? `${Math.floor(durS / 60)}m${String(durS % 60).padStart(2, "0")}s`
+      : `${durS}s`,
+  ];
+  if (tools > 0) bits.push(`${tools} tool${tools === 1 ? "" : "s"}`);
+  if (files.size > 0) bits.push(`${files.size} file${files.size === 1 ? "" : "s"}`);
+  if (agents > 0) bits.push(`${agents} agent${agents === 1 ? "" : "s"}`);
+
+  return (
+    <div className="flex items-center gap-1.5 px-1 pt-1 text-[11px] text-vscode-descriptionFg select-none">
+      <Check size={12} className="text-[#4ade80] shrink-0" aria-hidden="true" />
+      <span>Done · {bits.join(" · ")}</span>
+    </div>
   );
 }
 

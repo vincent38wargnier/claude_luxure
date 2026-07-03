@@ -2,7 +2,8 @@ import { useState } from "react";
 import { Waypoints, ChevronsUpDown } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import ZoomableImage from "./ZoomableImage";
+import ImageGrid from "./ImageGrid";
+import WorkingDots from "./WorkingDots";
 
 export interface McpCall {
   server: string;
@@ -32,17 +33,29 @@ export default function McpCallCard({
   const isError = !!result?.isError;
   const verb = running ? "Running" : "Ran";
 
+  // Amber marks *working* only — a finished call settles to the neutral card
+  // border so the status color never lies about what's still running.
+  const borderClass = isError
+    ? "border-[rgba(248,81,73,0.5)]"
+    : running
+      ? "border-[rgba(245,158,11,0.5)]"
+      : "border-[var(--app-border)]";
+  const iconClass = isError
+    ? "text-[#f85149]"
+    : running
+      ? "text-[#f59e0b]"
+      : "text-vscode-descriptionFg";
+
   return (
-    <div className="my-1 rounded-md border border-[rgba(245,158,11,0.5)] bg-[var(--app-surface)] overflow-hidden">
+    <div className={`my-1 rounded-md border ${borderClass} bg-[var(--app-surface)] overflow-hidden`}>
       {/* Collapsed row — Cursor style */}
-      <div
-        className="flex items-center gap-2 px-3 py-2 cursor-pointer hover:bg-[rgba(255,255,255,0.03)] transition-colors text-[13px] select-none"
+      <button
+        type="button"
+        aria-expanded={expanded}
+        className="w-full flex items-center gap-2 px-3 py-2 cursor-pointer hover:bg-[rgba(255,255,255,0.03)] transition-colors text-[13px] text-left select-none"
         onClick={() => setExpanded(!expanded)}
       >
-        <Waypoints
-          size={14}
-          className={`shrink-0 ${isError ? "text-[#f85149]" : "text-[#f59e0b]"}`}
-        />
+        <Waypoints size={14} className={`shrink-0 ${iconClass}`} />
 
         <span className="truncate min-w-0 text-vscode-descriptionFg">
           {verb} <span className="text-vscode-fg/90">{humanizeTool(tool)}</span> in{" "}
@@ -51,29 +64,16 @@ export default function McpCallCard({
 
         <div className="flex-1" />
 
-        {running && (
-          <span className="flex gap-0.5 shrink-0 mr-0.5">
-            <span className="w-1 h-1 rounded-full bg-[#f59e0b] animate-bounce" style={{ animationDelay: "0ms" }} />
-            <span className="w-1 h-1 rounded-full bg-[#f59e0b] animate-bounce" style={{ animationDelay: "150ms" }} />
-            <span className="w-1 h-1 rounded-full bg-[#f59e0b] animate-bounce" style={{ animationDelay: "300ms" }} />
-          </span>
-        )}
+        {running && <WorkingDots />}
 
         <ChevronsUpDown size={14} className="shrink-0 text-vscode-descriptionFg opacity-50" />
-      </div>
+      </button>
 
       {/* Result images (e.g. a browser screenshot) are the payload the user
           cares about — always visible, no expand needed. */}
       {result?.images && result.images.length > 0 && (
-        <div className="px-3 pb-2 flex flex-col gap-1.5">
-          {result.images.map((src, i) => (
-            <ZoomableImage
-              key={i}
-              src={src}
-              alt={`${tool} result ${i + 1}`}
-              className="max-h-64 w-auto max-w-full self-start rounded border border-vscode-border cursor-zoom-in"
-            />
-          ))}
+        <div className="px-3 pb-2">
+          <ImageGrid images={result.images} altPrefix={`${tool} result`} />
         </div>
       )}
 

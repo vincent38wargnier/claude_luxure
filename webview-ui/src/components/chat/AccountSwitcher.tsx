@@ -111,7 +111,7 @@ export default function AccountSwitcher({
         className={
           activeDisconnected
             ? "flex items-center gap-1 text-[10px] text-[#f87171] opacity-100 transition-opacity max-w-[150px]"
-            : "flex items-center gap-0.5 text-[10px] text-vscode-descriptionFg opacity-60 hover:opacity-100 transition-opacity max-w-[150px]"
+            : "flex items-center gap-0.5 text-[10px] text-vscode-descriptionFg opacity-80 hover:opacity-100 transition-opacity max-w-[150px]"
         }
         title={
           activeDisconnected

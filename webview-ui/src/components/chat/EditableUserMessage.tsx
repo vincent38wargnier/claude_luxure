@@ -7,6 +7,8 @@ import ModelSelector from "./ModelSelector";
 
 interface EditableUserMessageProps {
   initialText: string;
+  /** A run is in flight — submitting stops it before resending from here. */
+  willStopRun?: boolean;
   mode: Mode;
   model?: string;
   onModeChange: (mode: Mode) => void;
@@ -17,6 +19,7 @@ interface EditableUserMessageProps {
 
 export default function EditableUserMessage({
   initialText,
+  willStopRun,
   mode,
   model,
   onModeChange,
@@ -81,14 +84,20 @@ export default function EditableUserMessage({
             onClick={handleSubmit}
             disabled={!text.trim()}
             className="text-vscode-descriptionFg hover:text-vscode-fg disabled:opacity-30 transition-colors"
-            title="Resend from here (Enter)"
+            title={
+              willStopRun
+                ? "Stop the current run and resend from here (Enter)"
+                : "Resend from here (Enter)"
+            }
           >
             <ArrowUpCircle size={20} />
           </button>
         </div>
       </div>
       <p className="mt-1 px-1 text-[10px] text-vscode-descriptionFg opacity-50">
-        Enter to resend · Shift+Enter for newline · Esc to cancel
+        {willStopRun
+          ? "Enter stops the current run and resends from here · Esc to cancel"
+          : "Enter to resend · Shift+Enter for newline · Esc to cancel"}
       </p>
     </div>
   );

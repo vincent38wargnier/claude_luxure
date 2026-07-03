@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Claude Luxure — UI Harness</title>
+    <style>
+      /* Dev-only page (never built into dist): renders ChatView with mock data
+         in a plain browser for screenshots and design review. These are the
+         VS Code Dark Modern token values the webview normally inherits. */
+      :root {
+        --vscode-editor-background: #1f1f1f;
+        --vscode-editor-foreground: #cccccc;
+        --vscode-font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        --vscode-font-size: 13px;
+        --vscode-editor-font-family: "SF Mono", Monaco, Menlo, monospace;
+        --vscode-panel-border: #3c3c3c;
+        --vscode-descriptionForeground: #9d9d9d;
+        --vscode-textLink-foreground: #4daafc;
+        --vscode-errorForeground: #f48771;
+        --vscode-input-background: #313131;
+        --vscode-input-foreground: #cccccc;
+        --vscode-input-border: #3c3c3c;
+        --vscode-button-background: #0078d4;
+        --vscode-button-foreground: #ffffff;
+        --vscode-button-hoverBackground: #026ec1;
+        --vscode-badge-background: #616161;
+        --vscode-badge-foreground: #f8f8f8;
+        --vscode-sideBar-background: #181818;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/harness.tsx"></script>
+  </body>
+</html>
