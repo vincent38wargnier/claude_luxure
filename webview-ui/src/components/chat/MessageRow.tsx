@@ -20,7 +20,7 @@ interface MessageRowProps {
   mode?: Mode;
   model?: string;
   onStartEdit?: () => void;
-  onSubmitEdit?: (text: string) => void;
+  onSubmitEdit?: (text: string, images?: string[]) => void;
   onCancelEdit?: () => void;
   onModeChange?: (mode: Mode) => void;
   onModelChange?: (model: string) => void;
@@ -97,6 +97,7 @@ export default function MessageRow({
       return (
         <EditableUserMessage
           initialText={cleanContent}
+          initialImages={message.images}
           willStopRun={editWillStopRun}
           mode={mode || "agent"}
           model={model}

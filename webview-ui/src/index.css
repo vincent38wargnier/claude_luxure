@@ -186,6 +186,28 @@ textarea:focus-visible {
 .postit:disabled {
   cursor: default;
 }
+/* A sticky carrying a user note grows into a small rectangle; the note text
+   is dark ink on the pastel, clamped to three short lines. */
+.postit.postit-noted {
+  width: auto;
+  height: auto;
+  min-width: 40px;
+  min-height: 40px;
+  max-width: 148px;
+  padding: 5px 8px;
+}
+.postit-note-text {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  overflow: hidden;
+  font-size: 10px;
+  line-height: 1.3;
+  font-weight: 500;
+  text-align: left;
+  overflow-wrap: anywhere;
+  color: rgba(30, 25, 10, 0.85);
+}
 .postit-refresh {
   position: absolute;
   right: 2px;
@@ -202,6 +224,46 @@ textarea:focus-visible {
 }
 @keyframes postit-spin {
   to { transform: rotate(360deg); }
+}
+
+/* Tab drag & drop: insertion caret on the tab a drop would land before. */
+.tab-drop-before {
+  box-shadow: inset 2px 0 0 0 #60a5fa;
+}
+
+/* The pane that is NOT receiving the real-time stream sits back a touch, so
+   the working pane reads instantly. */
+.split-panes.is-split > .split-pane.pane-unfocused {
+  filter: brightness(0.94);
+  transition: filter 0.15s ease;
+}
+
+/* Split view: two conversations at once. Panes sit side by side when the
+   panel is wide enough for two readable columns, stacked otherwise. */
+.split-host {
+  container-type: inline-size;
+}
+.split-panes {
+  display: flex;
+  flex-direction: column;
+}
+.split-panes > .split-pane {
+  flex: 1 1 0;
+  min-height: 0;
+  min-width: 0;
+  overflow: hidden;
+}
+.split-panes.is-split > .split-pane + .split-pane {
+  border-top: 1px solid rgba(255, 255, 255, 0.09);
+}
+@container (min-width: 640px) {
+  .split-panes.is-split {
+    flex-direction: row;
+  }
+  .split-panes.is-split > .split-pane + .split-pane {
+    border-top: none;
+    border-left: 1px solid rgba(255, 255, 255, 0.09);
+  }
 }
 
 /* Motion is informational here (progress, working state); when the user asks

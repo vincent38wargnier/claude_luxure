@@ -19,8 +19,11 @@ export default function Thumbnails({ images, onRemove }: ThumbnailsProps) {
           />
           {onRemove && (
             <button
+              type="button"
               onClick={() => onRemove(i)}
-              className="absolute -top-1 -right-1 w-4 h-4 rounded-full bg-vscode-errorFg text-white text-[10px] leading-none flex items-center justify-center opacity-0 group-hover/thumb:opacity-100 transition-opacity"
+              aria-label={`Remove attachment ${i + 1}`}
+              title="Remove attachment"
+              className="absolute -top-1 -right-1 w-4 h-4 rounded-full bg-vscode-errorFg text-white text-[10px] leading-none flex items-center justify-center opacity-0 group-hover/thumb:opacity-100 focus-visible:opacity-100 transition-opacity"
             >
               ×
             </button>

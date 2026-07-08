@@ -1,4 +1,5 @@
 import { useRef, useEffect, useState, useMemo } from "react";
+import type { DragEvent as ReactDragEvent } from "react";
 import type { SessionInfo, SessionMarker } from "../../types";
 
 interface TabBarProps {
@@ -7,6 +8,8 @@ interface TabBarProps {
   tabNames?: Record<string, string>;
   /** Post-it identity per tab: emoji when picked, else a tiny color swatch. */
   tabMarkers?: Record<string, SessionMarker>;
+  /** Epoch ms of each tab's last completed reply — drives the idle counters. */
+  tabLastReply?: Record<string, number>;
   currentTabId?: string;
   runningSessionIds: string[];
   onSelect: (sessionId: string) => void;
@@ -14,6 +17,19 @@ interface TabBarProps {
   onNewChat: () => void;
   /** Start a chat in a fresh git worktree with a duplicated, port-remapped env. */
   onNewWorktree?: () => void;
+  /** Toggle the two-conversations-side-by-side view. */
+  onToggleSplit?: () => void;
+  splitActive?: boolean;
+  /** Which pane this strip belongs to (drag & drop routes through it). */
+  paneIndex?: number;
+  /** False when the OTHER pane owns the real-time stream — the current tab
+   * renders muted so the working pane is obvious at a glance. */
+  paneFocused?: boolean;
+  /** Drop handler: reorder within this strip or adopt a tab from the other
+   * pane's strip, inserting at `index`. */
+  onMoveTab?: (tabId: string, targetPane: number, index: number) => void;
+  /** Close all tabs (running conversations stay open). */
+  onCloseAll?: () => void;
   onListSessions: () => void;
   summarizingIds?: string[];
   summarizeProgress?: { done: number; total: number } | null;
@@ -28,6 +44,35 @@ function truncate(text: string, max: number): string {
 
 function isDraftTab(id: string): boolean {
   return id.startsWith("draft-");
+}
+
+/** Compact "waiting since" label: now → 5m → 3h → 2d. */
+function formatIdle(elapsedMs: number): string {
+  const s = Math.max(0, Math.floor(elapsedMs / 1000));
+  if (s < 60) return "now";
+  if (s < 3600) return `${Math.floor(s / 60)}m`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h`;
+  return `${Math.floor(s / 86400)}d`;
+}
+
+/** Idle-time counter: how long a conversation has been sitting on a finished
+ * reply, waiting for a follow-up. Yellow so forgotten chats catch the eye. */
+export function IdleBadge({ since, now, dim }: { since: number; now: number; dim?: boolean }) {
+  const label = formatIdle(now - since);
+  return (
+    <span
+      className={`shrink-0 px-1 py-px rounded text-[9px] font-medium tabular-nums leading-[13px] bg-[rgba(234,179,8,0.13)] text-[#eab308] ${
+        dim ? "opacity-70" : ""
+      }`}
+      title={
+        label === "now"
+          ? "Reply finished just now"
+          : `Waiting since the last reply finished ${label} ago`
+      }
+    >
+      {label}
+    </span>
+  );
 }
 
 function Spinner() {
@@ -66,12 +111,19 @@ export default function TabBar({
   openTabIds,
   tabNames,
   tabMarkers,
+  tabLastReply,
   currentTabId,
   runningSessionIds,
   onSelect,
   onClose,
   onNewChat,
   onNewWorktree,
+  onToggleSplit,
+  splitActive,
+  paneIndex,
+  paneFocused,
+  onMoveTab,
+  onCloseAll,
   onListSessions,
   summarizingIds,
   summarizeProgress,
@@ -82,6 +134,66 @@ export default function TabBar({
   const [search, setSearch] = useState("");
   const historyRef = useRef<HTMLDivElement>(null);
   const searchRef = useRef<HTMLInputElement>(null);
+
+  // Clock for the idle counters — a 15s tick keeps minute labels honest.
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 15000);
+    return () => clearInterval(t);
+  }, []);
+
+  // ── Tab drag & drop: reorder within this strip, or move a conversation to
+  // the other pane's strip. Payload rides a custom MIME so external file
+  // drags (handled elsewhere) never trigger tab-drop logic.
+  const DRAG_MIME = "application/x-luxure-tab";
+  const stripRef = useRef<HTMLDivElement>(null);
+  const [dropIndex, setDropIndex] = useState<number | null>(null);
+
+  const computeDropIndex = (e: ReactDragEvent): number => {
+    const strip = stripRef.current;
+    if (!strip) {
+      return 0;
+    }
+    const els = [...strip.querySelectorAll("[data-tab-id]")] as HTMLElement[];
+    for (let i = 0; i < els.length; i++) {
+      const r = els[i].getBoundingClientRect();
+      if (e.clientX < r.left + r.width / 2) {
+        return i;
+      }
+    }
+    return els.length;
+  };
+
+  const handleStripDragOver = (e: ReactDragEvent) => {
+    if (!onMoveTab || !e.dataTransfer.types.includes(DRAG_MIME)) {
+      return;
+    }
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "move";
+    setDropIndex(computeDropIndex(e));
+  };
+
+  const handleStripDrop = (e: ReactDragEvent) => {
+    if (!onMoveTab || !e.dataTransfer.types.includes(DRAG_MIME)) {
+      return;
+    }
+    e.preventDefault();
+    setDropIndex(null);
+    try {
+      const { tabId } = JSON.parse(e.dataTransfer.getData(DRAG_MIME));
+      if (typeof tabId === "string" && tabId) {
+        onMoveTab(tabId, paneIndex ?? 0, computeDropIndex(e));
+      }
+    } catch {
+      // Malformed payload — ignore the drop.
+    }
+  };
+
+  const handleStripDragLeave = (e: ReactDragEvent) => {
+    if (!stripRef.current?.contains(e.relatedTarget as Node)) {
+      setDropIndex(null);
+    }
+  };
 
   useEffect(() => {
     if (!showHistory) return;
@@ -149,17 +261,36 @@ export default function TabBar({
 
   return (
     <div className="flex items-center border-b border-[rgba(255,255,255,0.08)] bg-[var(--app-bg)] min-h-[32px]">
-      <div className="flex-1 flex items-center overflow-x-auto no-scrollbar">
-        {tabs.map((tab) => {
+      <div
+        ref={stripRef}
+        className={`flex-1 flex items-center overflow-x-auto no-scrollbar min-h-[30px] ${
+          dropIndex !== null ? "bg-[rgba(96,165,250,0.04)]" : ""
+        }`}
+        onDragOver={handleStripDragOver}
+        onDrop={handleStripDrop}
+        onDragLeave={handleStripDragLeave}
+      >
+        {tabs.map((tab, i) => {
           const isCurrent = tab.id === currentTabId;
           const running = runningSet.has(tab.id);
 
           return (
             <div
               key={tab.id}
+              data-tab-id={tab.id}
+              draggable={!!onMoveTab}
+              onDragStart={(e) => {
+                e.dataTransfer.setData(DRAG_MIME, JSON.stringify({ tabId: tab.id }));
+                e.dataTransfer.effectAllowed = "move";
+              }}
+              onDragEnd={() => setDropIndex(null)}
               className={`group relative flex items-center border-r border-[rgba(255,255,255,0.04)] transition-colors shrink-0 ${
+                dropIndex === i ? "tab-drop-before" : ""
+              } ${
                 isCurrent
-                  ? "bg-[var(--app-surface-2)] text-vscode-fg"
+                  ? paneFocused === false
+                    ? "bg-[rgba(255,255,255,0.05)] text-vscode-fg"
+                    : "bg-[var(--app-surface-2)] text-vscode-fg"
                   : "text-vscode-descriptionFg hover:text-vscode-fg hover:bg-[rgba(255,255,255,0.04)]"
               }`}
             >
@@ -190,6 +321,9 @@ export default function TabBar({
                 <span className={`truncate max-w-[130px] ${tab.isDraft ? "italic opacity-70" : ""}`}>
                   {tab.label}
                 </span>
+                {!running && !!tabLastReply?.[tab.id] && (
+                  <IdleBadge since={tabLastReply[tab.id]} now={now} />
+                )}
               </button>
               <button
                 type="button"
@@ -205,6 +339,9 @@ export default function TabBar({
             </div>
           );
         })}
+        {dropIndex !== null && dropIndex >= tabs.length && (
+          <span className="w-0.5 self-stretch my-1 bg-[#60a5fa] rounded shrink-0" aria-hidden="true" />
+        )}
       </div>
 
       <div className="flex items-center shrink-0 border-l border-[rgba(255,255,255,0.06)] px-1 gap-0.5">
@@ -232,6 +369,25 @@ export default function TabBar({
               <circle cx="18" cy="6" r="3" />
               <circle cx="6" cy="18" r="3" />
               <path d="M18 9a9 9 0 0 1-9 9" />
+            </svg>
+          </button>
+        )}
+
+        {onToggleSplit && (
+          <button
+            onClick={onToggleSplit}
+            aria-label={splitActive ? "Close split view" : "Split: show a second conversation"}
+            aria-pressed={splitActive}
+            title={splitActive ? "Close split view" : "Split: show a second conversation side by side"}
+            className={`p-1 rounded transition-colors ${
+              splitActive
+                ? "text-[#60a5fa] bg-[rgba(96,165,250,0.12)]"
+                : "text-vscode-descriptionFg hover:text-vscode-fg hover:bg-[rgba(255,255,255,0.06)]"
+            }`}
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <rect x="3" y="4" width="18" height="16" rx="2" />
+              <line x1="12" y1="4" x2="12" y2="20" />
             </svg>
           </button>
         )}
@@ -286,7 +442,7 @@ export default function TabBar({
           </button>
 
           {showHistory && (
-            <div className="absolute top-full right-0 mt-1 w-[min(280px,calc(100vw-16px))] max-h-[400px] bg-[var(--vscode-dropdown-background,var(--vscode-input-background))] border border-[rgba(255,255,255,0.1)] rounded-lg shadow-2xl z-50 flex flex-col overflow-hidden">
+            <div className="absolute top-full right-0 mt-1 w-[min(280px,calc(100vw-16px))] max-h-[400px] bg-[var(--vscode-dropdown-background,var(--vscode-input-background))] border border-[rgba(255,255,255,0.1)] rounded-lg shadow-2xl z-50 flex flex-col overflow-hidden" data-history-dropdown>
               <div className="px-2 py-1.5 border-b border-[rgba(255,255,255,0.06)]">
                 <input
                   ref={searchRef}
@@ -352,6 +508,13 @@ export default function TabBar({
                                 {truncate(label, 45)}
                               </div>
                             </div>
+                            {!isRunning && (
+                              <IdleBadge
+                                since={tabLastReply?.[session.id] ?? session.modifiedAt}
+                                now={now}
+                                dim
+                              />
+                            )}
                             {onSummarizeSession && (
                               <button
                                 onClick={(e) => {
@@ -390,6 +553,22 @@ export default function TabBar({
             </div>
           )}
         </div>
+
+        {onCloseAll && (
+          <button
+            onClick={onCloseAll}
+            aria-label="Close all tabs"
+            title="Close all tabs — running conversations stay open; everything remains in History"
+            className="p-1 rounded text-vscode-descriptionFg hover:text-[#f87171] hover:bg-[rgba(248,113,113,0.1)] transition-colors"
+          >
+            {/* stacked tabs with an ✕ — "close the whole strip" */}
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M4 16V7a3 3 0 0 1 3-3h9" />
+              <rect x="7" y="7" width="14" height="13" rx="2" />
+              <path d="M11.5 11l5 5M16.5 11l-5 5" />
+            </svg>
+          </button>
+        )}
       </div>
     </div>
   );

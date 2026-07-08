@@ -4,21 +4,25 @@ import { ArrowUpCircle } from "lucide-react";
 import type { Mode } from "../../types";
 import ModeSelector from "./ModeSelector";
 import ModelSelector from "./ModelSelector";
+import Thumbnails from "../common/Thumbnails";
 
 interface EditableUserMessageProps {
   initialText: string;
+  /** Attachments already on the message — kept on resend unless removed here. */
+  initialImages?: string[];
   /** A run is in flight — submitting stops it before resending from here. */
   willStopRun?: boolean;
   mode: Mode;
   model?: string;
   onModeChange: (mode: Mode) => void;
   onModelChange: (model: string) => void;
-  onSubmit: (text: string) => void;
+  onSubmit: (text: string, images?: string[]) => void;
   onCancel: () => void;
 }
 
 export default function EditableUserMessage({
   initialText,
+  initialImages,
   willStopRun,
   mode,
   model,
@@ -28,6 +32,7 @@ export default function EditableUserMessage({
   onCancel,
 }: EditableUserMessageProps) {
   const [text, setText] = useState(initialText);
+  const [images, setImages] = useState<string[]>(initialImages ?? []);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => {
@@ -36,13 +41,19 @@ export default function EditableUserMessage({
     textareaRef.current?.setSelectionRange(len, len);
   }, [initialText]);
 
+  const removeImage = useCallback((index: number) => {
+    setImages((prev) => prev.filter((_, i) => i !== index));
+  }, []);
+
+  const canSubmit = text.trim().length > 0 || images.length > 0;
+
   const handleSubmit = useCallback(() => {
     const trimmed = text.trim();
-    if (!trimmed) {
+    if (!trimmed && images.length === 0) {
       return;
     }
-    onSubmit(trimmed);
-  }, [text, onSubmit]);
+    onSubmit(trimmed, images.length > 0 ? images : undefined);
+  }, [text, images, onSubmit]);
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
@@ -61,6 +72,11 @@ export default function EditableUserMessage({
   return (
     <div className="mx-2">
       <div className="rounded-lg border border-[rgba(255,255,255,0.12)] bg-[var(--vscode-input-background)] overflow-hidden">
+        {images.length > 0 && (
+          <div className="px-3 pt-2.5 -mb-1">
+            <Thumbnails images={images} onRemove={removeImage} />
+          </div>
+        )}
         <TextareaAutosize
           ref={textareaRef}
           value={text}
@@ -82,7 +98,7 @@ export default function EditableUserMessage({
           <button
             type="button"
             onClick={handleSubmit}
-            disabled={!text.trim()}
+            disabled={!canSubmit}
             className="text-vscode-descriptionFg hover:text-vscode-fg disabled:opacity-30 transition-colors"
             title={
               willStopRun

@@ -88,6 +88,16 @@ export default function App() {
   // in flight (drives the spinner on the post-it).
   const [tabMarkers, setTabMarkers] = useState<Record<string, SessionMarker>>({});
   const [markerBusyKeys, setMarkerBusyKeys] = useState<Record<string, boolean>>({});
+  const [tabLastReply, setTabLastReply] = useState<Record<string, number>>({});
+  // Editor-group layout: which tabs live in which pane, what each pane shows,
+  // and which pane owns the real-time stream. Pane 1 empty ⇔ split closed.
+  const [panes, setPanes] = useState<{ tabIds: string[]; activeId: string | null }[]>([
+    { tabIds: [], activeId: null },
+    { tabIds: [], activeId: null },
+  ]);
+  const [focusedPane, setFocusedPane] = useState(0);
+  /** Full-state pushes for the UNFOCUSED pane's conversation. */
+  const [pushedPanes, setPushedPanes] = useState<Record<number, ExtensionState | null>>({});
   const [externalFiles, setExternalFiles] = useState<string[]>([]);
   const [skillsOpen, setSkillsOpen] = useState(false);
   const [skills, setSkills] = useState<SkillInfo[]>([]);
@@ -384,12 +394,30 @@ export default function App() {
           const incoming = msg.markers;
           setTabMarkers((prev) => ({ ...prev, ...incoming }));
         }
+        if (msg.lastReplyAt) {
+          const incoming = msg.lastReplyAt;
+          setTabLastReply((prev) => ({ ...prev, ...incoming }));
+        }
+        if (msg.panes && msg.panes.length > 0) {
+          const incoming = msg.panes;
+          setPanes([
+            incoming[0] ?? { tabIds: [], activeId: null },
+            incoming[1] ?? { tabIds: [], activeId: null },
+          ]);
+          setFocusedPane(msg.focusedPane === 1 ? 1 : 0);
+        }
         break;
 
       case "markerUpdate": {
         const { key, marker, busy } = msg;
         setTabMarkers((prev) => ({ ...prev, [key]: marker }));
         setMarkerBusyKeys((prev) => ({ ...prev, [key]: !!busy }));
+        break;
+      }
+
+      case "paneState": {
+        const { pane, state: paneState } = msg;
+        setPushedPanes((prev) => ({ ...prev, [pane]: paneState ?? null }));
         break;
       }
 
@@ -530,12 +558,20 @@ export default function App() {
     }
   }, [state.activeTabId]);
 
-  const handleSend = useCallback(
-    (text: string, images?: string[], mentions?: string[]) => {
-      // While a turn is in flight, queue the message instead of sending; it
-      // drains automatically when the current response finishes.
-      if (state.isStreaming) {
-        const tab = state.activeTabId ?? "";
+  /** Pane-aware send: `tabId` targets that pane's conversation (the provider
+   * moves focus to it first), and queueing keys off THAT pane's streaming
+   * state — a busy left pane must not queue a message meant for an idle
+   * right pane. */
+  const sendTo = useCallback(
+    (
+      tabId: string | undefined,
+      paneStreaming: boolean,
+      text: string,
+      images?: string[],
+      mentions?: string[]
+    ) => {
+      if (paneStreaming) {
+        const tab = tabId ?? "";
         const item: QueuedMessage = {
           id: `q${++queueIdRef.current}`,
           text,
@@ -545,9 +581,16 @@ export default function App() {
         setQueues((prev) => ({ ...prev, [tab]: [...(prev[tab] ?? []), item] }));
         return;
       }
-      vscode.postMessage({ type: "sendMessage", text, images, mentions } as any);
+      vscode.postMessage({ type: "sendMessage", text, images, mentions, tabId } as any);
     },
-    [state.isStreaming, state.activeTabId]
+    []
+  );
+
+  const handleSend = useCallback(
+    (text: string, images?: string[], mentions?: string[]) => {
+      sendTo(state.activeTabId, state.isStreaming ?? false, text, images, mentions);
+    },
+    [sendTo, state.isStreaming, state.activeTabId]
   );
 
   const handleRemoveQueued = useCallback(
@@ -601,9 +644,12 @@ export default function App() {
     if (first) handleSendQueuedNow(first.id);
   }, [state.activeTabId, handleSendQueuedNow]);
 
-  const handleEditMessage = useCallback((messageId: string, text: string) => {
-    vscode.postMessage({ type: "editMessage", messageId, text });
-  }, []);
+  const handleEditMessage = useCallback(
+    (messageId: string, text: string, images?: string[]) => {
+      vscode.postMessage({ type: "editMessage", messageId, text, images });
+    },
+    []
+  );
 
   const handleSwitchFork = useCallback((anchorId: string, index: number) => {
     vscode.postMessage({ type: "switchFork", anchorId, index });
@@ -633,12 +679,28 @@ export default function App() {
     vscode.postMessage({ type: "newWorktreeConversation" });
   }, []);
 
-  const handleSwitchSession = useCallback((sessionId: string) => {
-    vscode.postMessage({ type: "switchSession", sessionId });
+  const handleSwitchSession = useCallback((sessionId: string, pane?: number) => {
+    vscode.postMessage({ type: "switchSession", sessionId, pane });
   }, []);
 
   const handleCloseTab = useCallback((sessionId: string) => {
     vscode.postMessage({ type: "closeTab", sessionId });
+  }, []);
+
+  const handleCloseAllTabs = useCallback(() => {
+    vscode.postMessage({ type: "closeAllTabs" });
+  }, []);
+
+  const handleToggleSplit = useCallback(() => {
+    vscode.postMessage({ type: "toggleSplit" });
+  }, []);
+
+  const handleFocusPane = useCallback((pane: number) => {
+    vscode.postMessage({ type: "focusPane", pane });
+  }, []);
+
+  const handleMoveTab = useCallback((tabId: string, pane: number, index: number) => {
+    vscode.postMessage({ type: "moveTab", tabId, pane, index });
   }, []);
 
   const handleListSessions = useCallback(() => {
@@ -717,8 +779,12 @@ export default function App() {
     vscode.postMessage({ type: "summarizeAllSessions" });
   }, []);
 
-  const handleReevaluateMarker = useCallback(() => {
-    vscode.postMessage({ type: "reevaluateMarker" });
+  const handleSetMarkerNote = useCallback((note: string) => {
+    vscode.postMessage({ type: "setMarkerNote", note });
+  }, []);
+
+  const handleDismissTask = useCallback((toolUseId: string) => {
+    vscode.postMessage({ type: "dismissTask", toolUseId });
   }, []);
 
   const handleSwitchAccount = useCallback((accountId: string) => {
@@ -740,68 +806,93 @@ export default function App() {
   const isStreaming = state.isStreaming ?? false;
   const skillsDirty = editorContent !== savedEditorContent;
   const streamingText = isStreaming ? liveStreamingText : "";
+  const splitOpen = (panes[1]?.tabIds.length ?? 0) > 0;
 
-  return (
-    <div className="relative flex flex-col h-screen overflow-hidden">
-      <SkillsPanel
-        open={skillsOpen}
-        skills={skills}
-        selectedSkillId={selectedSkillId}
-        editorContent={editorContent}
-        dirty={skillsDirty}
-        error={skillsError}
-        savedFlash={savedFlash}
-        hasWorkspace={!!state.workspacePath}
-        onClose={() => setSkillsOpen(false)}
-        onSelectSkill={handleSelectSkill}
-        onEditorChange={handleEditorChange}
-        onListSkills={handleListSkills}
-        onSave={handleSaveSkill}
-        onDelete={handleDeleteSkill}
-        onCreate={handleCreateSkill}
-        onOpenInEditor={handleOpenSkillInEditor}
-      />
+  /** One full Claude Luxure instance per pane. The focused pane rides the
+   * real-time singleton state (streamText deltas, tasks, thinking...); the
+   * other renders the provider's full-state pushes for its conversation. */
+  const renderPane = (i: number) => {
+    const pane = panes[i] ?? { tabIds: [], activeId: null };
+    const focused = i === focusedPane;
+    const pv: ExtensionState = focused
+      ? state
+      : pushedPanes[i] ?? {
+          mode: state.mode,
+          messages: [],
+          cliStatus: "stopped",
+          pendingDiffs: [],
+        };
+    const pvStreaming = focused ? isStreaming : pv.isStreaming ?? false;
+    const pvStreamingText = focused
+      ? streamingText
+      : pvStreaming
+        ? pv.streamingText ?? ""
+        : "";
+    const activeId =
+      (focused ? state.activeTabId : pane.activeId ?? pv.activeTabId) ??
+      pane.activeId ??
+      undefined;
+
+    return (
       <ChatView
-        messages={state.messages}
-        mode={state.mode}
-        model={state.model}
-        effort={state.effort}
-        sessionId={state.sessionId}
-        activeTabId={state.activeTabId}
+        paneIndex={i}
+        paneFocused={focused}
+        messages={pv.messages}
+        mode={pv.mode ?? state.mode}
+        model={pv.model ?? state.model}
+        effort={pv.effort ?? state.effort}
+        sessionId={pv.sessionId}
+        activeTabId={activeId}
         sessions={sessions}
-        openTabIds={openTabIds}
+        openTabIds={pane.tabIds}
         tabNames={tabNames}
         tabMarkers={tabMarkers}
-        marker={tabMarkers[state.activeTabId ?? ""] ?? state.marker ?? null}
-        markerBusy={!!markerBusyKeys[state.activeTabId ?? ""]}
-        onReevaluateMarker={handleReevaluateMarker}
+        tabLastReply={tabLastReply}
+        onToggleSplit={handleToggleSplit}
+        splitActive={splitOpen}
+        onMoveTab={handleMoveTab}
+        onCloseAllTabs={handleCloseAllTabs}
+        marker={tabMarkers[activeId ?? ""] ?? pv.marker ?? null}
+        markerBusy={!!markerBusyKeys[activeId ?? ""]}
+        onSetMarkerNote={handleSetMarkerNote}
         runningSessionIds={state.runningSessionIds || []}
-        cliStatus={state.cliStatus}
+        cliStatus={pv.cliStatus}
         workspacePath={state.workspacePath}
-        externalFiles={externalFiles}
-        onClearExternalFiles={() => setExternalFiles([])}
-        pendingDiffs={state.pendingDiffs}
-        streamingText={streamingText}
-        isStreaming={isStreaming}
-        activities={activities}
-        liveTimeline={isStreaming ? liveTimeline : []}
-        runningTasks={runningTasks}
-        thinkingTokens={thinkingTokens}
-        transientStatus={transient}
-        cost={state.cost ?? null}
-        contextInfo={state.contextInfo ?? null}
+        externalFiles={focused ? externalFiles : []}
+        onClearExternalFiles={focused ? () => setExternalFiles([]) : () => {}}
+        pendingDiffs={pv.pendingDiffs ?? []}
+        streamingText={pvStreamingText}
+        isStreaming={pvStreaming}
+        activities={focused ? activities : pvStreaming ? pv.liveActivities ?? [] : []}
+        liveTimeline={
+          focused
+            ? isStreaming
+              ? liveTimeline
+              : []
+            : pvStreaming
+              ? pv.liveTimeline ?? []
+              : []
+        }
+        runningTasks={focused ? runningTasks : []}
+        onDismissTask={handleDismissTask}
+        thinkingTokens={focused ? thinkingTokens : 0}
+        transientStatus={focused ? transient : null}
+        cost={pv.cost ?? null}
+        contextInfo={pv.contextInfo ?? null}
         accountEmail={state.accountEmail}
         accountOrg={state.accountOrg}
         slashCommands={state.slashCommands}
-        contextSummarized={state.contextSummarized}
-        onSend={handleSend}
+        contextSummarized={pv.contextSummarized}
+        onSend={(text, images, mentions) =>
+          sendTo(pane.activeId ?? undefined, pvStreaming, text, images, mentions)
+        }
         onCancel={handleCancel}
         onModeChange={handleModeChange}
         onModelChange={handleModelChange}
         onEffortChange={handleEffortChange}
         onNewConversation={handleNewConversation}
         onNewWorktreeConversation={handleNewWorktreeConversation}
-        onSwitchSession={handleSwitchSession}
+        onSwitchSession={(sessionId) => handleSwitchSession(sessionId, i)}
         onCloseTab={handleCloseTab}
         onListSessions={handleListSessions}
         onAcceptChange={handleAcceptChange}
@@ -825,7 +916,7 @@ export default function App() {
         summarizeProgress={summarizeProgress}
         onSummarizeSession={handleSummarizeSession}
         onSummarizeAll={handleSummarizeAll}
-        queuedMessages={queues[state.activeTabId ?? ""] ?? []}
+        queuedMessages={queues[activeId ?? ""] ?? []}
         onQueueEdit={handleEditQueued}
         onQueueRemove={handleRemoveQueued}
         onQueueSendNow={handleSendQueuedNow}
@@ -833,6 +924,55 @@ export default function App() {
         onEditMessage={handleEditMessage}
         onSwitchFork={handleSwitchFork}
       />
+    );
+  };
+
+  return (
+    <div className="relative flex flex-col h-screen overflow-hidden">
+      <SkillsPanel
+        open={skillsOpen}
+        skills={skills}
+        selectedSkillId={selectedSkillId}
+        editorContent={editorContent}
+        dirty={skillsDirty}
+        error={skillsError}
+        savedFlash={savedFlash}
+        hasWorkspace={!!state.workspacePath}
+        onClose={() => setSkillsOpen(false)}
+        onSelectSkill={handleSelectSkill}
+        onEditorChange={handleEditorChange}
+        onListSkills={handleListSkills}
+        onSave={handleSaveSkill}
+        onDelete={handleDeleteSkill}
+        onCreate={handleCreateSkill}
+        onOpenInEditor={handleOpenSkillInEditor}
+      />
+      <div className="flex-1 min-h-0 split-host">
+        <div className={`split-panes h-full ${splitOpen ? "is-split" : ""}`}>
+          <div
+            className={`split-pane relative ${splitOpen && focusedPane !== 0 ? "pane-unfocused" : ""}`}
+            onMouseDownCapture={() => {
+              if (splitOpen && focusedPane !== 0) {
+                handleFocusPane(0);
+              }
+            }}
+          >
+            {renderPane(0)}
+          </div>
+          {splitOpen && (
+            <div
+              className={`split-pane relative ${focusedPane !== 1 ? "pane-unfocused" : ""}`}
+              onMouseDownCapture={() => {
+                if (focusedPane !== 1) {
+                  handleFocusPane(1);
+                }
+              }}
+            >
+              {renderPane(1)}
+            </div>
+          )}
+        </div>
+      </div>
     </div>
   );
 }

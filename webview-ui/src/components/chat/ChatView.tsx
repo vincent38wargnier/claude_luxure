@@ -4,6 +4,7 @@ import MessageRow from "./MessageRow";
 import ChatTextArea from "./ChatTextArea";
 import TabBar from "./TabBar";
 import SessionPostIt from "./SessionPostIt";
+import MarkerNoteModal from "./MarkerNoteModal";
 import QueuedMessages from "./QueuedMessages";
 import DiffPanel from "../common/DiffPanel";
 import WorkingDots from "../common/WorkingDots";
@@ -40,12 +41,24 @@ interface ChatViewProps {
   tabNames?: Record<string, string>;
   /** Post-it identity per open tab — the emoji rides along in the tab strip. */
   tabMarkers?: Record<string, SessionMarker>;
+  /** Epoch ms of each tab's last completed reply — drives the idle counters. */
+  tabLastReply?: Record<string, number>;
+  /** Which editor-group this instance renders (0 = left/top). */
+  paneIndex?: number;
+  /** True when this pane owns the real-time stream (focus follows clicks). */
+  paneFocused?: boolean;
+  /** Open/close the second pane. */
+  onToggleSplit?: () => void;
+  splitActive?: boolean;
+  /** Drag & drop a tab: reorder within a strip or move it to the other pane. */
+  onMoveTab?: (tabId: string, targetPane: number, index: number) => void;
+  onCloseAllTabs?: () => void;
   /** The active conversation's post-it (pinned top-right of the transcript). */
   marker?: SessionMarker | null;
   /** True while an emoji pick for the active conversation is in flight. */
   markerBusy?: boolean;
   /** Post-it clicked: re-pick the emoji from recent conversation context. */
-  onReevaluateMarker?: () => void;
+  onSetMarkerNote?: (note: string) => void;
   runningSessionIds: string[];
   cliStatus: string;
   pendingDiffs: PendingDiff[];
@@ -55,6 +68,7 @@ interface ChatViewProps {
   liveTimeline: TimelinePart[];
   /** Agents still working (live turn or background) — drives the status strip. */
   runningTasks?: TaskActivity[];
+  onDismissTask?: (toolUseId: string) => void;
   /** Live thinking-token estimate for the streaming turn (0 when idle). */
   thinkingTokens?: number;
   /** API retry / rate-limit chip; null when all is well. */
@@ -104,7 +118,7 @@ interface ChatViewProps {
   onQueueRemove?: (id: string) => void;
   onQueueSendNow?: (id: string) => void;
   onForceNext?: () => void;
-  onEditMessage?: (messageId: string, text: string) => void;
+  onEditMessage?: (messageId: string, text: string, images?: string[]) => void;
   onSwitchFork?: (anchorId: string, index: number) => void;
 }
 
@@ -119,9 +133,16 @@ export default function ChatView({
   openTabIds,
   tabNames,
   tabMarkers,
+  tabLastReply,
+  paneIndex,
+  paneFocused,
+  onToggleSplit,
+  splitActive,
+  onMoveTab,
+  onCloseAllTabs,
   marker,
   markerBusy,
-  onReevaluateMarker,
+  onSetMarkerNote,
   runningSessionIds,
   cliStatus,
   pendingDiffs,
@@ -130,6 +151,7 @@ export default function ChatView({
   activities,
   liveTimeline,
   runningTasks,
+  onDismissTask,
   thinkingTokens,
   transientStatus,
   cost,
@@ -186,6 +208,7 @@ export default function ChatView({
   const prevMsgCountRef = useRef(messages.length);
   const [showReview, setShowReview] = useState(false);
   const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
+  const [noteModalOpen, setNoteModalOpen] = useState(false);
 
   const handleScroll = useCallback(() => {
     const el = scrollContainerRef.current;
@@ -213,10 +236,12 @@ export default function ChatView({
     }
   }, [messages, streamingText]);
 
-  // Switching conversations starts pinned to the latest message.
+  // Switching conversations starts pinned to the latest message; an open
+  // note editor belongs to the previous conversation, so drop it too.
   useEffect(() => {
     stickToBottomRef.current = true;
     messagesEndRef.current?.scrollIntoView({ behavior: "auto" });
+    setNoteModalOpen(false);
   }, [activeTabId]);
 
   const handleReview = useCallback(() => {
@@ -235,12 +260,13 @@ export default function ChatView({
   }, []);
 
   const handleSubmitEdit = useCallback(
-    (messageId: string, text: string) => {
+    (messageId: string, text: string, images?: string[]) => {
       setEditingMessageId(null);
-      onEditMessage?.(messageId, text);
+      onEditMessage?.(messageId, text, images);
     },
     [onEditMessage]
   );
+
 
 
   return (
@@ -251,12 +277,19 @@ export default function ChatView({
         openTabIds={openTabIds}
         tabNames={tabNames}
         tabMarkers={tabMarkers}
+        tabLastReply={tabLastReply}
         currentTabId={activeTabId || sessionId}
         runningSessionIds={runningSessionIds}
         onSelect={onSwitchSession}
         onClose={onCloseTab}
         onNewChat={onNewConversation}
         onNewWorktree={onNewWorktreeConversation}
+        onToggleSplit={onToggleSplit}
+        splitActive={splitActive}
+        paneIndex={paneIndex}
+        paneFocused={paneFocused}
+        onMoveTab={onMoveTab}
+        onCloseAll={onCloseAllTabs}
         onListSessions={onListSessions}
         summarizingIds={summarizingIds}
         summarizeProgress={summarizeProgress}
@@ -272,7 +305,18 @@ export default function ChatView({
             tabKey={activeTabId || sessionId || "chat"}
             marker={marker}
             busy={markerBusy}
-            onReevaluate={onReevaluateMarker}
+            onEditNote={
+              onSetMarkerNote ? () => setNoteModalOpen(true) : undefined
+            }
+          />
+        )}
+        {noteModalOpen && marker && (
+          <MarkerNoteModal
+            color={marker.color}
+            initialNote={marker.note ?? ""}
+            emoji={marker.emoji}
+            onSave={(note) => onSetMarkerNote?.(note)}
+            onClose={() => setNoteModalOpen(false)}
           />
         )}
       <div
@@ -315,7 +359,9 @@ export default function ChatView({
                 mode={mode}
                 model={model}
                 onStartEdit={() => handleStartEdit(msg.id)}
-                onSubmitEdit={(text) => handleSubmitEdit(msg.id, text)}
+                onSubmitEdit={(text, images) =>
+                  handleSubmitEdit(msg.id, text, images)
+                }
                 onCancelEdit={handleCancelEdit}
                 onModeChange={onModeChange}
                 onModelChange={onModelChange}
@@ -340,6 +386,7 @@ export default function ChatView({
       {showReview && pendingDiffs.length > 0 && (
         <DiffPanel
           diffs={pendingDiffs}
+          workspacePath={workspacePath}
           onAccept={onAcceptChange}
           onReject={onRejectChange}
           onAcceptAll={onAcceptAll}
@@ -383,20 +430,35 @@ export default function ChatView({
                   t.progressSummary || t.description || t.subagentType || "agent";
                 const elapsed = fmtElapsed(t.durationMs);
                 return (
-                  <button
+                  <span
                     key={t.toolUseId}
-                    type="button"
-                    onClick={() => jumpToTask(t.toolUseId)}
-                    title={`${t.subagentType || "agent"} — ${label}. Click to show its card.`}
-                    className="flex items-center gap-1 min-w-0 max-w-[240px] px-1.5 py-0.5 rounded border border-[rgba(139,92,246,0.35)] text-vscode-descriptionFg hover:text-vscode-fg hover:bg-[rgba(139,92,246,0.15)] transition-colors"
+                    className="group/chip flex items-center min-w-0 max-w-[240px] rounded border border-[rgba(139,92,246,0.35)] text-vscode-descriptionFg hover:bg-[rgba(139,92,246,0.15)] transition-colors"
                   >
-                    <span className="truncate">{label}</span>
-                    {elapsed && (
-                      <span className="shrink-0 tabular-nums text-[10px] opacity-70">
-                        {elapsed}
-                      </span>
+                    <button
+                      type="button"
+                      onClick={() => jumpToTask(t.toolUseId)}
+                      title={`${t.subagentType || "agent"} — ${label}. Click to show its card.`}
+                      className="flex items-center gap-1 min-w-0 px-1.5 py-0.5 hover:text-vscode-fg transition-colors"
+                    >
+                      <span className="truncate">{label}</span>
+                      {elapsed && (
+                        <span className="shrink-0 tabular-nums text-[10px] opacity-70">
+                          {elapsed}
+                        </span>
+                      )}
+                    </button>
+                    {onDismissTask && (
+                      <button
+                        type="button"
+                        onClick={() => onDismissTask(t.toolUseId)}
+                        aria-label="Dismiss this agent from the strip"
+                        title="Dismiss — stop tracking this agent (a late result still lands on its card)"
+                        className="shrink-0 px-1 py-0.5 opacity-0 group-hover/chip:opacity-70 focus-visible:opacity-70 hover:!opacity-100 hover:text-[#f87171] transition-opacity"
+                      >
+                        ×
+                      </button>
                     )}
-                  </button>
+                  </span>
                 );
               })}
             </div>

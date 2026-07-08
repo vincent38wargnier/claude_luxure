@@ -186,6 +186,16 @@ interface SessionRuntime {
    * demand when the post-it is clicked). */
   markerColor?: string;
   markerEmoji?: string;
+  markerNote?: string;
+  /** Conversation-level settings, stamped at creation (persisted value for a
+   * known session, else the provider-wide defaults). Changing them in one
+   * conversation must never affect another. */
+  mode?: Mode;
+  model?: string;
+  effort?: EffortLevel;
+  /** Epoch ms when this conversation's last reply finished (any way a turn can
+   * end: result, error, stop, watchdog). Drives the tab-strip idle counter. */
+  lastReplyAt?: number;
 }
 
 function createEmptyRuntime(): SessionRuntime {
@@ -241,6 +251,10 @@ const POSTIT_COLORS = [
   "#D6E67E", // lime
   "#F4A28C", // coral
 ];
+
+/** Longest user note a post-it holds — enough for ~10 words, short enough to
+ * stay a glanceable sticky rather than a paragraph. */
+const MARKER_NOTE_MAX = 80;
 
 /** Keyword fallback when the one-shot emoji pick fails (offline, usage limit):
  * a coarse topic match beats a broken blank post-it. */
@@ -328,7 +342,36 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private webview: vscode.Webview | undefined;
   private webviewView: vscode.WebviewView | undefined;
   private runtimes = new Map<string, SessionRuntime>();
-  private activeKey = "";
+
+  // ── Pane model: up to two side-by-side instances, VS Code editor-group style.
+  /** Open tabs per pane; pane 1 empty ⇔ split closed. */
+  private paneTabs: [string[], string[]] = [[], []];
+  /** The conversation each pane displays. */
+  private paneActive: [string | null, string | null] = [null, null];
+  /** The pane the user is working in — its conversation gets real-time
+   * streaming; the other pane is refreshed with full-state pushes. */
+  private focusedPane: 0 | 1 = 0;
+
+  /** The focused pane's conversation. Accessor pair so the large pre-split
+   * codebase keeps reading/assigning `activeKey` unchanged; assignment also
+   * guarantees strip membership. */
+  private get activeKey(): string {
+    return this.paneActive[this.focusedPane] ?? "";
+  }
+  private set activeKey(v: string) {
+    this.paneActive[this.focusedPane] = v || null;
+    if (v && !this.paneTabs[0].includes(v) && !this.paneTabs[1].includes(v)) {
+      this.paneTabs[this.focusedPane].unshift(v);
+    }
+  }
+
+  /** Every open tab across both panes (read-only — mutate paneTabs). */
+  private get openTabIds(): string[] {
+    return [...this.paneTabs[0], ...this.paneTabs[1]];
+  }
+
+  // Defaults for NEW conversations only (each runtime carries its own copy,
+  // stamped at creation); kept in sync with the last explicit choice.
   private mode: Mode = "agent";
   private model: string | undefined;
   private effort: EffortLevel | undefined;
@@ -336,7 +379,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private diffManager = new DiffManager(this.snapshotManager);
   private accountEmail: string | undefined;
   private accountOrg: string | undefined;
-  private openTabIds: string[] = [];
   private sessionManager: SessionManager | undefined;
   private diffWatchStarted = false;
   private slashCommands: string[] = [];
@@ -396,11 +438,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   private getActiveRuntime(): SessionRuntime {
     if (!this.activeKey) {
-      const draftKey = this.createDraftRuntime();
-      this.activeKey = draftKey;
-      if (!this.openTabIds.includes(draftKey)) {
-        this.openTabIds.unshift(draftKey);
-      }
+      // Assigning activeKey also inserts the draft into the focused pane's strip.
+      this.activeKey = this.createDraftRuntime();
     }
     let runtime = this.runtimes.get(this.activeKey);
     if (!runtime) {
@@ -410,9 +449,35 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       } else {
         runtime.sessionId = this.activeKey;
       }
+      this.stampSettings(this.activeKey, runtime);
       this.runtimes.set(this.activeKey, runtime);
     }
     return runtime;
+  }
+
+  /** Give a runtime its own conversation-level settings: the persisted ones
+   * for a known session, else the provider-wide defaults at creation time. */
+  private stampSettings(key: string, runtime: SessionRuntime): void {
+    const persisted = !isDraftKey(key)
+      ? this.context.workspaceState.get<{
+          mode?: Mode;
+          model?: string;
+          effort?: EffortLevel;
+        }>(`claude-luxure.settingsFor.${key}`)
+      : undefined;
+    runtime.mode = persisted?.mode ?? this.mode;
+    runtime.model = persisted?.model ?? this.model;
+    runtime.effort = persisted?.effort ?? this.effort;
+  }
+
+  private persistSettingsFor(runtime: SessionRuntime): void {
+    if (!runtime.sessionId) {
+      return;
+    }
+    this.context.workspaceState.update(
+      `claude-luxure.settingsFor.${runtime.sessionId}`,
+      { mode: runtime.mode, model: runtime.model, effort: runtime.effort }
+    );
   }
 
   private createDraftRuntime(): string {
@@ -420,6 +485,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.runtimes.set(draftKey, createEmptyRuntime());
     const runtime = this.runtimes.get(draftKey)!;
     runtime.draftId = draftKey;
+    this.stampSettings(draftKey, runtime);
     // Every conversation gets its post-it color at birth, so a brand-new tab
     // is visually distinguishable before any message is sent.
     runtime.markerColor = this.pickMarkerColor();
@@ -428,6 +494,84 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   private isActiveKey(key: string): boolean {
     return key === this.activeKey;
+  }
+
+  private paneOf(tabId: string): 0 | 1 | undefined {
+    if (this.paneTabs[0].includes(tabId)) {
+      return 0;
+    }
+    if (this.paneTabs[1].includes(tabId)) {
+      return 1;
+    }
+    return undefined;
+  }
+
+  /** Re-key a tab in place (draft → real session id), wherever it lives. */
+  private renameTab(oldKey: string, newKey: string): void {
+    for (const pane of [0, 1] as const) {
+      const idx = this.paneTabs[pane].indexOf(oldKey);
+      if (idx >= 0) {
+        this.paneTabs[pane][idx] = newKey;
+      }
+      if (this.paneActive[pane] === oldKey) {
+        this.paneActive[pane] = newKey;
+      }
+    }
+    if (this.paneOf(newKey) === undefined) {
+      this.paneTabs[this.focusedPane].unshift(newKey);
+    }
+  }
+
+  private persistPanes(): void {
+    this.context.workspaceState.update("claude-luxure.openTabs", this.openTabIds);
+    this.context.workspaceState.update("claude-luxure.panes", {
+      tabs: this.paneTabs,
+      active: this.paneActive,
+      focused: this.focusedPane,
+    });
+  }
+
+  /** Keep the pane model coherent: an emptied pane 0 adopts pane 1's tabs, an
+   * empty pane 1 folds the split away, and each pane's displayed conversation
+   * must be one of its own tabs. */
+  private normalizePanes(): void {
+    if (this.paneTabs[0].length === 0 && this.paneTabs[1].length > 0) {
+      this.paneTabs[0] = this.paneTabs[1];
+      this.paneTabs[1] = [];
+      this.paneActive[0] = this.paneActive[1];
+      this.paneActive[1] = null;
+      this.focusedPane = 0;
+    }
+    if (this.paneTabs[1].length === 0) {
+      this.paneActive[1] = null;
+      this.focusedPane = 0;
+    }
+    for (const pane of [0, 1] as const) {
+      const tabs = this.paneTabs[pane];
+      const active = this.paneActive[pane];
+      if (tabs.length === 0) {
+        this.paneActive[pane] = null;
+      } else if (!active || !tabs.includes(active)) {
+        this.paneActive[pane] = tabs[0];
+      }
+    }
+  }
+
+  /** Load a session into a runtime if it isn't already (persisted messages →
+   * transcript fallback), so a pane can display it. */
+  private async ensureRuntimeLoaded(key: string): Promise<void> {
+    if (!key || this.runtimes.has(key)) {
+      return;
+    }
+    const runtime = createEmptyRuntime();
+    if (isDraftKey(key)) {
+      runtime.draftId = key;
+    } else {
+      runtime.sessionId = key;
+      await this.loadRuntimeMessages(key, runtime);
+    }
+    this.stampSettings(key, runtime);
+    this.runtimes.set(key, runtime);
   }
 
   private getRunningSessionIds(): string[] {
@@ -454,19 +598,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     runtime.sessionId = sessionId;
     delete runtime.draftId;
     this.runtimes.set(sessionId, runtime);
-    // The color chosen at draft time can be persisted now that a real id exists.
+    // The color chosen at draft time can be persisted now that a real id
+    // exists — same for any settings picked while still a draft.
     this.persistMarker(runtime);
+    this.persistSettingsFor(runtime);
 
-    const tabIdx = this.openTabIds.indexOf(draftKey);
-    if (tabIdx >= 0) {
-      this.openTabIds[tabIdx] = sessionId;
-    } else if (!this.openTabIds.includes(sessionId)) {
-      this.openTabIds.unshift(sessionId);
-    }
-
-    if (this.activeKey === draftKey) {
-      this.activeKey = sessionId;
-    }
+    this.renameTab(draftKey, sessionId);
   }
 
   private fetchAccountInfo(): void {
@@ -497,42 +634,60 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     });
   }
 
-  private restoreLastSession(): void {
-    this.openTabIds = this.context.workspaceState.get<string[]>("claude-luxure.openTabs") || [];
-    const lastSessionId = this.context.workspaceState.get<string>("claude-luxure.lastSessionId");
-
-    if (lastSessionId) {
-      if (!this.openTabIds.includes(lastSessionId)) {
-        this.openTabIds.unshift(lastSessionId);
-      }
-
-      const runtime = createEmptyRuntime();
-      runtime.sessionId = lastSessionId;
-      runtime.contextSummarized = this.loadContextSummarized(lastSessionId);
-      const cached = this.context.workspaceState.get<ChatMessage[]>(`claude-luxure.messages.${lastSessionId}`);
+  /** Synchronously hydrate a runtime from the workspaceState message cache —
+   * used at startup, before any async transcript loading is possible. */
+  private restoreRuntimeFromCache(key: string): void {
+    if (!key || this.runtimes.has(key)) {
+      return;
+    }
+    const runtime = createEmptyRuntime();
+    if (isDraftKey(key)) {
+      runtime.draftId = key;
+    } else {
+      runtime.sessionId = key;
+      runtime.contextSummarized = this.loadContextSummarized(key);
+      const cached = this.context.workspaceState.get<ChatMessage[]>(
+        `claude-luxure.messages.${key}`
+      );
       if (cached && cached.length > 0) {
         runtime.messages = restoreMessages(cached);
-        log("INFO", `Restored ${cached.length} messages for session ${lastSessionId}`);
+        log("INFO", `Restored ${cached.length} messages for session ${key}`);
       }
-      this.runtimes.set(lastSessionId, runtime);
-      this.activeKey = lastSessionId;
-    } else if (this.openTabIds.length > 0) {
-      this.activeKey = this.openTabIds[0];
-      if (!this.runtimes.has(this.activeKey)) {
-        const runtime = createEmptyRuntime();
-        if (isDraftKey(this.activeKey)) {
-          runtime.draftId = this.activeKey;
-        } else {
-          runtime.sessionId = this.activeKey;
-          runtime.contextSummarized = this.loadContextSummarized(this.activeKey);
-          const cached = this.context.workspaceState.get<ChatMessage[]>(
-            `claude-luxure.messages.${this.activeKey}`
-          );
-          if (cached) {
-            runtime.messages = restoreMessages(cached);
-          }
-        }
-        this.runtimes.set(this.activeKey, runtime);
+    }
+    this.stampSettings(key, runtime);
+    this.runtimes.set(key, runtime);
+  }
+
+  private restoreLastSession(): void {
+    const persisted = this.context.workspaceState.get<{
+      tabs?: [string[], string[]];
+      active?: [string | null, string | null];
+      focused?: number;
+    }>("claude-luxure.panes");
+
+    if (persisted?.tabs && Array.isArray(persisted.tabs[0])) {
+      this.paneTabs = [persisted.tabs[0] || [], persisted.tabs[1] || []];
+      this.paneActive = [persisted.active?.[0] ?? null, persisted.active?.[1] ?? null];
+      this.focusedPane = persisted.focused === 1 ? 1 : 0;
+    } else {
+      // Legacy flat tab list from before the split-pane model.
+      this.paneTabs = [
+        this.context.workspaceState.get<string[]>("claude-luxure.openTabs") || [],
+        [],
+      ];
+    }
+
+    const lastSessionId = this.context.workspaceState.get<string>("claude-luxure.lastSessionId");
+    if (lastSessionId && !this.activeKey) {
+      this.activeKey = lastSessionId; // setter inserts it into the focused strip
+    }
+    this.normalizePanes();
+
+    // Hydrate what each pane shows so the first render isn't empty.
+    for (const pane of [0, 1] as const) {
+      const key = this.paneActive[pane];
+      if (key) {
+        this.restoreRuntimeFromCache(key);
       }
     }
   }
@@ -556,8 +711,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         runtime.accountId
       );
     }
-    this.context.workspaceState.update("claude-luxure.openTabs", this.openTabIds);
+    if (persistId && runtime.lastReplyAt) {
+      this.context.workspaceState.update(
+        `claude-luxure.lastReplyAt.${persistId}`,
+        runtime.lastReplyAt
+      );
+    }
+    this.persistPanes();
     this.persistMarker(runtime);
+    this.persistSettingsFor(runtime);
   }
 
   private loadContextSummarized(key: string): boolean {
@@ -880,9 +1042,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   // ─────────────────────── Conversation post-it markers ───────────────────────
   // Each conversation gets a post-it: a palette color assigned when the tab is
-  // created, and an emoji picked by a Haiku one-shot over the transcript — once
+  // created, and an emoji picked by a Haiku one-shot over the transcript once
   // automatically after the first completed turn (a first message alone is often
-  // not enough context), and again whenever the post-it is clicked.
+  // not enough context). Clicking the post-it edits a user note, which the
+  // sticky then shows in place of the emoji until the note is cleared.
 
   /** Runtimes with an emoji pick in flight, to dedupe concurrent requests. */
   private markerBusy = new Set<SessionRuntime>();
@@ -905,6 +1068,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         runtime.markerColor = persisted.color;
         if (!runtime.markerEmoji) {
           runtime.markerEmoji = persisted.emoji;
+        }
+        if (!runtime.markerNote) {
+          runtime.markerNote = persisted.note;
         }
         return;
       }
@@ -934,6 +1100,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const marker: SessionMarker = {
       emoji: runtime.markerEmoji,
       color: runtime.markerColor,
+      note: runtime.markerNote,
     };
     this.context.workspaceState.update(
       `claude-luxure.sessionMarker.${runtime.sessionId}`,
@@ -949,7 +1116,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.postMessage({
       type: "markerUpdate",
       key,
-      marker: { emoji: runtime.markerEmoji, color: runtime.markerColor },
+      marker: {
+        emoji: runtime.markerEmoji,
+        color: runtime.markerColor,
+        note: runtime.markerNote,
+      },
       busy,
     });
   }
@@ -1020,6 +1191,200 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
+  /** Set (or clear, with an empty string) the active conversation's note. */
+  private handleSetMarkerNote(note: string): void {
+    const runtime = this.getActiveRuntime();
+    this.ensureMarker(this.markerKeyFor(runtime), runtime);
+    const trimmed = note.replace(/\s+/g, " ").trim().slice(0, MARKER_NOTE_MAX);
+    runtime.markerNote = trimmed || undefined;
+    this.persistMarker(runtime);
+    this.postMarkerUpdate(runtime, this.markerBusy.has(runtime));
+    this.sendOpenTabs();
+  }
+
+  // ──────────────────────── Idle-time (last reply) counters ────────────────────────
+
+  /** Fallback last-activity timestamps (transcript mtime) for sessions that
+   * predate lastReplyAt persistence. Stat once per session, then cached — the
+   * live value written at finalize takes over from the next reply on. */
+  private lastReplyFallback = new Map<string, number | null>();
+
+  /** When this conversation's last reply finished, best-effort:
+   * live runtime value → persisted value → transcript file mtime. */
+  private lastReplyAtFor(key: string, runtime?: SessionRuntime): number | undefined {
+    if (runtime?.lastReplyAt) {
+      return runtime.lastReplyAt;
+    }
+    if (!key || isDraftKey(key)) {
+      return undefined;
+    }
+    const persisted = this.context.workspaceState.get<number>(
+      `claude-luxure.lastReplyAt.${key}`
+    );
+    if (persisted) {
+      if (runtime) {
+        runtime.lastReplyAt = persisted;
+      }
+      return persisted;
+    }
+    if (!this.lastReplyFallback.has(key)) {
+      this.lastReplyFallback.set(
+        key,
+        this.getSessionManager()?.transcriptMtime(key) ?? null
+      );
+    }
+    return this.lastReplyFallback.get(key) || undefined;
+  }
+
+  // ───────────────────────────── Split view ─────────────────────────────
+  // Two full instances side by side (VS Code editor-group style). Each pane
+  // has its own tab strip, transcript and composer. Real-time streaming flows
+  // to the FOCUSED pane's conversation only (that's what the whole pre-split
+  // event plumbing assumes); the other pane is kept live with full-state
+  // pushes — on focus changes, on its turn settling, and on a slow ticker
+  // while it has a turn in flight. Focus follows interaction.
+
+  private paneTicker?: ReturnType<typeof setInterval>;
+
+  private ensurePaneTicker(): void {
+    if (this.paneTicker) {
+      return;
+    }
+    this.paneTicker = setInterval(() => {
+      if (this.paneTabs[1].length === 0) {
+        return;
+      }
+      const other = (1 - this.focusedPane) as 0 | 1;
+      const key = this.paneActive[other];
+      const rt = key ? this.runtimes.get(key) : undefined;
+      if (rt?.streamingMessageId) {
+        this.sendPaneState(other);
+      }
+    }, 900);
+  }
+
+  /** Full display state for the UNFOCUSED pane's conversation. */
+  private sendPaneState(pane: 0 | 1): void {
+    if (this.paneTabs[1].length === 0) {
+      return;
+    }
+    const key = this.paneActive[pane];
+    const runtime = key ? this.runtimes.get(key) : undefined;
+    if (!key || !runtime) {
+      return;
+    }
+    this.postMessage({
+      type: "paneState",
+      pane,
+      state: this.buildStateFor(key, runtime),
+    });
+  }
+
+  /** Layout + fresh state for both panes, in the order the webview needs:
+   * layout first (so `state` routes to the right pane), then the states. */
+  private sendPanesSnapshot(): void {
+    this.sendOpenTabs();
+    this.sendState();
+    this.sendPaneState((1 - this.focusedPane) as 0 | 1);
+  }
+
+  /** The user started interacting with the other pane: its conversation takes
+   * over the real-time stream; the demoted one falls back to pushes. */
+  private async handleFocusPane(pane: 0 | 1): Promise<void> {
+    if (pane === this.focusedPane || (pane === 1 && this.paneTabs[1].length === 0)) {
+      return;
+    }
+    this.persistActiveSession();
+    const demoted = this.focusedPane;
+    this.focusedPane = pane;
+    this.normalizePanes();
+    const key = this.paneActive[this.focusedPane];
+    if (key) {
+      await this.ensureRuntimeLoaded(key);
+      this.context.workspaceState.update("claude-luxure.lastSessionId", key);
+    }
+    this.persistPanes();
+    this.sendOpenTabs();
+    this.sendState();
+    this.sendPaneState(demoted);
+    this.sendAccountsList();
+    void this.pollUsageForActive();
+  }
+
+  /** Drag & drop: reorder within a strip, or move a conversation to the other
+   * pane (where it becomes that pane's displayed conversation). */
+  private async handleMoveTab(tabId: string, targetPane: 0 | 1, index: number): Promise<void> {
+    const source = this.paneOf(tabId);
+    if (source === undefined) {
+      return;
+    }
+    this.persistActiveSession();
+    const src = this.paneTabs[source];
+    const from = src.indexOf(tabId);
+    src.splice(from, 1);
+    let insert = index;
+    if (source === targetPane && from < insert) {
+      insert -= 1; // account for the slot the tab just vacated
+    }
+    const dst = this.paneTabs[targetPane];
+    insert = Math.max(0, Math.min(insert, dst.length));
+    dst.splice(insert, 0, tabId);
+
+    if (source !== targetPane) {
+      await this.ensureRuntimeLoaded(tabId);
+      this.paneActive[targetPane] = tabId;
+      this.focusedPane = targetPane;
+      if (this.paneActive[source] === tabId || !src.includes(this.paneActive[source] || "")) {
+        this.paneActive[source] = src[Math.min(from, src.length - 1)] ?? null;
+        if (this.paneActive[source]) {
+          await this.ensureRuntimeLoaded(this.paneActive[source]!);
+        }
+      }
+      this.ensurePaneTicker();
+    }
+    this.normalizePanes();
+    this.persistPanes();
+    this.sendPanesSnapshot();
+  }
+
+  /** Split button: open a second pane (seeded with the next tab, or a fresh
+   * draft), or fold pane 1's tabs back into pane 0 — nothing gets closed. */
+  private async handleToggleSplit(): Promise<void> {
+    this.persistActiveSession();
+    if (this.paneTabs[1].length > 0) {
+      const focusedConv = this.activeKey;
+      this.paneTabs[0] = [...this.paneTabs[0], ...this.paneTabs[1]];
+      this.paneTabs[1] = [];
+      this.paneActive[1] = null;
+      this.focusedPane = 0;
+      if (focusedConv) {
+        this.paneActive[0] = focusedConv;
+      }
+      this.normalizePanes();
+      this.postMessage({ type: "paneState", pane: 1, state: undefined });
+    } else {
+      const donorIdx = this.paneTabs[0].findIndex((id) => id !== this.paneActive[0]);
+      if (donorIdx >= 0) {
+        const donor = this.paneTabs[0].splice(donorIdx, 1)[0];
+        this.paneTabs[1] = [donor];
+        this.paneActive[1] = donor;
+        await this.ensureRuntimeLoaded(donor);
+      } else {
+        const draft = this.createDraftRuntime();
+        this.runtimes.get(draft)!.accountId =
+          this.context.globalState.get<string>("claude-luxure.lastAccountId") || "default";
+        this.paneTabs[1] = [draft];
+        this.paneActive[1] = draft;
+      }
+      this.focusedPane = 1;
+      this.ensurePaneTicker();
+    }
+    this.persistPanes();
+    this.sendPanesSnapshot();
+    this.sendAccountsList();
+    void this.pollUsageForActive();
+  }
+
   private async loadRuntimeMessages(key: string, runtime: SessionRuntime): Promise<void> {
     if (isDraftKey(key)) {
       runtime.messages = [];
@@ -1048,26 +1413,25 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  private async handleSwitchSession(sessionId: string): Promise<void> {
+  /** Show a conversation: if its tab is already open in either pane, that pane
+   * takes focus (VS Code-style); otherwise it opens in `pane` (default: the
+   * focused one). */
+  private async handleSwitchSession(sessionId: string, pane?: 0 | 1): Promise<void> {
     this.persistActiveSession();
 
-    if (!this.openTabIds.includes(sessionId)) {
-      this.openTabIds.unshift(sessionId);
+    const existing = this.paneOf(sessionId);
+    const target = existing ?? (pane !== undefined && this.paneTabs[1].length > 0 ? pane : this.focusedPane);
+    if (existing === undefined) {
+      this.paneTabs[target].unshift(sessionId);
     }
+    this.focusedPane = target;
+    this.paneActive[target] = sessionId;
 
-    this.activeKey = sessionId;
-
-    if (!this.runtimes.has(sessionId)) {
-      const runtime = createEmptyRuntime();
-      runtime.sessionId = sessionId;
-      await this.loadRuntimeMessages(sessionId, runtime);
-      this.runtimes.set(sessionId, runtime);
-    }
+    await this.ensureRuntimeLoaded(sessionId);
 
     this.context.workspaceState.update("claude-luxure.lastSessionId", sessionId);
     this.persistActiveSession();
-    this.sendState();
-    this.sendOpenTabs();
+    this.sendPanesSnapshot();
     this.sendAccountsList();
     void this.pollUsageForActive();
   }
@@ -1076,8 +1440,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const bridge = runtime.bridge;
     runtime.bridge = undefined;
     runtime.cliStatus = "stopped";
+    // A killed CLI can never finish its agents — settle their cards so the
+    // "N agents working" strip doesn't survive the stop as a ghost.
+    const settled = this.settleRunningTasks(
+      runtime,
+      "Interrupted — the run was stopped",
+      this.isActiveKey(key)
+    );
     if (runtime.streamingMessageId) {
       this.finalizeStreamingMessage(key, runtime, false);
+    } else if (settled > 0) {
+      this.persistRuntime(key, runtime);
     }
     if (bridge) {
       // Detach our handlers BEFORE killing. The process exits asynchronously and
@@ -1089,16 +1462,26 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  private handleCloseTab(tabId: string): void {
+  private async handleCloseTab(tabId: string): Promise<void> {
     const runtime = this.runtimes.get(tabId);
     if (runtime) {
       this.stopRuntimeBridge(tabId, runtime);
       this.runtimes.delete(tabId);
     }
 
-    this.openTabIds = this.openTabIds.filter((id) => id !== tabId);
+    const wasSplit = this.paneTabs[1].length > 0;
+    for (const pane of [0, 1] as const) {
+      this.paneTabs[pane] = this.paneTabs[pane].filter((id) => id !== tabId);
+      if (this.paneActive[pane] === tabId) {
+        this.paneActive[pane] = null;
+      }
+    }
+    this.normalizePanes();
+    if (wasSplit && this.paneTabs[1].length === 0) {
+      this.postMessage({ type: "paneState", pane: 1, state: undefined });
+    }
 
-    if (this.activeKey === tabId) {
+    if (!this.activeKey) {
       if (this.openTabIds.length > 0) {
         void this.handleSwitchSession(this.openTabIds[0]);
         return;
@@ -1107,20 +1490,72 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       return;
     }
 
+    for (const pane of [0, 1] as const) {
+      const key = this.paneActive[pane];
+      if (key) {
+        await this.ensureRuntimeLoaded(key);
+      }
+    }
     this.persistActiveSession();
-    this.sendOpenTabs();
-    this.sendState();
+    this.sendPanesSnapshot();
+  }
+
+  /** Cursor-style "Close All": closes every open tab in both panes, except
+   * conversations with a turn still running — closing those would kill the
+   * work mid-flight. Closed sessions stay recoverable from History. */
+  private handleCloseAllTabs(): void {
+    const wasSplit = this.paneTabs[1].length > 0;
+    for (const pane of [0, 1] as const) {
+      const keep: string[] = [];
+      for (const id of this.paneTabs[pane]) {
+        const runtime = this.runtimes.get(id);
+        if (runtime?.streamingMessageId) {
+          keep.push(id);
+          continue;
+        }
+        if (runtime) {
+          this.stopRuntimeBridge(id, runtime);
+          this.persistRuntime(id, runtime);
+          this.runtimes.delete(id);
+        }
+        if (this.paneActive[pane] === id) {
+          this.paneActive[pane] = null;
+        }
+      }
+      this.paneTabs[pane] = keep;
+    }
+    this.normalizePanes();
+    if (wasSplit && this.paneTabs[1].length === 0) {
+      this.postMessage({ type: "paneState", pane: 1, state: undefined });
+    }
+    this.persistPanes();
+
+    if (!this.activeKey) {
+      if (this.openTabIds.length > 0) {
+        void this.handleSwitchSession(this.openTabIds[0]);
+        return;
+      }
+      this.handleNewConversation();
+      return;
+    }
+
+    this.sendPanesSnapshot();
   }
 
   private sendOpenTabs(): void {
     const names: Record<string, string> = {};
     const markers: Record<string, SessionMarker> = {};
+    const lastReplyAt: Record<string, number> = {};
     for (const id of this.openTabIds) {
       names[id] = this.tabNameFor(id);
       const rt = this.runtimes.get(id);
       if (rt) {
         this.ensureMarker(id, rt);
-        markers[id] = { emoji: rt.markerEmoji, color: rt.markerColor! };
+        markers[id] = {
+          emoji: rt.markerEmoji,
+          color: rt.markerColor!,
+          note: rt.markerNote,
+        };
       } else {
         // Tab not loaded into a runtime yet — its persisted marker still
         // identifies it in the strip.
@@ -1131,12 +1566,22 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           markers[id] = persisted;
         }
       }
+      const replyAt = this.lastReplyAtFor(id, rt);
+      if (replyAt) {
+        lastReplyAt[id] = replyAt;
+      }
     }
     this.postMessage({
       type: "openTabs",
       tabIds: this.openTabIds,
       names,
       markers,
+      lastReplyAt,
+      panes: [
+        { tabIds: [...this.paneTabs[0]], activeId: this.paneActive[0] },
+        { tabIds: [...this.paneTabs[1]], activeId: this.paneActive[1] },
+      ],
+      focusedPane: this.focusedPane,
     });
   }
 
@@ -1169,11 +1614,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     // "sticks" across new chats; switch per-conversation via the composer.
     this.runtimes.get(draftKey)!.accountId =
       this.context.globalState.get<string>("claude-luxure.lastAccountId") || "default";
-    this.openTabIds.unshift(draftKey);
-    this.activeKey = draftKey;
+    this.activeKey = draftKey; // setter inserts it into the focused strip
 
-    this.sendState();
-    this.sendOpenTabs();
+    this.sendPanesSnapshot();
     this.sendAccountsList();
     void this.pollUsageForActive();
   }
@@ -1285,11 +1728,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       rt.worktreeEnv = result.env;
       rt.worktreeBranch = result.branch;
       rt.sessionName = result.branch;
-      this.openTabIds.unshift(draftKey);
-      this.activeKey = draftKey;
+      this.activeKey = draftKey; // setter inserts it into the focused strip
 
-      this.sendState();
-      this.sendOpenTabs();
+      this.sendPanesSnapshot();
       this.sendAccountsList();
       void this.pollUsageForActive();
 
@@ -1457,23 +1898,39 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private async handleWebviewMessage(message: WebviewMessage): Promise<void> {
     log("INFO", "Webview message received:", message.type);
     switch (message.type) {
-      case "ready":
+      case "ready": {
         log("INFO", "Webview ready, sending state");
-        this.sendState();
-        this.sendOpenTabs();
+        this.sendPanesSnapshot();
+        if (this.paneTabs[1].length > 0) {
+          this.ensurePaneTicker();
+        }
         this.handleListSessions();
         this.sendAccountsList();
         void this.pollUsageForActive();
         break;
+      }
 
-      case "sendMessage":
+      case "sendMessage": {
         log("INFO", "sendMessage:", (message as any).text?.slice(0, 100));
+        // A composer in the unfocused pane targets ITS conversation: focus
+        // follows the send, deterministically, before the message is handled.
+        const targetTab = (message as { tabId?: string }).tabId;
+        if (targetTab && targetTab !== this.activeKey) {
+          const pane = this.paneOf(targetTab);
+          if (pane !== undefined && pane !== this.focusedPane) {
+            await this.handleFocusPane(pane);
+          }
+          if (this.paneActive[this.focusedPane] !== targetTab && this.paneOf(targetTab) !== undefined) {
+            await this.handleSwitchSession(targetTab);
+          }
+        }
         await this.handleSendMessage(
           message.text,
           message.images,
           message.mentions
         );
         break;
+      }
 
       case "editMessage":
         log("INFO", "editMessage:", message.messageId);
@@ -1502,41 +1959,50 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         break;
       }
 
-      case "mode":
-        this.mode = message.mode;
-        {
-          const runtime = this.getActiveRuntime();
-          if (runtime.bridge) {
-            runtime.bridge.restart({ mode: this.mode });
-          }
-        }
-        this.sendState();
+      case "dismissTask":
+        this.handleDismissTask(message.toolUseId);
         break;
 
-      case "changeModel":
+      // Mode/model/effort belong to the conversation being looked at; the
+      // provider-wide fields only serve as defaults for future conversations.
+      case "mode": {
+        const runtime = this.getActiveRuntime();
+        runtime.mode = message.mode;
+        this.mode = message.mode;
+        if (runtime.bridge) {
+          runtime.bridge.restart({ mode: message.mode });
+        }
+        this.persistSettingsFor(runtime);
+        this.sendState();
+        break;
+      }
+
+      case "changeModel": {
+        const runtime = this.getActiveRuntime();
+        runtime.model = message.model;
+        runtime.lastContext = undefined;
         this.model = message.model;
         this.context.workspaceState.update("claude-luxure.model", this.model);
-        {
-          const runtime = this.getActiveRuntime();
-          runtime.lastContext = undefined;
-          if (runtime.bridge) {
-            runtime.bridge.restart({ model: this.model });
-          }
+        if (runtime.bridge) {
+          runtime.bridge.restart({ model: message.model });
         }
+        this.persistSettingsFor(runtime);
         this.sendState();
         break;
+      }
 
-      case "changeEffort":
+      case "changeEffort": {
+        const runtime = this.getActiveRuntime();
+        runtime.effort = message.effort;
         this.effort = message.effort;
         this.context.workspaceState.update("claude-luxure.effort", this.effort);
-        {
-          const runtime = this.getActiveRuntime();
-          if (runtime.bridge) {
-            runtime.bridge.restart({ effort: this.effort });
-          }
+        if (runtime.bridge) {
+          runtime.bridge.restart({ effort: message.effort });
         }
+        this.persistSettingsFor(runtime);
         this.sendState();
         break;
+      }
 
       case "acceptChange":
         await this.diffManager.acceptChange(message.filePath);
@@ -1567,11 +2033,34 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         break;
 
       case "switchSession":
-        await this.handleSwitchSession(message.sessionId);
+        await this.handleSwitchSession(
+          message.sessionId,
+          message.pane === 1 ? 1 : message.pane === 0 ? 0 : undefined
+        );
         break;
 
       case "closeTab":
-        this.handleCloseTab(message.sessionId);
+        await this.handleCloseTab(message.sessionId);
+        break;
+
+      case "closeAllTabs":
+        this.handleCloseAllTabs();
+        break;
+
+      case "toggleSplit":
+        await this.handleToggleSplit();
+        break;
+
+      case "focusPane":
+        await this.handleFocusPane(message.pane === 1 ? 1 : 0);
+        break;
+
+      case "moveTab":
+        await this.handleMoveTab(
+          message.tabId,
+          message.pane === 1 ? 1 : 0,
+          message.index
+        );
         break;
 
       case "listSessions":
@@ -1649,8 +2138,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         void this.pollUsageForAll();
         break;
 
-      case "reevaluateMarker":
-        void this.evaluateMarker(this.getActiveRuntime());
+      case "setMarkerNote":
+        this.handleSetMarkerNote(message.note);
         break;
 
       case "summarizeSession":
@@ -2786,15 +3275,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (newKey !== oldKey) {
       this.runtimes.delete(oldKey);
       this.runtimes.set(newKey, runtime);
-      const tabIdx = this.openTabIds.indexOf(oldKey);
-      if (tabIdx >= 0) {
-        this.openTabIds[tabIdx] = newKey;
-      } else {
-        this.openTabIds.unshift(newKey);
-      }
-      if (this.activeKey === oldKey) {
-        this.activeKey = newKey;
-      }
+      this.renameTab(oldKey, newKey);
     }
   }
 
@@ -2806,11 +3287,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   ): Promise<void> {
     const runtimeKey = this.activeKey || this.createDraftRuntime();
     if (!this.activeKey) {
-      this.activeKey = runtimeKey;
-      if (!this.openTabIds.includes(runtimeKey)) {
-        this.openTabIds.unshift(runtimeKey);
-        this.sendOpenTabs();
-      }
+      this.activeKey = runtimeKey; // setter inserts it into the focused strip
+      this.sendOpenTabs();
     }
     const runtime = this.getActiveRuntime();
 
@@ -2907,9 +3385,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     const bridge = new ClaudeBridge({
       cwd,
-      mode: this.mode,
-      model: this.model,
-      effort: this.effort,
+      mode: runtime.mode ?? this.mode,
+      model: runtime.model ?? this.model,
+      effort: runtime.effort ?? this.effort,
       sessionId: runtime.sessionId,
       sessionName: runtime.sessionName,
       configDir,
@@ -3237,8 +3715,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           this.sendOpenTabs();
         } else if (!runtime.sessionId) {
           runtime.sessionId = newSessionId;
-          if (!this.openTabIds.includes(newSessionId)) {
-            this.openTabIds.unshift(newSessionId);
+          if (this.paneOf(newSessionId) === undefined) {
+            this.paneTabs[this.paneOf(runtimeKey) ?? this.focusedPane].unshift(newSessionId);
             this.sendOpenTabs();
           }
         }
@@ -3246,11 +3724,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         log("INFO", "Session ID captured:", newSessionId);
       }
 
-      if (
-        (status === "stopped" || status === "error") &&
-        runtime.streamingMessageId
-      ) {
-        this.finalizeStreamingMessage(runtimeKey, runtime, isActive());
+      if (status === "stopped" || status === "error") {
+        // Covers every path that ends the process (restarts for mode/model/
+        // account changes, crashes): running agents died with it.
+        const settled = this.settleRunningTasks(
+          runtime,
+          "Interrupted — the CLI process ended",
+          isActive()
+        );
+        if (runtime.streamingMessageId) {
+          this.finalizeStreamingMessage(runtimeKey, runtime, isActive());
+        } else if (settled > 0) {
+          this.persistRuntime(runtimeKey, runtime);
+        }
       }
 
       if (isActive()) {
@@ -3800,6 +4286,66 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     });
   }
 
+  /** Settle every task card still "running" in this conversation, so the
+   * "N agents working" strip can't outlive the work as a ghost. Called when
+   * the CLI process ends (its agents die with it) and when the silence
+   * watchdog ends a stalled turn. Safe against late truth: if an agent does
+   * report in afterwards, its completed/failed patch overrides this settle
+   * (mergeTaskInto only ignores "running" statuses). Returns how many cards
+   * were settled. */
+  private settleRunningTasks(
+    runtime: SessionRuntime,
+    summary: string,
+    active: boolean
+  ): number {
+    let settled = 0;
+    const settle = (acts?: ActivityEvent[], messageId?: string) => {
+      for (const a of acts || []) {
+        if (a.type === "task" && a.status === "running") {
+          a.status = "failed";
+          a.progressSummary = summary;
+          settled++;
+          this.postTaskUpdate(a, messageId, active);
+        }
+      }
+    };
+    for (const part of runtime.currentTimeline) {
+      if (part.type === "activities") {
+        settle(part.activities);
+      }
+    }
+    settle(runtime.currentActivities);
+    for (const m of runtime.messages) {
+      settle(m.activities, m.id);
+      for (const part of m.timeline || []) {
+        if (part.type === "activities") {
+          settle(part.activities, m.id);
+        }
+      }
+    }
+    return settled;
+  }
+
+  /** The user clicked ✕ on a stuck agent chip: mark that card settled so the
+   * strip lets go of it. Does not (cannot) stop the agent itself — if it later
+   * finishes for real, its completion patch still lands on the card. */
+  private handleDismissTask(toolUseId: string): void {
+    if (!this.activeKey) {
+      return;
+    }
+    const runtime = this.getActiveRuntime();
+    const found = this.findTaskActivity(runtime, toolUseId);
+    if (!found || found.task.status !== "running") {
+      return;
+    }
+    found.task.status = "failed";
+    found.task.progressSummary = "Dismissed";
+    if (found.messageId) {
+      this.persistRuntime(this.activeKey, runtime);
+    }
+    this.postTaskUpdate(found.task, found.messageId, this.isActiveKey(this.activeKey));
+  }
+
   /** Fold a system:task_* event into its card. task_progress carries the live
    * one-liner ("Reading a.txt") + usage counters; task_notification marks
    * completion — for background agents that lands after the turn finalized,
@@ -4051,6 +4597,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       return;
     }
     log("WARN", "Stream watchdog fired; ending stalled turn:", runtimeKey);
+    // The CLI (and therefore every agent) has been silent for the whole
+    // window — settle their cards along with the turn. If one does finish
+    // later, its completion patch still lands on the settled card.
+    this.settleRunningTasks(
+      runtime,
+      "No updates for a while — settled by the watchdog",
+      this.isActiveKey(runtimeKey)
+    );
     const notice =
       "\n\n---\n⏳ *This turn went quiet. The model may have left work running in the background, which this view can't resume on its own — send a message to continue.*";
     runtime.currentStreamText = (runtime.currentStreamText || "") + notice;
@@ -4108,12 +4662,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     runtime.streamingMessageId = null;
     runtime.currentStreamText = "";
     runtime.pendingParagraphBreak = false;
+    runtime.lastReplyAt = Date.now();
 
     if (runtime.bridge?.sessionId && !runtime.sessionId) {
       runtime.sessionId = runtime.bridge.sessionId;
     }
 
     this.persistRuntime(runtimeKey, runtime);
+    // Restart this tab's idle counter (and any background tab whose turn just
+    // settled) without waiting for the next full state push.
+    this.sendOpenTabs();
+    const otherPane = (1 - this.focusedPane) as 0 | 1;
+    if (this.paneActive[otherPane] === runtimeKey) {
+      this.sendPaneState(otherPane);
+    }
 
     if (notifyWebview) {
       this.postMessage({ type: "streamEnd" });
@@ -4272,38 +4834,48 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     return result;
   }
 
+  /** Serialize one conversation's full display state — used for the active
+   * conversation ("state") and for the one shown in the split pane. */
+  private buildStateFor(key: string, runtime: SessionRuntime): ExtensionState {
+    this.ensureMarker(key, runtime);
+    return {
+      marker: runtime.markerColor
+        ? {
+            emoji: runtime.markerEmoji,
+            color: runtime.markerColor,
+            note: runtime.markerNote,
+          }
+        : undefined,
+      mode: runtime.mode ?? this.mode,
+      model: runtime.model ?? this.model,
+      effort: runtime.effort ?? this.effort,
+      messages: this.decorateForks(runtime),
+      cliStatus: runtime.bridge?.status || runtime.cliStatus || "stopped",
+      pendingDiffs: this.diffManager.getPendingDiffs(),
+      sessionId: runtime.sessionId,
+      activeTabId: key,
+      isStreaming: !!runtime.streamingMessageId,
+      streamingText: runtime.currentStreamText,
+      runningSessionIds: this.getRunningSessionIds(),
+      cost: runtime.cost,
+      contextInfo: runtime.lastContext,
+      workspacePath: this.getWorkspacePath(),
+      accountEmail: this.accountEmail,
+      accountOrg: this.accountOrg,
+      slashCommands: this.slashCommands,
+      contextSummarized: runtime.contextSummarized ?? false,
+      // Live turn buffers — lets the webview restore the in-progress feed
+      // when the user switches back to a running conversation.
+      liveTimeline: runtime.currentTimeline,
+      liveActivities: runtime.currentActivities,
+    };
+  }
+
   private sendState(): void {
     const runtime = this.getActiveRuntime();
-    this.ensureMarker(this.activeKey!, runtime);
     this.postMessage({
       type: "state",
-      state: {
-        marker: runtime.markerColor
-          ? { emoji: runtime.markerEmoji, color: runtime.markerColor }
-          : undefined,
-        mode: this.mode,
-        model: this.model,
-        effort: this.effort,
-        messages: this.decorateForks(runtime),
-        cliStatus: runtime.bridge?.status || runtime.cliStatus || "stopped",
-        pendingDiffs: this.diffManager.getPendingDiffs(),
-        sessionId: runtime.sessionId,
-        activeTabId: this.activeKey,
-        isStreaming: !!runtime.streamingMessageId,
-        streamingText: runtime.currentStreamText,
-        runningSessionIds: this.getRunningSessionIds(),
-        cost: runtime.cost,
-        contextInfo: runtime.lastContext,
-        workspacePath: this.getWorkspacePath(),
-        accountEmail: this.accountEmail,
-        accountOrg: this.accountOrg,
-        slashCommands: this.slashCommands,
-        contextSummarized: runtime.contextSummarized ?? false,
-        // Live turn buffers — lets the webview restore the in-progress feed
-        // when the user switches back to a running conversation.
-        liveTimeline: runtime.currentTimeline,
-        liveActivities: runtime.currentActivities,
-      },
+      state: this.buildStateFor(this.activeKey!, runtime),
     });
   }
 
@@ -4313,6 +4885,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   dispose(): void {
     this.stopUsagePolling();
+    if (this.paneTicker) {
+      clearInterval(this.paneTicker);
+      this.paneTicker = undefined;
+    }
     for (const [key, runtime] of this.runtimes) {
       this.persistRuntime(key, runtime);
       runtime.bridge?.stop();

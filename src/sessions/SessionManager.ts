@@ -109,6 +109,17 @@ export class SessionManager {
     });
   }
 
+  /** mtime of a session's transcript, or null when it doesn't exist — the
+   * "last activity" proxy for conversations that predate lastReplyAt
+   * persistence (or whose transcript lives in another config dir). */
+  transcriptMtime(sessionId: string): number | null {
+    try {
+      return fs.statSync(path.join(this.sessionsDir, `${sessionId}.jsonl`)).mtimeMs;
+    } catch {
+      return null;
+    }
+  }
+
   async getSessionMessages(sessionId: string): Promise<Array<{ role: string; content: string; timestamp: string }>> {
     const filePath = path.join(this.sessionsDir, `${sessionId}.jsonl`);
     if (!fs.existsSync(filePath)) {

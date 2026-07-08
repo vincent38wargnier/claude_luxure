@@ -218,10 +218,13 @@ export interface SessionInfo {
 
 /** Visual identity mark for a conversation: a post-it color assigned when the
  * tab is created plus an emoji picked by a Haiku one-shot from the content.
- * Clicking the post-it re-evaluates the emoji against recent context. */
+ * Clicking the post-it opens a small editor for a user note; when a note is
+ * set the sticky shows the note instead of the emoji. */
 export interface SessionMarker {
   emoji?: string;
   color: string;
+  /** User-typed note shown on the sticky in place of the emoji when set. */
+  note?: string;
 }
 
 export type SkillScope = "global" | "project";
@@ -236,7 +239,7 @@ export interface SkillInfo {
 }
 
 export type WebviewMessage =
-  | { type: "sendMessage"; text: string; images?: string[]; mentions?: string[] }
+  | { type: "sendMessage"; text: string; images?: string[]; mentions?: string[]; tabId?: string }
   | { type: "editMessage"; messageId: string; text: string; images?: string[] }
   | { type: "switchFork"; anchorId: string; index: number }
   | { type: "cancelRequest" }
@@ -245,8 +248,18 @@ export type WebviewMessage =
   | { type: "changeEffort"; effort: EffortLevel }
   | { type: "newConversation" }
   | { type: "newWorktreeConversation" }
-  | { type: "switchSession"; sessionId: string }
+  | { type: "switchSession"; sessionId: string; pane?: number }
   | { type: "closeTab"; sessionId: string }
+  /** Close every open tab except conversations with a turn still running. */
+  | { type: "closeAllTabs" }
+  /** Open/close the second pane (a full side-by-side instance). */
+  | { type: "toggleSplit" }
+  /** The user started interacting with this pane — route real-time streaming
+   * (and the composer) to its conversation. */
+  | { type: "focusPane"; pane: number }
+  /** Drag & drop: reorder a tab within a strip or move it to the other pane,
+   * inserting at `index`. */
+  | { type: "moveTab"; tabId: string; pane: number; index: number }
   | { type: "listSessions" }
   | { type: "acceptChange"; filePath: string }
   | { type: "rejectChange"; filePath: string }
@@ -279,7 +292,8 @@ export type WebviewMessage =
   | { type: "summarizeSession"; sessionId: string }
   | { type: "summarizeAllSessions" }
   /** Post-it clicked: re-pick the active conversation's emoji from recent context. */
-  | { type: "reevaluateMarker" }
+  | { type: "setMarkerNote"; note: string }
+  | { type: "dismissTask"; toolUseId: string }
   /** Reply to an "annotateImage" render request: the burned-in PNG (data URL)
    * or the reason rendering failed. */
   | { type: "annotateResult"; requestId: string; dataUrl?: string; error?: string };
@@ -335,9 +349,20 @@ export type ExtensionMessage =
       names?: Record<string, string>;
       /** Post-it identity per tab (emoji shows in the tab strip). */
       markers?: Record<string, SessionMarker>;
+      /** Epoch ms of each tab's last completed reply — feeds the idle-time
+       * counter that flags conversations left waiting for a follow-up. */
+      lastReplyAt?: Record<string, number>;
+      /** Editor-group layout: which tabs live in which pane and what each pane
+       * shows. Pane 1 empty ⇔ split closed. */
+      panes?: { tabIds: string[]; activeId: string | null }[];
+      focusedPane?: number;
     }
   /** In-place update of one conversation's post-it (emoji picked / picking). */
   | { type: "markerUpdate"; key: string; marker: SessionMarker; busy?: boolean }
+  /** Full display state of the UNFOCUSED pane's conversation (the focused
+   * pane rides the real-time "state" + stream events). state undefined ⇒ the
+   * split closed. Re-pushed while that conversation streams. */
+  | { type: "paneState"; pane: number; state?: ExtensionState }
   | { type: "cliStatus"; status: "starting" | "ready" | "busy" | "error" | "stopped" }
   | { type: "slashCommands"; commands: string[] }
   | { type: "skillsList"; skills: SkillInfo[] }
