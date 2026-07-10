@@ -373,6 +373,13 @@ export default function ChatView({
                 editWillStopRun={isStreaming}
                 mode={mode}
                 model={model}
+                workspacePath={workspacePath}
+                externalFiles={
+                  editingMessageId === msg.id ? externalFiles : undefined
+                }
+                onClearExternalFiles={
+                  editingMessageId === msg.id ? onClearExternalFiles : undefined
+                }
                 onStartEdit={() => handleStartEdit(msg.id)}
                 onSubmitEdit={(text, images) =>
                   handleSubmitEdit(msg.id, text, images)
@@ -513,7 +520,7 @@ export default function ChatView({
         accountOrg={accountOrg}
         slashCommands={slashCommands}
         workspacePath={workspacePath}
-        externalFiles={externalFiles}
+        externalFiles={editingMessageId ? undefined : externalFiles}
         onClearExternalFiles={onClearExternalFiles}
         onSend={onSend}
         onCancel={onCancel}

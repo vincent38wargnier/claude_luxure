@@ -20,6 +20,10 @@ interface MessageRowProps {
   editWillStopRun?: boolean;
   mode?: Mode;
   model?: string;
+  workspacePath?: string;
+  /** Host answers for files dropped on the open editor (see EditableUserMessage). */
+  externalFiles?: string[];
+  onClearExternalFiles?: () => void;
   onStartEdit?: () => void;
   onSubmitEdit?: (text: string, images?: string[]) => void;
   onCancelEdit?: () => void;
@@ -45,6 +49,9 @@ export default function MessageRow({
   editWillStopRun,
   mode,
   model,
+  workspacePath,
+  externalFiles,
+  onClearExternalFiles,
   onStartEdit,
   onSubmitEdit,
   onCancelEdit,
@@ -112,6 +119,9 @@ export default function MessageRow({
           willStopRun={editWillStopRun}
           mode={mode || "agent"}
           model={model}
+          workspacePath={workspacePath}
+          externalFiles={externalFiles}
+          onClearExternalFiles={onClearExternalFiles}
           onModeChange={onModeChange}
           onModelChange={onModelChange}
           onSubmit={onSubmitEdit}

@@ -16,6 +16,15 @@ import ModelSelector from "./ModelSelector";
 import ContextMenu from "./ContextMenu";
 import SlashCommandMenu from "./SlashCommandMenu";
 import Thumbnails from "../common/Thumbnails";
+import {
+  MAX_IMAGES,
+  MAX_DROP_FILE_MB,
+  classifyDrop,
+  filesToBase64,
+  imageFilesFromClipboard,
+  pathsFromUriList,
+  toRelativePath,
+} from "./imageAttachments";
 import AccountSwitcher from "./AccountSwitcher";
 import UsageBars from "./UsageBars";
 import {
@@ -69,11 +78,6 @@ interface ChatTextAreaProps {
   onReauthAccount?: (accountId: string) => void;
 }
 
-const MAX_IMAGES = 10;
-// External drops travel through postMessage as base64 — cap them so a stray
-// video doesn't stall the webview bridge.
-const MAX_DROP_FILE_MB = 25;
-const MAX_DROP_FILE_BYTES = MAX_DROP_FILE_MB * 1024 * 1024;
 
 /** A small colored dot summarizing overall MCP health, derived from the live
  * session lifecycle: green = connected, amber (pulsing) = connecting/restarting,
@@ -112,18 +116,7 @@ function McpStatusDot({ servers }: { servers?: McpServerStatus[] }) {
     />
   );
 }
-const ACCEPTED_IMAGE_TYPES = ["image/png", "image/jpeg", "image/webp"];
 const MENTION_REGEX = /@[\w.\/\-\\]+/g;
-
-function toRelativePath(absPath: string, workspacePath?: string): string {
-  if (!workspacePath) return absPath;
-  const normalized = absPath.replace(/\\/g, "/");
-  const normalizedWs = workspacePath.replace(/\\/g, "/").replace(/\/$/, "");
-  if (normalized.startsWith(normalizedWs + "/")) {
-    return normalized.slice(normalizedWs.length + 1);
-  }
-  return absPath;
-}
 
 function renderHighlightedText(text: string) {
   const parts: React.ReactNode[] = [];
@@ -660,14 +653,7 @@ export default function ChatTextArea({
 
   const handlePaste = useCallback(
     (e: React.ClipboardEvent) => {
-      const items = e.clipboardData?.items;
-      if (!items) return;
-
-      const imageFiles = Array.from(items)
-        .filter((item) => ACCEPTED_IMAGE_TYPES.includes(item.type))
-        .map((item) => item.getAsFile())
-        .filter((f): f is File => f !== null);
-
+      const imageFiles = imageFilesFromClipboard(e);
       if (imageFiles.length === 0) return;
 
       e.preventDefault();
@@ -689,17 +675,7 @@ export default function ChatTextArea({
   /** Insert `@path` mentions for a newline-separated path/uri list. */
   const insertPathMentions = useCallback(
     (rawPaths: string) => {
-      const paths = rawPaths
-        .split("\n")
-        .map((p: string) => p.trim())
-        .filter(Boolean)
-        .map((p: string) => {
-          if (p.startsWith("file://")) {
-            return decodeURIComponent(p.slice(7));
-          }
-          return p;
-        })
-        .map((p: string) => toRelativePath(p, workspacePath));
+      const paths = pathsFromUriList(rawPaths, workspacePath);
 
       if (paths.length === 0) return;
 
@@ -713,92 +689,40 @@ export default function ChatTextArea({
     (e: React.DragEvent) => {
       e.preventDefault();
       setIsDragOver(false);
+      const drop = classifyDrop(e);
 
       // Drags that carry real paths (VS Code explorer / editor tabs, and any
       // source that sets file:// uris) mention the original file directly.
-      const codeUriList = e.dataTransfer.getData(
-        "application/vnd.code.uri-list"
-      );
-      const fileUris = e.dataTransfer
-        .getData("text/uri-list")
-        .split("\n")
-        .map((l) => l.trim())
-        .filter((l) => l.startsWith("file://"))
-        .join("\n");
-      const pathList = (codeUriList || fileUris).trim();
-      if (pathList) {
-        insertPathMentions(pathList);
+      if (drop.pathList) {
+        insertPathMentions(drop.pathList);
         return;
       }
 
-      // Drops from outside VS Code (Finder, browsers…) arrive as blobs only —
-      // the sandboxed webview never sees their real path. Collect the files,
-      // skipping folders, which FileReader can't ingest.
-      const items = Array.from(e.dataTransfer.items ?? []).filter(
-        (it) => it.kind === "file"
-      );
-      let droppedFiles: File[] = [];
-      let folderCount = 0;
-      if (items.length > 0) {
-        for (const it of items) {
-          if (it.webkitGetAsEntry?.()?.isDirectory) {
-            folderCount++;
-            continue;
-          }
-          const f = it.getAsFile();
-          if (f) droppedFiles.push(f);
-        }
-      } else {
-        droppedFiles = Array.from(e.dataTransfer.files);
-      }
-      if (folderCount > 0) {
+      if (drop.folderCount > 0) {
         showNotice(
           "Folders can't be dropped from outside VS Code — drop files instead"
         );
       }
 
-      if (droppedFiles.length > 0) {
-        const images = droppedFiles.filter((f) =>
-          ACCEPTED_IMAGE_TYPES.includes(f.type)
-        );
-        if (images.length > 0) {
-          attachImageFiles(images);
+      // Drops from outside VS Code (Finder, browsers…) arrive as blobs only —
+      // the sandboxed webview never sees their real path.
+      if (
+        drop.images.length > 0 ||
+        drop.sendable.length > 0 ||
+        drop.oversizeCount > 0
+      ) {
+        if (drop.images.length > 0) {
+          attachImageFiles(drop.images);
         }
-
-        // Everything else goes to the extension host, which writes a temp
-        // copy and answers with an `addFile` → `@mention` for each.
-        const others = droppedFiles.filter(
-          (f) => !ACCEPTED_IMAGE_TYPES.includes(f.type)
-        );
-        const sendable = others.filter((f) => f.size <= MAX_DROP_FILE_BYTES);
-        if (others.length > sendable.length) {
+        if (drop.oversizeCount > 0) {
           showNotice(
-            `Files over ${MAX_DROP_FILE_MB}MB can't be attached — ${others.length - sendable.length} skipped`
+            `Files over ${MAX_DROP_FILE_MB}MB can't be attached — ${drop.oversizeCount} skipped`
           );
         }
-        if (sendable.length > 0) {
-          void Promise.all(
-            sendable.map(
-              (f) =>
-                new Promise<{ name: string; dataBase64: string } | null>(
-                  (resolve) => {
-                    const reader = new FileReader();
-                    reader.onload = () => {
-                      const dataUrl = reader.result as string;
-                      resolve({
-                        name: f.name,
-                        dataBase64: dataUrl.slice(dataUrl.indexOf(",") + 1),
-                      });
-                    };
-                    reader.onerror = () => resolve(null);
-                    reader.readAsDataURL(f);
-                  }
-                )
-            )
-          ).then((results) => {
-            const files = results.filter(
-              (r): r is { name: string; dataBase64: string } => r !== null
-            );
+        // Everything else goes to the extension host, which writes a temp
+        // copy and answers with an `addFile` → `@mention` for each.
+        if (drop.sendable.length > 0) {
+          void filesToBase64(drop.sendable).then((files) => {
             if (files.length > 0) {
               vscode.postMessage({ type: "saveDroppedFiles", files });
             }
@@ -808,9 +732,8 @@ export default function ChatTextArea({
       }
 
       // Last resort: dragged text (a path from a terminal, etc.).
-      const text = e.dataTransfer.getData("text/plain").trim();
-      if (text) {
-        insertPathMentions(text);
+      if (drop.text) {
+        insertPathMentions(drop.text);
       }
     },
     [insertPathMentions, attachImageFiles, showNotice]
