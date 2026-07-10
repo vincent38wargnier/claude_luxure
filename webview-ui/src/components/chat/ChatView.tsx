@@ -1,4 +1,5 @@
 import { useRef, useEffect, useState, useCallback, Fragment } from "react";
+import { useRenderPerf } from "../../perf";
 import type { ChatMessage, CostInfo, ContextInfo, ActivityEvent, TaskActivity, TimelinePart, SessionInfo, SessionMarker, Mode, EffortLevel, PendingDiff, McpServerStatus, StoredAccount, UsageInfo, QueuedMessage } from "../../types";
 import MessageRow from "./MessageRow";
 import ChatTextArea from "./ChatTextArea";
@@ -202,6 +203,8 @@ export default function ChatView({
   onEditMessage,
   onSwitchFork,
 }: ChatViewProps) {
+  // Lag diagnostics: flags expensive transcript re-renders (React commit time).
+  useRenderPerf("ChatView", { msgs: messages.length, pane: paneIndex });
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const stickToBottomRef = useRef(true);
@@ -237,12 +240,22 @@ export default function ChatView({
   }, [messages, streamingText]);
 
   // Switching conversations starts pinned to the latest message; an open
-  // note editor belongs to the previous conversation, so drop it too.
+  // note editor or message editor belongs to the previous conversation.
   useEffect(() => {
     stickToBottomRef.current = true;
     messagesEndRef.current?.scrollIntoView({ behavior: "auto" });
     setNoteModalOpen(false);
+    setEditingMessageId(null);
   }, [activeTabId]);
+
+  // Self-heal an orphaned editor: if the message being edited vanished from
+  // the list (fork rewind, stop, reload), the editor renders nowhere while
+  // editingMessageId keeps every other bubble's edit permanently disabled.
+  useEffect(() => {
+    if (editingMessageId && !messages.some((m) => m.id === editingMessageId)) {
+      setEditingMessageId(null);
+    }
+  }, [messages, editingMessageId]);
 
   const handleReview = useCallback(() => {
     setShowReview((prev) => !prev);
@@ -270,7 +283,9 @@ export default function ChatView({
 
 
   return (
-    <div className="flex flex-col h-full">
+    // data-pane-root scopes the Lightbox's gallery collection to this
+    // instance's transcript (each split pane is its own gallery).
+    <div className="flex flex-col h-full" data-pane-root="">
       {/* Tab bar */}
       <TabBar
         sessions={sessions}

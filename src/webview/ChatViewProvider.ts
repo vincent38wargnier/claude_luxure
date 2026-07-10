@@ -36,6 +36,13 @@ import {
 } from "../shared/types";
 import { extractMentions, resolveFromMention } from "../utils/path-mentions";
 import { log } from "../utils/logger";
+import {
+  PERF,
+  measureStatePayload,
+  perfLog,
+  r1,
+  startLoopLagSampler,
+} from "../utils/perf";
 import { resolveClaudePath } from "../utils/claude-path";
 import { provisionWorktree } from "../worktree/provisioner";
 import { generateRecipe } from "../worktree/recipe-generator";
@@ -432,6 +439,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     });
     this.model = this.context.workspaceState.get<string>("claude-luxure.model");
     this.effort = this.context.workspaceState.get<EffortLevel>("claude-luxure.effort");
+    startLoopLagSampler();
     this.fetchAccountInfo();
     this.restoreLastSession();
   }
@@ -1246,6 +1254,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   private paneTicker?: ReturnType<typeof setInterval>;
 
+  /** perfId of an in-flight tab switch — echoed on the next state send so the
+   * webview can correlate its click → state → painted waterfall. */
+  private pendingStatePerfId?: string;
+
   private ensurePaneTicker(): void {
     if (this.paneTicker) {
       return;
@@ -1258,13 +1270,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       const key = this.paneActive[other];
       const rt = key ? this.runtimes.get(key) : undefined;
       if (rt?.streamingMessageId) {
-        this.sendPaneState(other);
+        this.sendPaneState(other, "ticker");
       }
     }, 900);
   }
 
   /** Full display state for the UNFOCUSED pane's conversation. */
-  private sendPaneState(pane: 0 | 1): void {
+  private sendPaneState(pane: 0 | 1, via: "push" | "ticker" = "push"): void {
     if (this.paneTabs[1].length === 0) {
       return;
     }
@@ -1273,11 +1285,25 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (!key || !runtime) {
       return;
     }
+    const t0 = performance.now();
+    const state = this.buildStateFor(key, runtime);
+    const tBuilt = performance.now();
     this.postMessage({
       type: "paneState",
       pane,
-      state: this.buildStateFor(key, runtime),
+      state,
+      perfSentAt: Date.now(),
     });
+    if (PERF) {
+      perfLog("paneState.sent", {
+        via,
+        pane,
+        sid: key.slice(-8),
+        ...measureStatePayload(state),
+        buildMs: r1(tBuilt - t0),
+        postMs: r1(performance.now() - tBuilt),
+      });
+    }
   }
 
   /** Layout + fresh state for both panes, in the order the webview needs:
@@ -1294,6 +1320,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (pane === this.focusedPane || (pane === 1 && this.paneTabs[1].length === 0)) {
       return;
     }
+    const t0 = performance.now();
     this.persistActiveSession();
     const demoted = this.focusedPane;
     this.focusedPane = pane;
@@ -1309,6 +1336,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.sendPaneState(demoted);
     this.sendAccountsList();
     void this.pollUsageForActive();
+    perfLog("focus.done", { pane, totalMs: r1(performance.now() - t0) });
   }
 
   /** Drag & drop: reorder within a strip, or move a conversation to the other
@@ -1416,8 +1444,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   /** Show a conversation: if its tab is already open in either pane, that pane
    * takes focus (VS Code-style); otherwise it opens in `pane` (default: the
    * focused one). */
-  private async handleSwitchSession(sessionId: string, pane?: 0 | 1): Promise<void> {
+  private async handleSwitchSession(
+    sessionId: string,
+    pane?: 0 | 1,
+    perfId?: string
+  ): Promise<void> {
+    const t0 = performance.now();
+    this.pendingStatePerfId = perfId;
     this.persistActiveSession();
+    const tPersisted = performance.now();
 
     const existing = this.paneOf(sessionId);
     const target = existing ?? (pane !== undefined && this.paneTabs[1].length > 0 ? pane : this.focusedPane);
@@ -1427,13 +1462,25 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.focusedPane = target;
     this.paneActive[target] = sessionId;
 
+    const tLoad = performance.now();
     await this.ensureRuntimeLoaded(sessionId);
+    const tLoaded = performance.now();
 
     this.context.workspaceState.update("claude-luxure.lastSessionId", sessionId);
     this.persistActiveSession();
+    const tSnap = performance.now();
     this.sendPanesSnapshot();
+    const tDone = performance.now();
     this.sendAccountsList();
     void this.pollUsageForActive();
+    perfLog("sw.done", {
+      perfId,
+      sid: sessionId.slice(-8),
+      totalMs: r1(tDone - t0),
+      persistMs: r1(tPersisted - t0 + (tSnap - tLoaded)),
+      loadMs: r1(tLoaded - tLoad),
+      snapshotMs: r1(tDone - tSnap),
+    });
   }
 
   private stopRuntimeBridge(key: string, runtime: SessionRuntime): void {
@@ -1543,6 +1590,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   private sendOpenTabs(): void {
+    const perfT0 = performance.now();
     const names: Record<string, string> = {};
     const markers: Record<string, SessionMarker> = {};
     const lastReplyAt: Record<string, number> = {};
@@ -1583,6 +1631,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       ],
       focusedPane: this.focusedPane,
     });
+    const perfMs = performance.now() - perfT0;
+    if (perfMs > 5) {
+      // tabNameFor reads persisted transcripts for tabs without a runtime —
+      // the usual reason this gets slow as tabs pile up.
+      perfLog("tabs.sent", { tabs: this.openTabIds.length, ms: r1(perfMs) });
+    }
   }
 
   /** A human-readable tab label: the session's name, else its first real user
@@ -1896,6 +1950,25 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   private async handleWebviewMessage(message: WebviewMessage): Promise<void> {
+    if (message.type === "perfEvent") {
+      // Webview-side lag diagnostics land in the same log as host-side ones.
+      perfLog(`wv.${message.event}`, message.fields ?? {});
+      return;
+    }
+    const perfT0 = performance.now();
+    try {
+      await this.handleWebviewMessageInner(message);
+    } finally {
+      const ms = performance.now() - perfT0;
+      if (ms > 20) {
+        // Includes awaited async time, not just CPU — the sw.done / focus.done
+        // breakdowns disambiguate for the switch paths.
+        perfLog("host.msg.slow", { type: message.type, ms: r1(ms) });
+      }
+    }
+  }
+
+  private async handleWebviewMessageInner(message: WebviewMessage): Promise<void> {
     log("INFO", "Webview message received:", message.type);
     switch (message.type) {
       case "ready": {
@@ -2035,7 +2108,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       case "switchSession":
         await this.handleSwitchSession(
           message.sessionId,
-          message.pane === 1 ? 1 : message.pane === 0 ? 0 : undefined
+          message.pane === 1 ? 1 : message.pane === 0 ? 0 : undefined,
+          message.perfId
         );
         break;
 
@@ -2085,6 +2159,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         }
         break;
       }
+
+      case "openImageInEditor":
+        await this.handleOpenImageInEditor(message.dataUrl, message.label);
+        break;
 
       case "openDiff":
         await this.handleOpenDiff(message.filePath);
@@ -4795,6 +4873,46 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
+  /** Lightbox "open in editor tab": write the chat image (a data URL) to a
+   * temp file and open it in a real editor tab — the native image preview
+   * gives a full-window view with its own zoom, which the sidebar can't. */
+  private async handleOpenImageInEditor(
+    dataUrl: string,
+    label?: string
+  ): Promise<void> {
+    const match = /^data:image\/(png|jpeg|jpg|webp|gif|bmp);base64,(.+)$/.exec(
+      dataUrl
+    );
+    if (!match) {
+      vscode.window.showErrorMessage(
+        "This image can't be opened in an editor tab."
+      );
+      return;
+    }
+    try {
+      const ext = match[1] === "jpeg" ? "jpg" : match[1];
+      const dir = path.join(os.tmpdir(), "claude-luxure-images");
+      fs.mkdirSync(dir, { recursive: true });
+      const safe =
+        (label || "image").replace(/[^\w.-]+/g, "-").slice(0, 40) || "image";
+      const filePath = path.join(
+        dir,
+        `${safe}-${Date.now().toString(36)}.${ext}`
+      );
+      fs.writeFileSync(filePath, Buffer.from(match[2], "base64"));
+      await vscode.commands.executeCommand(
+        "vscode.open",
+        vscode.Uri.file(filePath),
+        vscode.ViewColumn.Active
+      );
+    } catch (err) {
+      log("ERROR", "openImageInEditor failed:", String(err));
+      vscode.window.showErrorMessage(
+        "Could not open the image in an editor tab."
+      );
+    }
+  }
+
   private postMessage(message: ExtensionMessage): void {
     this.webview?.postMessage(message);
   }
@@ -4873,10 +4991,26 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   private sendState(): void {
     const runtime = this.getActiveRuntime();
+    const perfId = this.pendingStatePerfId;
+    this.pendingStatePerfId = undefined;
+    const t0 = performance.now();
+    const state = this.buildStateFor(this.activeKey!, runtime);
+    const tBuilt = performance.now();
     this.postMessage({
       type: "state",
-      state: this.buildStateFor(this.activeKey!, runtime),
+      state,
+      perfId,
+      perfSentAt: Date.now(),
     });
+    if (PERF) {
+      perfLog("state.sent", {
+        perfId,
+        sid: state.sessionId?.slice(-8),
+        ...measureStatePayload(state),
+        buildMs: r1(tBuilt - t0),
+        postMs: r1(performance.now() - tBuilt),
+      });
+    }
   }
 
   getDiffManager(): DiffManager {

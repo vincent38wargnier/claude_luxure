@@ -1,5 +1,15 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import vscode from "./vscode";
+import {
+  PERF,
+  countMessage,
+  installPerfMonitors,
+  markSwitch,
+  markSwitchPainted,
+  perfLog,
+  r1,
+  switchExtras,
+} from "./perf";
 import ChatView from "./components/chat/ChatView";
 import { coalesceActivities } from "./components/chat/ActivityFeed";
 import { renderAnnotatedImage } from "./utils/annotate";
@@ -133,6 +143,9 @@ export default function App() {
 
   const handleMessage = useCallback((event: MessageEvent) => {
     const msg = event.data as ExtensionMessage;
+    const perfT0 = performance.now();
+    let perfExtra: Record<string, unknown> | undefined;
+    countMessage(msg.type);
 
     switch (msg.type) {
       case "state": {
@@ -159,6 +172,19 @@ export default function App() {
           const key = msg.state.activeTabId;
           const marker = msg.state.marker;
           setTabMarkers((prev) => ({ ...prev, [key]: marker }));
+        }
+        if (PERF) {
+          perfExtra = {
+            ...(switchExtras(msg.perfId) ?? {}),
+            transportMs: msg.perfSentAt
+              ? Date.now() - msg.perfSentAt
+              : undefined,
+            msgs: msg.state.messages.length,
+            live:
+              (msg.state.liveTimeline?.length ?? 0) +
+              (msg.state.liveActivities?.length ?? 0),
+          };
+          markSwitchPainted(msg.perfId);
         }
         break;
       }
@@ -418,6 +444,15 @@ export default function App() {
       case "paneState": {
         const { pane, state: paneState } = msg;
         setPushedPanes((prev) => ({ ...prev, [pane]: paneState ?? null }));
+        if (PERF) {
+          perfExtra = {
+            pane,
+            transportMs: msg.perfSentAt
+              ? Date.now() - msg.perfSentAt
+              : undefined,
+            msgs: paneState?.messages.length ?? 0,
+          };
+        }
         break;
       }
 
@@ -474,6 +509,14 @@ export default function App() {
         setTimeout(() => setSavedFlash(false), 2000);
         break;
     }
+
+    if (PERF) {
+      const ms = performance.now() - perfT0;
+      // Always log the heavy full-state pushes; anything else only when slow.
+      if (msg.type === "state" || msg.type === "paneState" || ms > 8) {
+        perfLog("msg", { type: msg.type, ms: r1(ms), ...(perfExtra ?? {}) });
+      }
+    }
   }, []);
 
   useEffect(() => {
@@ -481,6 +524,9 @@ export default function App() {
     vscode.postMessage({ type: "ready" });
     return () => window.removeEventListener("message", handleMessage);
   }, [handleMessage]);
+
+  // Lag diagnostics: long-task observer + event-loop sampler for this thread.
+  useEffect(() => installPerfMonitors(), []);
 
   // Agents still working right now — from finalized messages AND the live turn
   // (a background agent outlives its turn). Last sighting of a card wins, so a
@@ -680,7 +726,12 @@ export default function App() {
   }, []);
 
   const handleSwitchSession = useCallback((sessionId: string, pane?: number) => {
-    vscode.postMessage({ type: "switchSession", sessionId, pane });
+    vscode.postMessage({
+      type: "switchSession",
+      sessionId,
+      pane,
+      perfId: markSwitch(sessionId),
+    });
   }, []);
 
   const handleCloseTab = useCallback((sessionId: string) => {

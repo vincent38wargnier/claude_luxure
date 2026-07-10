@@ -1,7 +1,9 @@
 import * as fs from "fs";
 import * as path from "path";
 
-const LOG_FILE = path.join(__dirname, "..", "..", "claude-luxure.log");
+// __dirname is the bundled dist/ — one level up lands the log at the repo
+// root (it used to escape to the repo's PARENT directory).
+const LOG_FILE = path.join(__dirname, "..", "claude-luxure.log");
 
 export function log(level: string, ...args: unknown[]): void {
   const timestamp = new Date().toISOString();

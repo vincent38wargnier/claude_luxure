@@ -1,5 +1,6 @@
 node_modules/
 dist/
+claude-luxure.log
 *.vsix
 webview-ui/node_modules/
 webview-ui/dist/

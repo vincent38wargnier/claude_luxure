@@ -248,7 +248,7 @@ export type WebviewMessage =
   | { type: "changeEffort"; effort: EffortLevel }
   | { type: "newConversation" }
   | { type: "newWorktreeConversation" }
-  | { type: "switchSession"; sessionId: string; pane?: number }
+  | { type: "switchSession"; sessionId: string; pane?: number; perfId?: string }
   | { type: "closeTab"; sessionId: string }
   /** Close every open tab except conversations with a turn still running. */
   | { type: "closeAllTabs" }
@@ -276,6 +276,9 @@ export type WebviewMessage =
   | { type: "openFile"; filePath: string }
   | { type: "openDiff"; filePath: string }
   | { type: "openExternal"; url: string }
+  /** Lightbox "open in editor tab": the host writes the data URL to a temp
+   * file and opens VS Code's native image preview (full-window, zoomable). */
+  | { type: "openImageInEditor"; dataUrl: string; label?: string }
   | { type: "ready" }
   | { type: "listSkills" }
   | { type: "readSkill"; skillId: string }
@@ -294,6 +297,9 @@ export type WebviewMessage =
   /** Post-it clicked: re-pick the active conversation's emoji from recent context. */
   | { type: "setMarkerNote"; note: string }
   | { type: "dismissTask"; toolUseId: string }
+  /** Webview-side lag diagnostics, mirrored into the extension's log file
+   * (prefixed `wv.`) so host and webview timings line up in one place. */
+  | { type: "perfEvent"; event: string; fields?: Record<string, unknown> }
   /** Reply to an "annotateImage" render request: the burned-in PNG (data URL)
    * or the reason rendering failed. */
   | { type: "annotateResult"; requestId: string; dataUrl?: string; error?: string };
@@ -310,7 +316,9 @@ export interface McpServerStatus {
 }
 
 export type ExtensionMessage =
-  | { type: "state"; state: ExtensionState }
+  /** perfId echoes a pending tab switch's id; perfSentAt (epoch ms) lets the
+   * webview measure IPC transport + queue delay. Diagnostics only. */
+  | { type: "state"; state: ExtensionState; perfId?: string; perfSentAt?: number }
   | { type: "mcpStatus"; servers: McpServerStatus[] }
   | { type: "streamToken"; text: string }
   | { type: "streamEnd" }
@@ -362,7 +370,7 @@ export type ExtensionMessage =
   /** Full display state of the UNFOCUSED pane's conversation (the focused
    * pane rides the real-time "state" + stream events). state undefined ⇒ the
    * split closed. Re-pushed while that conversation streams. */
-  | { type: "paneState"; pane: number; state?: ExtensionState }
+  | { type: "paneState"; pane: number; state?: ExtensionState; perfSentAt?: number }
   | { type: "cliStatus"; status: "starting" | "ready" | "busy" | "error" | "stopped" }
   | { type: "slashCommands"; commands: string[] }
   | { type: "skillsList"; skills: SkillInfo[] }

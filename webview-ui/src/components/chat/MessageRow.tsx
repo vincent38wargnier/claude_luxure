@@ -1,6 +1,7 @@
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { Check, RefreshCw } from "lucide-react";
+import { Check, Copy, Pencil, RefreshCw } from "lucide-react";
+import { useState } from "react";
 import type { ReactNode, MouseEvent as ReactMouseEvent } from "react";
 import vscode from "../../vscode";
 import type { ChatMessage, Mode, ActivityEvent, TimelinePart } from "../../types";
@@ -55,6 +56,16 @@ export default function MessageRow({
   const isUser = message.role === "user";
   const isSystem = message.role === "system";
   const isStreaming = message.isStreaming && streamingContent !== undefined;
+  const [copied, setCopied] = useState(false);
+
+  const handleCopy = () => {
+    void navigator.clipboard
+      .writeText(cleanUserContent(message.content))
+      .then(() => {
+        setCopied(true);
+        setTimeout(() => setCopied(false), 1200);
+      });
+  };
 
   // When a message is tagged with a failed account (a 401/403 from the CLI), show
   // an inline "Reconnect" button. The tag can land on a system error *or* on the
@@ -153,27 +164,62 @@ export default function MessageRow({
             <ImageGrid images={message.images} altPrefix="Attachment" />
           </div>
         )}
-        <button
-          type="button"
-          onClick={canEdit ? onStartEdit : undefined}
-          disabled={!canEdit}
-          className={`w-full text-left bg-[var(--app-surface-2)] rounded-lg px-3 py-2.5 transition-colors ${
-            canEdit
-              ? "cursor-pointer hover:ring-1 hover:ring-[rgba(255,255,255,0.1)]"
-              : "cursor-default"
+        {/* A div, not a button: button text can't be selected, which made
+            copying a sent message impossible. Click still opens the editor —
+            unless the click ends a text selection (that's a copy gesture). */}
+        <div
+          className={`group/msg relative w-full text-left bg-[var(--app-surface-2)] rounded-lg px-3 py-2.5 transition-colors ${
+            canEdit ? "hover:ring-1 hover:ring-[rgba(255,255,255,0.1)]" : ""
           }`}
-          title={
-            canEdit
-              ? editWillStopRun
-                ? "Click to edit — resending stops the current run and restarts from here"
-                : "Click to edit and resend from here"
-              : undefined
-          }
         >
-          <div className="text-sm text-vscode-fg whitespace-pre-wrap">
+          <div
+            className="text-sm text-vscode-fg whitespace-pre-wrap select-text cursor-text"
+            onClick={
+              canEdit && onStartEdit
+                ? () => {
+                    if (window.getSelection()?.isCollapsed !== false) {
+                      onStartEdit();
+                    }
+                  }
+                : undefined
+            }
+            title={
+              canEdit
+                ? editWillStopRun
+                  ? "Click to edit — resending stops the current run and restarts from here"
+                  : "Click to edit and resend from here"
+                : undefined
+            }
+          >
             {cleanContent}
           </div>
-        </button>
+          <div className="absolute -top-2.5 right-2 flex gap-0.5 rounded-md border border-[var(--app-border)] bg-[var(--app-surface-2)] px-0.5 py-0.5 shadow-sm opacity-0 group-hover/msg:opacity-100 focus-within:opacity-100 transition-opacity">
+            <button
+              type="button"
+              onClick={handleCopy}
+              aria-label="Copy message text"
+              title={copied ? "Copied" : "Copy"}
+              className="p-1 rounded text-vscode-descriptionFg hover:text-vscode-fg transition-colors"
+            >
+              {copied ? <Check size={12} /> : <Copy size={12} />}
+            </button>
+            {canEdit && onStartEdit && (
+              <button
+                type="button"
+                onClick={onStartEdit}
+                aria-label="Edit and resend from here"
+                title={
+                  editWillStopRun
+                    ? "Edit — resending stops the current run"
+                    : "Edit and resend from here"
+                }
+                className="p-1 rounded text-vscode-descriptionFg hover:text-vscode-fg transition-colors"
+              >
+                <Pencil size={12} />
+              </button>
+            )}
+          </div>
+        </div>
       </div>
     );
   }

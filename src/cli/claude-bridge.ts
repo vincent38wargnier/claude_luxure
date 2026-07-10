@@ -1,6 +1,7 @@
 import { spawn, ChildProcess } from "child_process";
 import { EventEmitter } from "events";
 import * as readline from "readline";
+import { PERF, perfLog, r1 } from "../utils/perf";
 import type { ContextInfo, Mode, EffortLevel } from "../shared/types";
 import {
   contextTokensUsed,
@@ -398,11 +399,23 @@ export class ClaudeBridge extends EventEmitter {
     }
 
     let event: ClaudeEvent;
+    // A multi-MB stream line (usually a tool result carrying images) parses
+    // synchronously on the extension host — a prime lag suspect, since it
+    // stalls every conversation's UI at once.
+    const bigLine = PERF && trimmed.length >= 200_000;
+    const parseT0 = bigLine ? performance.now() : 0;
     try {
       event = JSON.parse(trimmed);
     } catch {
       this.emit("rawOutput", trimmed);
       return;
+    }
+    if (bigLine) {
+      perfLog("bridge.bigLine", {
+        kb: Math.round(trimmed.length / 1024),
+        type: `${event.type}${event.subtype ? ":" + event.subtype : ""}`,
+        parseMs: r1(performance.now() - parseT0),
+      });
     }
 
     if (event.type === "system" && event.subtype === "init") {
