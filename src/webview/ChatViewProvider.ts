@@ -36,6 +36,7 @@ import {
 } from "../shared/types";
 import { extractMentions, resolveFromMention } from "../utils/path-mentions";
 import { log } from "../utils/logger";
+import { TranscriptStore } from "../utils/transcriptStore";
 import {
   PERF,
   measureStatePayload,
@@ -424,6 +425,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       timer: ReturnType<typeof setTimeout>;
     }
   >();
+  // Per-session transcript files — transcripts are banned from workspaceState
+  // (the whole memento serializes as one sqlite row in the main process; see
+  // TranscriptStore).
+  private readonly transcripts: TranscriptStore;
+  // Names for tabs whose runtime isn't loaded, so tab-strip refreshes don't
+  // re-read transcript files. A session's first user message never changes.
+  private readonly tabNameCache = new Map<string, string>();
 
   constructor(
     private readonly context: vscode.ExtensionContext,
@@ -439,9 +447,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     });
     this.model = this.context.workspaceState.get<string>("claude-luxure.model");
     this.effort = this.context.workspaceState.get<EffortLevel>("claude-luxure.effort");
+    this.transcripts = new TranscriptStore(context);
     startLoopLagSampler();
     this.fetchAccountInfo();
     this.restoreLastSession();
+    // After the sync restore path (which still falls back to the memento):
+    // move legacy transcripts to files and purge their memento keys, so the
+    // state.vscdb row shrinks back to a few KB.
+    void this.transcripts.migrateFromMemento(this.context.workspaceState);
+    this.transcripts.prune();
   }
 
   private getActiveRuntime(): SessionRuntime {
@@ -654,9 +668,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     } else {
       runtime.sessionId = key;
       runtime.contextSummarized = this.loadContextSummarized(key);
-      const cached = this.context.workspaceState.get<ChatMessage[]>(
-        `claude-luxure.messages.${key}`
-      );
+      // Memento fallback covers sessions from before the file store existed
+      // whose migration hasn't run/finished yet.
+      const cached =
+        this.transcripts.load(key) ??
+        this.context.workspaceState.get<ChatMessage[]>(
+          `claude-luxure.messages.${key}`
+        );
       if (cached && cached.length > 0) {
         runtime.messages = restoreMessages(cached);
         log("INFO", `Restored ${cached.length} messages for session ${key}`);
@@ -703,8 +721,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private persistRuntime(key: string, runtime: SessionRuntime): void {
     const persistId = runtime.sessionId;
     if (persistId && runtime.messages.length > 0) {
-      this.context.workspaceState.update(
-        `claude-luxure.messages.${persistId}`,
+      this.transcripts.save(
+        persistId,
         runtime.messages.filter((m) => !m.isStreaming)
       );
       this.context.workspaceState.update("claude-luxure.lastSessionId", persistId);
@@ -1421,7 +1439,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     runtime.sessionId = key;
     runtime.contextSummarized = this.loadContextSummarized(key);
-    const cached = this.context.workspaceState.get<ChatMessage[]>(`claude-luxure.messages.${key}`);
+    const cached =
+      this.transcripts.load(key) ??
+      this.context.workspaceState.get<ChatMessage[]>(`claude-luxure.messages.${key}`);
     if (cached && cached.length > 0) {
       runtime.messages = restoreMessages(cached);
       return;
@@ -1646,8 +1666,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (rt?.sessionName) {
       return rt.sessionName;
     }
+    const cachedName = this.tabNameCache.get(key);
+    if (!rt?.messages && cachedName) {
+      return cachedName;
+    }
     const messages =
       rt?.messages ??
+      this.transcripts.load(key) ??
       this.context.workspaceState.get<ChatMessage[]>(
         `claude-luxure.messages.${key}`
       );
@@ -1655,7 +1680,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       (m) => m.role === "user" && m.content.trim() && !isSlashCommand(m.content)
     );
     if (firstUser) {
-      return sessionNameFromText(firstUser.content);
+      const name = sessionNameFromText(firstUser.content);
+      this.tabNameCache.set(key, name);
+      return name;
     }
     return "New chat";
   }
@@ -5027,6 +5054,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       this.persistRuntime(key, runtime);
       runtime.bridge?.stop();
     }
+    // persistRuntime only queued debounced saves — write them before the host dies.
+    this.transcripts.flushAll();
     for (const pending of this.pendingAnnotations.values()) {
       clearTimeout(pending.timer);
       pending.reject(new Error("Extension deactivated"));
