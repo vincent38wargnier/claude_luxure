@@ -32,6 +32,10 @@ function jumpToTask(toolUseId: string) {
 
 interface ChatViewProps {
   messages: ChatMessage[];
+  /** How many older messages the host withheld (display window) — renders the
+   * "Show earlier messages" pill at the top of the transcript. */
+  historyTruncated?: number;
+  onLoadEarlier?: () => void;
   mode: Mode;
   model?: string;
   effort?: EffortLevel;
@@ -125,6 +129,8 @@ interface ChatViewProps {
 
 export default function ChatView({
   messages,
+  historyTruncated,
+  onLoadEarlier,
   mode,
   model,
   effort,
@@ -350,6 +356,18 @@ export default function ChatView({
                 Drop files or type @ to add context
               </p>
             </div>
+          </div>
+        )}
+
+        {!!historyTruncated && historyTruncated > 0 && (
+          <div className="flex justify-center py-1">
+            <button
+              onClick={onLoadEarlier}
+              className="text-[10px] px-2.5 py-1 rounded-full border border-vscode-border text-vscode-descriptionFg bg-vscode-bg hover:text-vscode-fg transition-colors"
+              title="Older messages are kept out of the panel to keep it fast — click to page them in"
+            >
+              ↑ Show earlier messages ({historyTruncated} hidden)
+            </button>
           </div>
         )}
 

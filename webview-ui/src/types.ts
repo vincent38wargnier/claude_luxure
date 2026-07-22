@@ -246,6 +246,10 @@ export interface ExtensionState {
   liveActivities?: ActivityEvent[];
   /** The active conversation's post-it (color + picked emoji). */
   marker?: SessionMarker;
+  /** How many older messages were withheld from `messages` — the webview only
+   * gets a tail window of the transcript (heap protection). Drives the
+   * "Show earlier messages" affordance. */
+  historyTruncated?: number;
 }
 
 export interface SessionInfo {
@@ -345,7 +349,20 @@ export type WebviewMessage =
   | { type: "perfEvent"; event: string; fields?: Record<string, unknown> }
   /** Reply to an "annotateImage" render request: the burned-in PNG (data URL)
    * or the reason rendering failed. */
-  | { type: "annotateResult"; requestId: string; dataUrl?: string; error?: string };
+  | { type: "annotateResult"; requestId: string; dataUrl?: string; error?: string }
+  /** Reveal older messages: widens the host-side display window for one
+   * conversation (older messages are withheld to keep the webview heap small). */
+  | { type: "loadEarlier"; tabId?: string }
+  /** Heartbeat reply. Any incoming message counts as liveness; this one exists
+   * so an idle-but-alive webview still answers pings. */
+  | { type: "pong"; t?: number }
+  /** Periodic heap telemetry from the webview memory watchdog. */
+  | { type: "memStats"; usedMB: number; limitMB: number; pct: number }
+  /** Heap crossed the pressure threshold — host trims display windows. */
+  | { type: "memPressure"; usedMB: number; limitMB: number }
+  /** Heap nearly exhausted — host restarts the webview before the renderer
+   * OOM-crashes into an unrecoverable gray panel. */
+  | { type: "memCritical"; usedMB: number; limitMB: number };
 
 export type McpConnectionState = "connecting" | "connected" | "stopped" | "error";
 
@@ -444,4 +461,7 @@ export type ExtensionMessage =
       requestId: string;
       image: string;
       annotations: ProofAnnotation[];
-    };
+    }
+  /** Liveness probe; the webview answers "pong". A visible webview that stays
+   * silent gets recreated (a crashed renderer emits no VS Code event). */
+  | { type: "ping"; t: number };

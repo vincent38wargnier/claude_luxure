@@ -156,6 +156,23 @@ interface FileCheckpoint {
   files: Map<string, string | null>; // null = the file did not exist yet
 }
 
+/** Heap-protection knobs. The webview renderer OOM-crashes (V8 aborts around
+ * ~2.2-2.7GB) once enough transcript/blob data accumulates in its JS heap —
+ * these bound what ever reaches it. */
+const DISPLAY_WINDOW_DEFAULT = 60;
+const DISPLAY_WINDOW_STEP = 120;
+/** Under reported heap pressure, visible conversations collapse to this. */
+const DISPLAY_WINDOW_LEAN = 25;
+/** Live-turn buffer caps — one runaway turn can't grow state without bound. */
+const MAX_TIMELINE_PARTS = 400;
+const MAX_RUN_ACTIVITIES = 300;
+const MAX_TOOL_RESULT_CHARS = 20_000;
+/** Webview liveness: ping cadence, silence treated as death, and the minimum
+ * gap between forced recreations (guards against a recovery loop). */
+const HEARTBEAT_INTERVAL_MS = 15_000;
+const HEARTBEAT_DEAD_MS = 50_000;
+const RECOVERY_COOLDOWN_MS = 90_000;
+
 interface SessionRuntime {
   sessionId?: string;
   draftId?: string;
@@ -241,6 +258,17 @@ const SUMMARY_PROMPT_MARKER =
  * in headless mode) and unstick the UI. Generous, so a long-but-live foreground
  * tool isn't cut short. */
 const STREAM_WATCHDOG_MS = 180000; // 3 minutes
+
+/** Fingerprints of an auth failure in CLI error/result text, across CLI
+ * versions and failure shapes. A server-side rejection reads "401 Invalid
+ * authentication credentials" (and carries api_error_status), but a
+ * client-side token-refresh failure reads "Failed to authenticate: OAuth
+ * session expired and could not be refreshed" with NO api_error_status —
+ * only this text identifies it. Only ever tested on error text (is_error
+ * results / process errors), so broad terms like "oauth" don't false-match
+ * ordinary assistant prose. */
+const AUTH_ERROR_TEXT =
+  /\b40[13]\b|invalid bearer|authentication[_ ]?failed|invalid authentication|unauthor|credential|oauth|session expired|failed to authenticate|please run \/login/i;
 
 /** Cap on nested activities kept per task card, so a chatty subagent can't
  * grow the persisted message state without bound (oldest entries drop off;
@@ -349,6 +377,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   private webview: vscode.Webview | undefined;
   private webviewView: vscode.WebviewView | undefined;
+  /** Per-conversation display window: how many trailing messages the webview
+   * gets. Widened by "loadEarlier", collapsed under heap pressure. */
+  private displayWindow = new Map<string, number>();
+  /** data-URL → webview-URI image cache (see externalizeImage). */
+  private imageCacheDir?: string;
+  private imageCacheIndex = new Map<string, string>();
+  /** Webview liveness watchdog (renderer crashes emit no VS Code event). */
+  private heartbeatTimer?: ReturnType<typeof setInterval>;
+  private lastWebviewSignal = Date.now();
+  private lastWebviewRecovery = 0;
+  private webviewBoot = 0;
   private runtimes = new Map<string, SessionRuntime>();
 
   // ── Pane model: up to two side-by-side instances, VS Code editor-group style.
@@ -617,6 +656,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   private migrateDraftToSession(draftKey: string, sessionId: string, runtime: SessionRuntime): void {
     this.runtimes.delete(draftKey);
+    this.moveDisplayWindow(draftKey, sessionId);
     runtime.sessionId = sessionId;
     delete runtime.draftId;
     this.runtimes.set(sessionId, runtime);
@@ -1294,6 +1334,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   /** Full display state for the UNFOCUSED pane's conversation. */
+  /** Re-push whichever view(s) currently display `key` — the live state when
+   * it's the focused conversation, a paneState push when it sits in the other
+   * pane. Used after display-window changes (loadEarlier / heap trims). */
+  private refreshConversationViews(key: string): void {
+    if (this.isActiveKey(key)) {
+      this.sendState();
+    }
+    for (const pane of [0, 1] as const) {
+      if (pane !== this.focusedPane && this.paneActive[pane] === key) {
+        this.sendPaneState(pane);
+      }
+    }
+  }
+
   private sendPaneState(pane: 0 | 1, via: "push" | "ticker" = "push"): void {
     if (this.paneTabs[1].length === 0) {
       return;
@@ -1535,6 +1589,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       this.stopRuntimeBridge(tabId, runtime);
       this.runtimes.delete(tabId);
     }
+    this.displayWindow.delete(tabId);
 
     const wasSplit = this.paneTabs[1].length > 0;
     for (const pane of [0, 1] as const) {
@@ -1585,6 +1640,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           this.persistRuntime(id, runtime);
           this.runtimes.delete(id);
         }
+        this.displayWindow.delete(id);
         if (this.paneActive[pane] === id) {
           this.paneActive[pane] = null;
         }
@@ -1913,13 +1969,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.webviewView = webviewView;
     this.webview = webviewView.webview;
 
+    const resourceRoots = [
+      vscode.Uri.file(
+        path.join(this.context.extensionPath, "webview-ui", "dist")
+      ),
+    ];
+    // Images are served as files from this cache instead of base64 data URLs
+    // held in state — pixels then live in Chromium's image cache, not V8.
+    const imgCache = this.ensureImageCacheDir();
+    if (imgCache) {
+      resourceRoots.push(vscode.Uri.file(imgCache));
+    }
     webviewView.webview.options = {
       enableScripts: true,
-      localResourceRoots: [
-        vscode.Uri.file(
-          path.join(this.context.extensionPath, "webview-ui", "dist")
-        ),
-      ],
+      localResourceRoots: resourceRoots,
     };
 
     webviewView.webview.html = this.getHtmlContent(webviewView.webview);
@@ -1936,12 +1999,65 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.refreshMcpStatus();
     this.sendAccountsList();
     this.startUsagePolling();
+    this.startHeartbeat();
 
     webviewView.onDidDispose(() => {
       this.webviewView = undefined;
       this.webview = undefined;
       this.stopUsagePolling();
+      this.stopHeartbeat();
     });
+  }
+
+  /** Ping the webview while it's visible; if it stays silent past the dead
+   * threshold, assume its renderer died (OOM crashes leave a gray panel and no
+   * VS Code event) and recreate it. Any incoming message counts as liveness. */
+  private startHeartbeat(): void {
+    this.stopHeartbeat();
+    this.lastWebviewSignal = Date.now();
+    this.heartbeatTimer = setInterval(() => {
+      const view = this.webviewView;
+      if (!view) {
+        return;
+      }
+      if (!view.visible) {
+        // Hidden views legitimately go quiet — never judge them.
+        this.lastWebviewSignal = Date.now();
+        return;
+      }
+      void view.webview.postMessage({ type: "ping", t: Date.now() });
+      const silentMs = Date.now() - this.lastWebviewSignal;
+      if (silentMs > HEARTBEAT_DEAD_MS) {
+        this.recoverWebview(`no heartbeat for ${Math.round(silentMs / 1000)}s`);
+      }
+    }, HEARTBEAT_INTERVAL_MS);
+  }
+
+  private stopHeartbeat(): void {
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = undefined;
+    }
+  }
+
+  /** Reload the webview's HTML — the only lever that also resurrects a crashed
+   * renderer. State lives on the host, so the panel rebuilds via "ready". */
+  private recoverWebview(reason: string): void {
+    const view = this.webviewView;
+    if (!view) {
+      return;
+    }
+    const now = Date.now();
+    if (now - this.lastWebviewRecovery < RECOVERY_COOLDOWN_MS) {
+      log("WARN", `Webview recovery skipped (cooldown): ${reason}`);
+      return;
+    }
+    this.lastWebviewRecovery = now;
+    this.webviewBoot++;
+    log("WARN", `Webview recovery #${this.webviewBoot}: ${reason}`);
+    perfLog("wv.recovery", { boot: this.webviewBoot, reason });
+    view.webview.html = this.getHtmlContent(view.webview);
+    this.lastWebviewSignal = Date.now();
   }
 
   private getHtmlContent(webview: vscode.Webview): string {
@@ -1970,6 +2086,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   <title>Claude Luxure</title>
 </head>
 <body>
+  <!-- boot ${this.webviewBoot} — changes the html string so recovery re-assignment always reloads -->
   <div id="root"></div>
   <script nonce="${nonce}" src="${scriptUri}"></script>
 </body>
@@ -1977,6 +2094,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   private async handleWebviewMessage(message: WebviewMessage): Promise<void> {
+    // Any message from the webview proves its renderer is alive.
+    this.lastWebviewSignal = Date.now();
+    if (message.type === "pong") {
+      return;
+    }
+    if (message.type === "memStats") {
+      perfLog("wv.mem", {
+        usedMB: message.usedMB,
+        limitMB: message.limitMB,
+        pct: message.pct,
+      });
+      return;
+    }
     if (message.type === "perfEvent") {
       // Webview-side lag diagnostics land in the same log as host-side ones.
       perfLog(`wv.${message.event}`, message.fields ?? {});
@@ -2007,6 +2137,48 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         this.handleListSessions();
         this.sendAccountsList();
         void this.pollUsageForActive();
+        break;
+      }
+
+      case "loadEarlier": {
+        const key = message.tabId ?? this.activeKey;
+        if (!key) {
+          break;
+        }
+        const cur = this.displayWindow.get(key) ?? DISPLAY_WINDOW_DEFAULT;
+        this.displayWindow.set(key, cur + DISPLAY_WINDOW_STEP);
+        this.refreshConversationViews(key);
+        break;
+      }
+
+      case "memPressure": {
+        log(
+          "WARN",
+          `Webview heap pressure (${message.usedMB}/${message.limitMB}MB) — collapsing display windows`
+        );
+        perfLog("wv.mem.pressure", {
+          usedMB: message.usedMB,
+          limitMB: message.limitMB,
+        });
+        for (const key of this.paneActive) {
+          if (!key) {
+            continue;
+          }
+          const cur = this.displayWindow.get(key) ?? DISPLAY_WINDOW_DEFAULT;
+          this.displayWindow.set(key, Math.min(cur, DISPLAY_WINDOW_LEAN));
+          this.refreshConversationViews(key);
+        }
+        break;
+      }
+
+      case "memCritical": {
+        perfLog("wv.mem.critical", {
+          usedMB: message.usedMB,
+          limitMB: message.limitMB,
+        });
+        this.recoverWebview(
+          `webview heap critical: ${message.usedMB}/${message.limitMB}MB`
+        );
         break;
       }
 
@@ -3379,8 +3551,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     if (newKey !== oldKey) {
       this.runtimes.delete(oldKey);
+      this.moveDisplayWindow(oldKey, newKey);
       this.runtimes.set(newKey, runtime);
       this.renameTab(oldKey, newKey);
+    }
+  }
+
+  /** Carry a conversation's widened display window across a key change. */
+  private moveDisplayWindow(oldKey: string, newKey: string): void {
+    const win = this.displayWindow.get(oldKey);
+    this.displayWindow.delete(oldKey);
+    if (win !== undefined) {
+      this.displayWindow.set(newKey, win);
     }
   }
 
@@ -3420,13 +3602,29 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     // to roll the workspace back to this point.
     runtime.checkpoints.push({ userMsgId: userMessage.id, files: new Map() });
     if (this.isActiveKey(runtimeKey)) {
-      this.postMessage({ type: "message", message: userMessage });
+      this.postMessage({
+        type: "message",
+        message: this.slimMessage(userMessage),
+      });
     }
 
     const seed =
       seedHistory && seedHistory.length > 0 ? renderSeedHistory(seedHistory) : "";
     const outgoingText = seed ? `${seed}\n\n${resolvedText}` : resolvedText;
-    runtime.bridge?.sendMessage(outgoingText, images);
+    // Edited messages carry externalized images (webview URIs); the CLI only
+    // understands base64 blocks, so rehydrate those from the cache files.
+    const cliImages = images?.map((img) => {
+      const file = this.webviewUriToFile(img);
+      if (!file) {
+        return img;
+      }
+      try {
+        return this.loadImageAsDataUrl(file);
+      } catch {
+        return img;
+      }
+    });
+    runtime.bridge?.sendMessage(outgoingText, cliImages);
 
     runtime.streamingMessageId = generateId();
     runtime.currentStreamText = "";
@@ -3682,7 +3880,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     images: string[],
     caption?: string
   ): void {
-    const activity: ActivityEvent = { type: "proof", images, caption };
+    // Externalize at the source: the multi-MB base64 never enters the runtime
+    // buffers or the persisted transcript, only the webview-URI reference.
+    const activity: ActivityEvent = {
+      type: "proof",
+      images: images.map((i) => this.externalizeImage(i)),
+      caption,
+    };
     this.appendActivity(runtime, activity);
     this.pushTimelineActivity(runtime, activity);
     if (runtime.currentStreamText) {
@@ -3943,9 +4147,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         (event as ClaudeEvent & { is_error?: boolean }).is_error === true &&
         (apiErrorStatus === 401 ||
           apiErrorStatus === 403 ||
-          /\b401\b|\b403\b|invalid bearer|authentication_failed|invalid authentication|unauthor|credential/i.test(
-            resultText
-          ));
+          AUTH_ERROR_TEXT.test(resultText));
 
       let auth: { id: string; label: string } | undefined;
       let taggedBubble = false;
@@ -4104,7 +4306,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         runtime.pendingParagraphBreak = true;
       }
       if (isActive()) {
-        this.postMessage({ type: "activity", activity: a });
+        this.postMessage({ type: "activity", activity: this.slimActivity(a) });
       }
     });
 
@@ -4172,8 +4374,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       // 401s arrive via the "result" event instead — see bridge.on("result")).
       // Flag the account so the switcher shows it disconnected, and tag the error
       // so the webview renders an inline "Reconnect" button on the message.
-      const isAuthError =
-        /401|invalid authentication|unauthor|oauth|credential/i.test(err);
+      const isAuthError = AUTH_ERROR_TEXT.test(err);
       const auth = isAuthError
         ? this.noteAuthFailure(runtime.accountId || "default")
         : undefined;
@@ -4587,8 +4788,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (!last || last.type !== "activities") {
       last = { type: "activities", activities: [] };
       tl.push(last);
+      this.capTimelineParts(tl);
     }
     this.coalesceInto(last.activities, e);
+  }
+
+  /** Drop the oldest parts once a turn's timeline exceeds the cap — a runaway
+   * turn must not grow the live buffers (and every state push) without bound. */
+  private capTimelineParts(tl: TimelinePart[]): void {
+    const over = tl.length - MAX_TIMELINE_PARTS;
+    if (over > 0) {
+      tl.splice(0, over);
+    }
   }
 
   /** Append streamed prose to the timeline's trailing text run, starting a new
@@ -4600,6 +4811,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       last.text += text;
     } else {
       tl.push({ type: "text", text });
+      this.capTimelineParts(tl);
     }
   }
 
@@ -4607,6 +4819,24 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
    * contiguous thinking, drop tool_result. Scoped to whatever array is passed,
    * so it serves both the flat list and a single timeline run. */
   private coalesceInto(acts: ActivityEvent[], e: ActivityEvent): void {
+    // Display cap: a giant tool output (file dump, log stream) would otherwise
+    // ride every state push. The CLI's own session file keeps the full text.
+    if (
+      e.type === "tool_result" &&
+      e.content &&
+      e.content.length > MAX_TOOL_RESULT_CHARS
+    ) {
+      e = {
+        ...e,
+        content:
+          e.content.slice(0, MAX_TOOL_RESULT_CHARS) +
+          `\n… [${e.content.length - MAX_TOOL_RESULT_CHARS} more chars truncated for display]`,
+      };
+    }
+    const over = acts.length - MAX_RUN_ACTIVITIES;
+    if (over > 0) {
+      acts.splice(0, over);
+    }
     if (e.type === "proof") {
       // Presented screenshots are standalone cards; never merged or deduped.
       acts.push(e);
@@ -4907,6 +5137,21 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     dataUrl: string,
     label?: string
   ): Promise<void> {
+    // Externalized images arrive as webview URIs — map back to the cache file
+    // and open it directly, no temp copy needed.
+    const cached = this.webviewUriToFile(dataUrl);
+    if (cached) {
+      try {
+        await vscode.commands.executeCommand(
+          "vscode.open",
+          vscode.Uri.file(cached),
+          vscode.ViewColumn.Active
+        );
+      } catch (err) {
+        log("ERROR", "openImageInEditor failed:", String(err));
+      }
+      return;
+    }
     const match = /^data:image\/(png|jpeg|jpg|webp|gif|bmp);base64,(.+)$/.exec(
       dataUrl
     );
@@ -4980,10 +5225,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   /** Serialize one conversation's full display state — used for the active
-   * conversation ("state") and for the one shown in the split pane. */
+   * conversation ("state") and for the one shown in the split pane.
+   * Two heap guards apply on the way out: only the trailing display window of
+   * messages ships (older ones page in via "loadEarlier"), and base64 images
+   * are swapped for webview-URI files (externalizeImage). */
   private buildStateFor(key: string, runtime: SessionRuntime): ExtensionState {
     this.ensureMarker(key, runtime);
+    const all = this.decorateForks(runtime);
+    const win = this.displayWindow.get(key) ?? DISPLAY_WINDOW_DEFAULT;
+    const windowed = all.length > win ? all.slice(all.length - win) : all;
     return {
+      historyTruncated: all.length - windowed.length || undefined,
       marker: runtime.markerColor
         ? {
             emoji: runtime.markerEmoji,
@@ -4994,7 +5246,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       mode: runtime.mode ?? this.mode,
       model: runtime.model ?? this.model,
       effort: runtime.effort ?? this.effort,
-      messages: this.decorateForks(runtime),
+      messages: windowed.map((m) => this.slimMessage(m)),
       cliStatus: runtime.bridge?.status || runtime.cliStatus || "stopped",
       pendingDiffs: this.diffManager.getPendingDiffs(),
       sessionId: runtime.sessionId,
@@ -5011,9 +5263,166 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       contextSummarized: runtime.contextSummarized ?? false,
       // Live turn buffers — lets the webview restore the in-progress feed
       // when the user switches back to a running conversation.
-      liveTimeline: runtime.currentTimeline,
-      liveActivities: runtime.currentActivities,
+      liveTimeline: this.slimTimeline(runtime.currentTimeline),
+      liveActivities: this.slimActivities(runtime.currentActivities),
     };
+  }
+
+  /** Where display images live as files: served to the webview via
+   * asWebviewUri so pixels sit in Chromium's image cache instead of V8's heap
+   * (base64 data URLs retained in state were the OOM driver). */
+  private ensureImageCacheDir(): string | undefined {
+    if (this.imageCacheDir) {
+      return this.imageCacheDir;
+    }
+    try {
+      const dir = path.join(this.context.globalStorageUri.fsPath, "imgcache");
+      fs.mkdirSync(dir, { recursive: true });
+      this.imageCacheDir = dir;
+      return dir;
+    } catch (e) {
+      log("WARN", "Image cache dir unavailable:", e);
+      return undefined;
+    }
+  }
+
+  /** Swap a base64 data URL for a webview-URI backed by a cache file. Returns
+   * the input untouched when it isn't a data URL or the cache/webview isn't
+   * available (the webview renders either form). */
+  private externalizeImage(src: string): string {
+    if (!src.startsWith("data:image/")) {
+      return src;
+    }
+    const webview = this.webview;
+    const dir = webview ? this.ensureImageCacheDir() : undefined;
+    if (!webview || !dir) {
+      return src;
+    }
+    // Identity without hashing the multi-MB string on every lookup.
+    const key = `${src.length}:${src.slice(0, 96)}:${src.slice(-32)}`;
+    const hit = this.imageCacheIndex.get(key);
+    if (hit) {
+      return hit;
+    }
+    const m = /^data:image\/(png|jpeg|jpg|webp|gif|bmp);base64,(.+)$/.exec(src);
+    if (!m) {
+      return src;
+    }
+    try {
+      const ext = m[1] === "jpg" ? "jpeg" : m[1];
+      const name = `img-${crypto
+        .createHash("sha1")
+        .update(src)
+        .digest("hex")
+        .slice(0, 24)}.${ext}`;
+      const file = path.join(dir, name);
+      if (!fs.existsSync(file)) {
+        fs.writeFileSync(file, Buffer.from(m[2], "base64"));
+      }
+      const uri = webview.asWebviewUri(vscode.Uri.file(file)).toString();
+      this.imageCacheIndex.set(key, uri);
+      return uri;
+    } catch (e) {
+      log("WARN", "externalizeImage failed:", e);
+      return src;
+    }
+  }
+
+  /** Map a webview resource URI back to the local file it serves — only for
+   * files inside our image cache (used by "open image in editor tab"). */
+  private webviewUriToFile(src: string): string | undefined {
+    if (!/^https:\/\/[^/]*vscode-resource[^/]*\//.test(src)) {
+      return undefined;
+    }
+    try {
+      const pathname = decodeURIComponent(new URL(src).pathname);
+      const dir = this.imageCacheDir;
+      if (
+        dir &&
+        pathname.startsWith(dir + path.sep) &&
+        fs.existsSync(pathname)
+      ) {
+        return pathname;
+      }
+    } catch {
+      // not a parseable URL — treat as unknown
+    }
+    return undefined;
+  }
+
+  private slimImages(images: string[] | undefined): string[] | undefined {
+    if (!images || !images.some((i) => i.startsWith("data:image/"))) {
+      return images;
+    }
+    return images.map((i) => this.externalizeImage(i));
+  }
+
+  private slimActivity(a: ActivityEvent): ActivityEvent {
+    if (a.type === "proof") {
+      const images = this.slimImages(a.images) ?? a.images;
+      return images === a.images ? a : { ...a, images };
+    }
+    if (a.type === "tool_use" && a.result?.images) {
+      const images = this.slimImages(a.result.images);
+      return images === a.result.images
+        ? a
+        : { ...a, result: { ...a.result, images } };
+    }
+    if (a.type === "tool_result") {
+      const images = this.slimImages(a.images);
+      return images === a.images ? a : { ...a, images };
+    }
+    return a;
+  }
+
+  private slimActivities(
+    acts: ActivityEvent[] | undefined
+  ): ActivityEvent[] | undefined {
+    if (!acts) {
+      return acts;
+    }
+    let changed = false;
+    const out = acts.map((a) => {
+      const slim = this.slimActivity(a);
+      changed ||= slim !== a;
+      return slim;
+    });
+    return changed ? out : acts;
+  }
+
+  private slimTimeline(
+    parts: TimelinePart[] | undefined
+  ): TimelinePart[] | undefined {
+    if (!parts) {
+      return parts;
+    }
+    let changed = false;
+    const out = parts.map((p) => {
+      if (p.type !== "activities") {
+        return p;
+      }
+      const slim = this.slimActivities(p.activities);
+      if (slim === p.activities) {
+        return p;
+      }
+      changed = true;
+      return { ...p, activities: slim ?? [] };
+    });
+    return changed ? out : parts;
+  }
+
+  private slimMessage(msg: ChatMessage): ChatMessage {
+    const images = this.slimImages(msg.images);
+    const timeline = this.slimTimeline(msg.timeline);
+    const activities = this.slimActivities(msg.activities);
+    if (
+      images === msg.images &&
+      timeline === msg.timeline &&
+      activities === msg.activities
+    ) {
+      return msg;
+    }
+    return { ...msg, images, timeline, activities };
   }
 
   private sendState(): void {
@@ -5046,6 +5455,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   dispose(): void {
     this.stopUsagePolling();
+    this.stopHeartbeat();
     if (this.paneTicker) {
       clearInterval(this.paneTicker);
       this.paneTicker = undefined;

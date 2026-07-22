@@ -242,7 +242,8 @@ export default function App() {
               activities: coalesceActivities([msg.activity]),
             });
           }
-          return next;
+          // Heap guard: a runaway turn can't grow the live feed without bound.
+          return next.length > 400 ? next.slice(next.length - 400) : next;
         });
         break;
 
@@ -889,6 +890,13 @@ export default function App() {
         paneIndex={i}
         paneFocused={focused}
         messages={pv.messages}
+        historyTruncated={pv.historyTruncated}
+        onLoadEarlier={() =>
+          vscode.postMessage({
+            type: "loadEarlier",
+            tabId: activeId,
+          })
+        }
         mode={pv.mode ?? state.mode}
         model={pv.model ?? state.model}
         effort={pv.effort ?? state.effort}
