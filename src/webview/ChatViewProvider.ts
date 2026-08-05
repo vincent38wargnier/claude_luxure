@@ -3599,7 +3599,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       runtime.sessionName = sessionNameFromText(text);
     }
 
-    if (!runtime.bridge || runtime.bridge.status === "stopped") {
+    // status alone can lie after process churn (a stale "ready" with no
+    // process behind it) — isAlive is the ground truth for respawning.
+    if (
+      !runtime.bridge ||
+      runtime.bridge.status === "stopped" ||
+      !runtime.bridge.isAlive
+    ) {
       await this.startBridge(runtimeKey, runtime);
     }
 
@@ -3640,7 +3646,32 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         return img;
       }
     });
-    runtime.bridge?.sendMessage(outgoingText, cliImages);
+    let sent = runtime.bridge?.sendMessage(outgoingText, cliImages) === true;
+    if (!sent) {
+      // The process died between the liveness check and the write. Respawn
+      // once and retry so the user's message still goes through.
+      log("WARN", "sendMessage hit a dead CLI; respawning bridge and retrying");
+      await this.startBridge(runtimeKey, runtime);
+      sent = runtime.bridge?.sendMessage(outgoingText, cliImages) === true;
+    }
+    if (!sent) {
+      // Never start a phantom turn: without this the message would sit
+      // "streaming" for 3 minutes until the watchdog stamps a misleading
+      // "turn went quiet" banner, even though the CLI never got the message.
+      const failMessage: ChatMessage = {
+        id: generateId(),
+        role: "assistant",
+        content:
+          "⚠️ *This message never reached the Claude CLI — its process could not be started. Check the extension logs, then send again.*",
+        timestamp: Date.now(),
+      };
+      runtime.messages.push(failMessage);
+      if (this.isActiveKey(runtimeKey)) {
+        this.postMessage({ type: "message", message: this.slimMessage(failMessage) });
+      }
+      this.sendState();
+      return;
+    }
 
     runtime.streamingMessageId = generateId();
     runtime.currentStreamText = "";
@@ -3673,7 +3704,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     if (runtime.sessionId) {
       const existing = this.findBridgeForSessionId(runtime.sessionId);
-      if (existing && existing.status !== "stopped") {
+      if (existing && existing.status !== "stopped" && existing.isAlive) {
         runtime.bridge = existing;
         runtime.cliStatus = existing.status;
         return;

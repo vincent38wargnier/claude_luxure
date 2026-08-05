@@ -249,6 +249,13 @@ export class ClaudeBridge extends EventEmitter {
     return this._status;
   }
 
+  /** True when a live CLI process is attached (stdin writable). Callers
+   * deciding whether to (re)spawn must check this, not just status — late
+   * events from a previous process generation can leave status stale. */
+  get isAlive(): boolean {
+    return !!this.proc?.stdin;
+  }
+
   get sessionId() {
     return this._sessionId;
   }
@@ -341,8 +348,9 @@ export class ClaudeBridge extends EventEmitter {
       Object.assign(childEnv, this.options.env);
     }
 
+    let spawned: ChildProcess;
     try {
-      this.proc = spawn(this.options.claudePath || "claude", args, {
+      spawned = spawn(this.options.claudePath || "claude", args, {
         cwd: this.cwd,
         stdio: ["pipe", "pipe", "pipe"],
         env: childEnv,
@@ -353,14 +361,27 @@ export class ClaudeBridge extends EventEmitter {
       this.emit("error", `Failed to spawn claude CLI: ${err}`);
       return;
     }
+    this.proc = spawned;
+    // Generation guard: each listener below belongs to THIS spawn. After a
+    // restart, the old process's late events (its exit firing after the
+    // replacement was assigned, buffered stdout) must not touch the bridge —
+    // an unguarded exit handler nulls the NEW proc, wedging the session with
+    // status "ready" but nothing to write to, and leaking the live process.
+    const owned = () => this.proc === spawned;
 
-    this.proc.on("error", (err) => {
+    spawned.on("error", (err) => {
+      if (!owned()) {
+        return;
+      }
       this._status = "error";
       this.emit("status", this._status);
       this.emit("error", `Claude CLI error: ${err.message}`);
     });
 
-    this.proc.on("exit", (code, signal) => {
+    spawned.on("exit", (code, signal) => {
+      if (!owned()) {
+        return;
+      }
       this._status = "stopped";
       this.emit("status", this._status);
       this.emit("exit", { code, signal });
@@ -368,8 +389,11 @@ export class ClaudeBridge extends EventEmitter {
       this.rl = null;
     });
 
-    if (this.proc.stderr) {
-      this.proc.stderr.on("data", (data: Buffer) => {
+    if (spawned.stderr) {
+      spawned.stderr.on("data", (data: Buffer) => {
+        if (!owned()) {
+          return;
+        }
         const text = data.toString();
         if (text.trim()) {
           this.emit("stderr", text);
@@ -377,13 +401,16 @@ export class ClaudeBridge extends EventEmitter {
       });
     }
 
-    if (this.proc.stdout) {
+    if (spawned.stdout) {
       this.rl = readline.createInterface({
-        input: this.proc.stdout,
+        input: spawned.stdout,
         crlfDelay: Infinity,
       });
 
       this.rl.on("line", (line: string) => {
+        if (!owned()) {
+          return;
+        }
         this.parseLine(line);
       });
     }
@@ -640,10 +667,12 @@ export class ClaudeBridge extends EventEmitter {
     this.emit("event", event);
   }
 
-  sendMessage(text: string, images?: string[]): void {
+  /** Write a user turn to the CLI. Returns false when there is no live
+   * process to write to — the caller must not treat the turn as started. */
+  sendMessage(text: string, images?: string[]): boolean {
     if (!this.proc?.stdin || this._status === "stopped") {
       this.emit("error", "Claude CLI is not running");
-      return;
+      return false;
     }
 
     this._status = "busy";
@@ -681,6 +710,7 @@ export class ClaudeBridge extends EventEmitter {
     };
 
     this.proc.stdin.write(JSON.stringify(message) + "\n");
+    return true;
   }
 
   sendControlResponse(response: Record<string, unknown>): void {
@@ -691,18 +721,25 @@ export class ClaudeBridge extends EventEmitter {
   }
 
   stop(): void {
-    if (this.proc) {
-      this.proc.kill("SIGTERM");
+    // Disown before killing: restart() spawns a replacement immediately, so
+    // by the time this process's exit event (or the escalation timer) fires,
+    // this.proc may already be the new, healthy CLI. Everything below must
+    // act on the captured handle only.
+    const proc = this.proc;
+    const rl = this.rl;
+    this.proc = null;
+    this.rl = null;
+    rl?.close();
+    if (proc) {
+      proc.kill("SIGTERM");
       setTimeout(() => {
-        if (this.proc) {
-          this.proc.kill("SIGKILL");
+        if (proc.exitCode === null && proc.signalCode === null) {
+          proc.kill("SIGKILL");
         }
       }, 5000);
     }
     this._status = "stopped";
     this.emit("status", this._status);
-    this.proc = null;
-    this.rl = null;
   }
 
   restart(options?: Partial<ClaudeBridgeOptions>): void {
