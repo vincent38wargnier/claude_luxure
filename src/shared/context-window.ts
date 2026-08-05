@@ -22,10 +22,11 @@ export function nativeContextWindowForModel(modelId: string): number {
     return DEFAULT_WINDOW;
   }
 
-  // 1M-native families (Fable 5, Opus 4.6+, Sonnet 4.6+, Opus 4.8, etc.)
+  // 1M-native families (Fable 5, Opus 5, Sonnet 5, Opus 4.6+, Sonnet 4.6+, etc.)
   // "fable" also matches the explicit 1M variant id "claude-fable-5[1m]".
   if (
     m.includes("fable") ||
+    /claude-(opus|sonnet)-5/.test(m) ||
     /claude-opus-4-[6-9]/.test(m) ||
     /claude-sonnet-4-[6-9]/.test(m) ||
     m.includes("claude-opus-4-8") ||

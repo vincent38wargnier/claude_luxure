@@ -1,4 +1,4 @@
-import { useState, useRef } from "react";
+import { useEffect, useState, useRef } from "react";
 import { createRoot } from "react-dom/client";
 import "./index.css";
 import ChatView from "./components/chat/ChatView";
@@ -389,6 +389,26 @@ function ChatHarness() {
   const [runningTasks, setRunningTasks] = useState<TaskActivity[]>(
     initialRunningTasks
   );
+  // Seed the composer's past-prompt suggestions. In the real webview the
+  // extension host answers requestPromptHistory from the CLI transcripts;
+  // the harness pushes a canned corpus (modeled on this repo's real one).
+  useEffect(() => {
+    const day = 86_400_000;
+    const entries = [
+      { text: "can you add opus 5 to the available models?", count: 2, lastUsed: Date.now() - 6 * day },
+      { text: "check how i can run this claude luxure by default in all my vscode instances", count: 2, lastUsed: Date.now() - 5 * day },
+      { text: "improve the edit bubble to behave like the original text area", count: 1, lastUsed: Date.now() - 4 * day },
+      { text: "can you take a screenshot on this url and show me what ui i should improve https://app.jarvio.io", count: 3, lastUsed: Date.now() - 10 * day },
+      { text: "add a pastel sticky note with a small emoji on each conversation in the history list", count: 1, lastUsed: Date.now() - 24 * day },
+      { text: "add a yellow time-since-last-reply pill on the tabs and history rows", count: 1, lastUsed: Date.now() - 28 * day },
+      { text: "fix the tab idle counters when the transcript is missing", count: 1, lastUsed: Date.now() - 20 * day },
+      { text: "continue", count: 2, lastUsed: Date.now() - 2 * day },
+      // Long multi-sentence prompt: its middle sentence becomes a phrase
+      // chunk (¶ row) — demoes the two-granularity retrieval.
+      { text: "the composer suggestions feel slow on large corpora. run the harness suite and screenshot the composer states. also check the memwatch counters after reload.", count: 2, lastUsed: Date.now() - 3 * day },
+    ];
+    window.postMessage({ type: "promptHistory", entries }, "*");
+  }, []);
   // Mirrors App's queue-while-streaming behavior so the flow is testable here.
   const [queued, setQueued] = useState<QueuedMessage[]>([]);
   const queueIdRef = useRef(0);

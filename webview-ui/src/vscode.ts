@@ -14,7 +14,30 @@ class VsCodeWrapper {
       this.api = acquireVsCodeApi();
     } else {
       this.api = {
-        postMessage: (msg: unknown) => console.log("[dev] postMessage:", msg),
+        postMessage: (msg: unknown) => {
+          console.log("[dev] postMessage:", msg);
+          // Harness-only loopback: answer suggestPhrase with a canned "magie"
+          // completion after a realistic delay, so the blue row is demoable
+          // without an extension host (the real model runs there).
+          const m = msg as { type?: string; draft?: string; examples?: string[] };
+          if (m?.type === "suggestPhrase" && typeof m.draft === "string") {
+            const draft = m.draft.trim();
+            const canned = draft.toLowerCase().startsWith("add")
+              ? `${draft} yellow idle counter pill on the tab strip`
+              : `${draft} in the composer and explain how it works`;
+            setTimeout(() => {
+              window.postMessage(
+                {
+                  type: "phraseSuggestion",
+                  draft: m.draft,
+                  suggestion: canned,
+                  examples: m.examples ?? [],
+                },
+                "*"
+              );
+            }, 220);
+          }
+        },
         getState: () => undefined,
         setState: () => {},
       };

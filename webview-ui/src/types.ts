@@ -194,8 +194,19 @@ export type ActivityEvent =
 
 export type TaskActivity = Extract<ActivityEvent, { type: "task" }>;
 
+/** One deduped past prompt from this project's CLI transcripts — the corpus
+ * behind the composer's history suggestions. */
+export interface PromptHistoryEntry {
+  text: string;
+  /** Times this exact prompt (case/whitespace-insensitive) was sent. */
+  count: number;
+  /** Epoch ms of the most recent send. */
+  lastUsed: number;
+}
+
 export const AVAILABLE_MODELS = [
   { id: "claude-fable-5", alias: "fable", label: "Fable 5" },
+  { id: "claude-opus-5", alias: "opus-5", label: "Opus 5" },
   { id: "claude-sonnet-4-20250514", alias: "sonnet", label: "Sonnet 4" },
   { id: "claude-opus-4-20250514", alias: "opus", label: "Opus 4" },
   { id: "claude-haiku-4-5-20251001", alias: "haiku", label: "Haiku 4.5" },
@@ -313,6 +324,16 @@ export type WebviewMessage =
   | { type: "acceptAllChanges" }
   | { type: "rejectAllChanges" }
   | { type: "searchFiles"; query: string }
+  /** Composer asks for this project's past-prompt corpus (once per load). */
+  | { type: "requestPromptHistory" }
+  /** Composer asks the local LLM ("magie") to complete the draft. `examples`
+   * may be empty — the model then works from conversation context alone. */
+  | {
+      type: "suggestPhrase";
+      conversationId?: string;
+      draft: string;
+      examples: string[];
+    }
   | {
       // Files dragged in from outside VS Code: the webview only gets blob
       // content (no filesystem path), so the host writes temp copies and
@@ -393,6 +414,17 @@ export type ExtensionMessage =
       authErrorAccountLabel?: string;
     }
   | { type: "fileSearchResults"; files: string[] }
+  | { type: "promptHistory"; entries: PromptHistoryEntry[] }
+  /** Local-LLM completion of `draft`; null when unavailable or empty. The
+   * webview drops it if the composer text moved on since `draft`. `examples`
+   * echoes the retrieved prompts the model actually saw, so the webview can
+   * mark which suggestion words were copied from them vs invented. */
+  | {
+      type: "phraseSuggestion";
+      draft: string;
+      suggestion: string | null;
+      examples: string[];
+    }
   | { type: "addFile"; filePath: string }
   | { type: "diffUpdate"; filePath: string; diff: string; status: "pending" | "accepted" | "rejected" }
   | { type: "costUpdate"; cost: CostInfo }

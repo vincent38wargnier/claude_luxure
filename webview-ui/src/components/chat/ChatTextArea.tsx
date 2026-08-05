@@ -15,6 +15,17 @@ import ModeSelector from "./ModeSelector";
 import ModelSelector from "./ModelSelector";
 import ContextMenu from "./ContextMenu";
 import SlashCommandMenu from "./SlashCommandMenu";
+import PromptHistoryMenu from "./PromptHistoryMenu";
+import {
+  attributeMagieWords,
+  buildPhraseCorpus,
+  normalizePromptHistory,
+  rankPromptSuggestions,
+  recordSentPrompt,
+  type RankedPrompt,
+  type SuggestionRow,
+} from "../../utils/promptSuggestions";
+import { buildVocabModel } from "../../utils/vocabWeights";
 import Thumbnails from "../common/Thumbnails";
 import {
   MAX_IMAGES,
@@ -303,6 +314,19 @@ export default function ChatTextArea({
   const [contextMenuIndex, setContextMenuIndex] = useState(0);
   const [slashMenuIndex, setSlashMenuIndex] = useState(0);
   const [mentionStartPos, setMentionStartPos] = useState(-1);
+  // Past-prompt suggestions: corpus of this project's previously sent prompts
+  // (scanned from the real CLI transcripts by the host, ranked client-side).
+  const [historyEntries, setHistoryEntries] = useState<RankedPrompt[]>([]);
+  const [historyIndex, setHistoryIndex] = useState(0);
+  const [historyDismissed, setHistoryDismissed] = useState(false);
+  // Local-LLM ("magie") completion of the current draft — asked at typing
+  // boundaries, shown as the blue top row while it still extends the input.
+  // `sources` (the request's draft + the examples the model saw) feed the
+  // word-provenance rendering: copied words normal, invented words bold.
+  const [aiSuggestion, setAiSuggestion] = useState<{
+    text: string;
+    sources: string[];
+  } | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const highlightRef = useRef<HTMLDivElement>(null);
 
@@ -344,6 +368,9 @@ export default function ChatTextArea({
     setShowContextMenu(false);
     setSlashMenuQuery("");
     setContextMenuQuery("");
+    setHistoryDismissed(false);
+    setHistoryIndex(0);
+    setAiSuggestion(null);
   }, [draftKey]);
 
   const cliCommands = useMemo(
@@ -362,6 +389,85 @@ export default function ChatTextArea({
     );
   }, [cliCommands, slashMenuQuery]);
 
+  // Plain typing (not a /command or @mention, single-line, short) opens the
+  // suggestion menu. Multiline/long drafts opt out so the arrow keys stay
+  // caret movement while editing a real prompt.
+  const suggestionGatesOpen =
+    !historyDismissed &&
+    !showSlashMenu &&
+    !showContextMenu &&
+    !inputValue.includes("\n") &&
+    inputValue.length <= 200 &&
+    inputValue.trim().length >= 3 &&
+    !inputValue.trimStart().startsWith("/");
+
+  // Two retrieval granularities from one corpus: whole prompts plus the
+  // phrases inside them, and a corrector-style word-weight model — all
+  // derived once per corpus change, not per keystroke.
+  const suggestionCorpus = useMemo(
+    () => [...historyEntries, ...buildPhraseCorpus(historyEntries)],
+    [historyEntries]
+  );
+  const vocabModel = useMemo(
+    () => buildVocabModel(historyEntries, Date.now()),
+    [historyEntries]
+  );
+
+  const historyMatches = useMemo(() => {
+    if (!suggestionGatesOpen) return [];
+    return rankPromptSuggestions(
+      inputValue,
+      suggestionCorpus,
+      Date.now(),
+      5,
+      vocabModel
+    );
+  }, [suggestionGatesOpen, inputValue, suggestionCorpus, vocabModel]);
+
+  // Ask the local LLM at typing boundaries (180ms after the last keystroke).
+  // Zero lexical matches is fine — the host falls back to conversation
+  // context, so "magie" also fires on prompts unlike anything typed before.
+  useEffect(() => {
+    if (!suggestionGatesOpen) return;
+    const draft = inputValue;
+    const examples = historyMatches.map((m) => m.text).slice(0, 8);
+    const timer = setTimeout(() => {
+      vscode.postMessage({
+        type: "suggestPhrase",
+        conversationId: activeTabId,
+        draft,
+        examples,
+      });
+    }, 180);
+    return () => clearTimeout(timer);
+  }, [suggestionGatesOpen, inputValue, historyMatches, activeTabId]);
+
+  // The menu: magie's completion (while it still extends the draft) on top,
+  // then the lexical history matches.
+  const suggestionRows = useMemo<SuggestionRow[]>(() => {
+    if (!suggestionGatesOpen) return [];
+    const rows: SuggestionRow[] = [];
+    const normInput = inputValue.replace(/\s+/g, " ").trim().toLowerCase();
+    if (
+      aiSuggestion &&
+      aiSuggestion.text.toLowerCase().startsWith(normInput) &&
+      aiSuggestion.text.replace(/\s+/g, " ").trim().toLowerCase() !== normInput
+    ) {
+      rows.push({
+        kind: "magie",
+        text: aiSuggestion.text,
+        segments: attributeMagieWords(aiSuggestion.text, aiSuggestion.sources),
+      });
+    }
+    for (const entry of historyMatches) {
+      rows.push({ kind: "history", entry });
+    }
+    return rows;
+  }, [suggestionGatesOpen, inputValue, aiSuggestion, historyMatches]);
+
+  const menuVisible = suggestionRows.length > 0;
+  const menuSelected = Math.min(historyIndex, suggestionRows.length - 1);
+
   // Merge external files at cursor position
   useEffect(() => {
     if (externalFiles && externalFiles.length > 0) {
@@ -376,8 +482,30 @@ export default function ChatTextArea({
       if (event.data?.type === "fileSearchResults") {
         setContextMenuFiles(event.data.files);
       }
+      if (event.data?.type === "promptHistory") {
+        setHistoryEntries(normalizePromptHistory(event.data.entries ?? []));
+      }
+      if (event.data?.type === "phraseSuggestion") {
+        // Stored as-is; display gating hides it once the draft diverges.
+        // Provenance sources are what the model saw: that request's draft
+        // (the user's own words) plus the retrieved examples.
+        setAiSuggestion(
+          event.data.suggestion
+            ? {
+                text: event.data.suggestion,
+                sources: [
+                  event.data.draft ?? "",
+                  ...(event.data.examples ?? []),
+                ],
+              }
+            : null
+        );
+      }
     };
     window.addEventListener("message", handler);
+    // Both split-view composers ask; the host answers from cache after the
+    // first, and the push lands on every listener in the window.
+    vscode.postMessage({ type: "requestPromptHistory" });
     return () => window.removeEventListener("message", handler);
   }, []);
 
@@ -433,6 +561,10 @@ export default function ChatTextArea({
       mentions.length > 0 ? mentions : undefined
     );
 
+    // The prompt just sent is instantly reusable — no transcript rescan.
+    setHistoryEntries((prev) => recordSentPrompt(prev, text));
+    setAiSuggestion(null);
+
     setInputValue("");
     setSelectedImages([]);
     setShowContextMenu(false);
@@ -449,6 +581,24 @@ export default function ChatTextArea({
     setTimeout(() => {
       if (textareaRef.current) {
         const pos = command.name.length + 1;
+        textareaRef.current.selectionStart = pos;
+        textareaRef.current.selectionEnd = pos;
+        textareaRef.current.focus();
+      }
+    }, 0);
+  }, []);
+
+  const acceptSuggestionRow = useCallback((row: SuggestionRow) => {
+    const text = row.kind === "magie" ? row.text : row.entry.text;
+    setInputValue(text);
+    // Stay dismissed until the next edit — the inserted text would otherwise
+    // immediately re-match its own neighbors.
+    setHistoryDismissed(true);
+    setAiSuggestion(null);
+
+    setTimeout(() => {
+      if (textareaRef.current) {
+        const pos = text.length;
         textareaRef.current.selectionStart = pos;
         textareaRef.current.selectionEnd = pos;
         textareaRef.current.focus();
@@ -517,6 +667,33 @@ export default function ChatTextArea({
         }
       }
 
+      if (menuVisible) {
+        if (e.key === "ArrowDown") {
+          e.preventDefault();
+          setHistoryIndex(
+            Math.min(menuSelected + 1, suggestionRows.length - 1)
+          );
+          return;
+        }
+        if (e.key === "ArrowUp") {
+          e.preventDefault();
+          setHistoryIndex(Math.max(menuSelected - 1, 0));
+          return;
+        }
+        if (e.key === "Tab" && !e.shiftKey) {
+          e.preventDefault();
+          acceptSuggestionRow(suggestionRows[menuSelected]);
+          return;
+        }
+        if (e.key === "Escape") {
+          e.preventDefault();
+          setHistoryDismissed(true);
+          return;
+        }
+        // Enter falls through on purpose: it sends what's typed, never the
+        // suggestion — Tab is the only way to take one.
+      }
+
       if (e.key === "Enter" && !e.shiftKey) {
         e.preventDefault();
         const hasContent =
@@ -551,6 +728,10 @@ export default function ChatTextArea({
       contextMenuFiles,
       contextMenuIndex,
       contextMenuQuery,
+      menuVisible,
+      suggestionRows,
+      menuSelected,
+      acceptSuggestionRow,
       isStreaming,
       queueCount,
       onForceNext,
@@ -566,6 +747,9 @@ export default function ChatTextArea({
     (e: React.ChangeEvent<HTMLTextAreaElement>) => {
       const value = e.target.value;
       setInputValue(value);
+      // Typing (re)arms history suggestions and resets the highlighted row.
+      setHistoryDismissed(false);
+      setHistoryIndex(0);
 
       const cursorPos = e.target.selectionStart;
       const textBeforeCursor = value.slice(0, cursorPos);
@@ -798,6 +982,14 @@ export default function ChatTextArea({
           selectedIndex={slashMenuIndex}
           onSelect={insertSlashCommand}
           onClose={() => setShowSlashMenu(false)}
+        />
+
+        <PromptHistoryMenu
+          rows={suggestionRows}
+          visible={menuVisible}
+          selectedIndex={menuSelected}
+          onSelect={acceptSuggestionRow}
+          onClose={() => setHistoryDismissed(true)}
         />
 
         <ContextMenu

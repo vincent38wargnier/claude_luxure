@@ -26,6 +26,7 @@ import {
   McpServerStatus,
   Mode,
   ProofAnnotation,
+  PromptHistoryEntry,
   SessionMarker,
   StoredAccount,
   TaskActivity,
@@ -34,7 +35,10 @@ import {
   UsageInfo,
   WebviewMessage,
 } from "../shared/types";
+import { buildVocabModel, topProjectWords } from "../shared/vocabWeights";
 import { extractMentions, resolveFromMention } from "../utils/path-mentions";
+import { loadPromptHistory } from "../utils/promptHistory";
+import { LlmSuggester } from "../utils/llmSuggester";
 import { log } from "../utils/logger";
 import { TranscriptStore } from "../utils/transcriptStore";
 import {
@@ -2342,6 +2346,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
       case "searchFiles":
         await this.handleFileSearch(message.query);
+        break;
+
+      case "requestPromptHistory":
+        await this.handleRequestPromptHistory();
+        break;
+
+      case "suggestPhrase":
+        await this.handleSuggestPhrase(
+          message.conversationId,
+          message.draft,
+          message.examples ?? []
+        );
         break;
 
       case "openFile": {
@@ -5023,6 +5039,96 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       this.sendState();
     } else {
       this.sendState();
+    }
+  }
+
+  private readonly llmSuggester = new LlmSuggester();
+
+  /** Vocab model cached per corpus snapshot — loadPromptHistory returns the
+   * same array identity within its TTL, so this recomputes at most once a
+   * minute. */
+  private readonly vocabCache = new WeakMap<
+    PromptHistoryEntry[],
+    { word: string; weight: number }[]
+  >();
+
+  /** The user's learned project vocabulary (corrector-style weights) for
+   * steering the local LLM. Empty on any failure — steering is an upgrade,
+   * never a dependency. */
+  private async projectVocabulary(): Promise<
+    { word: string; weight: number }[]
+  > {
+    const workspacePath = this.getWorkspacePath();
+    if (!workspacePath) {
+      return [];
+    }
+    try {
+      const entries = await loadPromptHistory(workspacePath);
+      const cached = this.vocabCache.get(entries);
+      if (cached) {
+        return cached;
+      }
+      const model = buildVocabModel(entries, Date.now());
+      // Fewer, stronger words (≥3 uses) — the bench showed a broad shallow
+      // push does more harm than a focused one.
+      const vocabulary = topProjectWords(model, 60, 3).map((w) => ({
+        word: w.word,
+        weight: w.weight,
+      }));
+      this.vocabCache.set(entries, vocabulary);
+      return vocabulary;
+    } catch {
+      return [];
+    }
+  }
+
+  /** Local-LLM ("magie") completion of the draft the user is typing. The
+   * suggester itself is single-flight and never throws; an unavailable model
+   * (file not downloaded) just answers null and the feature stays invisible.
+   * Conversation context comes from the runtime's own messages, so it works
+   * even when retrieval found no examples. */
+  private async handleSuggestPhrase(
+    conversationId: string | undefined,
+    draft: string,
+    examples: string[]
+  ): Promise<void> {
+    const runtime = conversationId
+      ? this.runtimes.get(conversationId)
+      : this.runtimes.get(this.activeKey);
+    const conversation = (runtime?.messages ?? [])
+      .filter((m) => (m.role === "user" || m.role === "assistant") && m.content)
+      .slice(-4)
+      .map((m) => ({ role: m.role, text: m.content.slice(0, 240) }));
+    const usedExamples = examples.slice(0, 8);
+    const suggestion = await this.llmSuggester.suggest({
+      draft,
+      examples: usedExamples,
+      conversation,
+      vocabulary: await this.projectVocabulary(),
+    });
+    this.postMessage({
+      type: "phraseSuggestion",
+      draft,
+      suggestion,
+      examples: usedExamples,
+    });
+  }
+
+  /** Past-prompt corpus for the composer's history suggestions. Scanning and
+   * caching live in loadPromptHistory; an empty corpus is a normal answer
+   * (fresh project), so failures degrade to that rather than surfacing. */
+  private async handleRequestPromptHistory(): Promise<void> {
+    const workspacePath = this.getWorkspacePath();
+    if (!workspacePath) {
+      this.postMessage({ type: "promptHistory", entries: [] });
+      return;
+    }
+    try {
+      const entries = await loadPromptHistory(workspacePath);
+      this.postMessage({ type: "promptHistory", entries });
+    } catch (err) {
+      log("WARN", "prompt history scan failed:", String(err));
+      this.postMessage({ type: "promptHistory", entries: [] });
     }
   }
 

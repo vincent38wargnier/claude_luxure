@@ -121,10 +121,10 @@
     "vscode:prepublish": "npm run build",
     "setup": "./setup.sh",
     "build": "npm run build:webview && npm run build:ext && npm run build:mcp",
-    "build:ext": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --sourcemap",
+    "build:ext": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --external:node-llama-cpp --format=cjs --platform=node --sourcemap",
     "build:mcp": "esbuild src/mcp/luxure-mcp-server.ts --bundle --outfile=dist/luxure-mcp.js --format=cjs --platform=node --sourcemap",
     "build:webview": "cd webview-ui && npm run build",
-    "watch:ext": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --sourcemap --watch",
+    "watch:ext": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --external:node-llama-cpp --format=cjs --platform=node --sourcemap --watch",
     "watch:mcp": "esbuild src/mcp/luxure-mcp-server.ts --bundle --outfile=dist/luxure-mcp.js --format=cjs --platform=node --sourcemap --watch",
     "watch:webview": "cd webview-ui && npm run dev",
     "dev": "concurrently \"npm run watch:ext\" \"npm run watch:mcp\" \"npm run watch:webview\"",
@@ -139,6 +139,7 @@
     "typescript": "^5.7.0"
   },
   "dependencies": {
-    "diff": "^7.0.0"
+    "diff": "^7.0.0",
+    "node-llama-cpp": "^3.19.1"
   }
 }
