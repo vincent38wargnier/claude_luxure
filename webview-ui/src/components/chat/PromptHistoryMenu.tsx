@@ -64,11 +64,18 @@ export default function PromptHistoryMenu({
         if (row.kind === "magie") {
           // Word provenance: words copied from the retrieved past prompts (or
           // the draft itself) render normal; words the LLM introduced are bold.
+          // The rewrite row REPLACES the phrase (keywords → clean prompt); the
+          // completion row extends it.
           return (
             <button
-              key="magie"
+              key={(row.expand ? "magie-expand:" : "magie:") + row.text}
               onClick={() => onSelect(row)}
               className={rowClass}
+              title={
+                row.expand
+                  ? "Rewrites your words into the full phrase (replaces the line)"
+                  : undefined
+              }
             >
               <span className="flex-1 leading-snug line-clamp-2 break-words text-[#60a5fa]">
                 {row.segments.map((seg, j) =>
@@ -82,7 +89,7 @@ export default function PromptHistoryMenu({
                 )}
               </span>
               <span className="shrink-0 flex items-center gap-1 text-[9px] uppercase tracking-wide text-[#60a5fa] opacity-70 pt-0.5 select-none">
-                ✨ magie
+                {row.expand ? "✍ rewrite" : "✨ magie"}
               </span>
             </button>
           );

@@ -14,6 +14,7 @@
 import * as fs from "fs";
 import * as path from "path";
 import { fileURLToPath } from "url";
+import { createRequire } from "module";
 import { performance } from "perf_hooks";
 import {
   attributeMagieWords,
@@ -86,6 +87,31 @@ function selftest() {
   }
   check("attribution lossless over 5000 fuzz cases", lossless);
   check("attribution segments well-formed", wellFormed);
+
+  // 2b. Continuation merge preserves the model's word boundary (the
+  // "corr rect?" bug): a space-less continuation completes the draft's last
+  // word, a spaced one starts a new word, echoes strip, echo-only → null.
+  const { mergeDraftAndContinuation: merge } = createRequire(import.meta.url)(
+    "./.host.cjs"
+  );
+  const mergeCases = [
+    ["a new word corr", "ect?", "a new word correct?"],
+    ["then push", " the fix.", "then push the fix."],
+    ["so all good", ", right?", "so all good, right?"],
+    ["add a ", "yellow pill", "add a yellow pill"],
+    ["check the", "check the logs and push", "check the logs and push"],
+    ["a new word corr", "a new word correct?", "a new word correct?"],
+    ["check the", "check the", null],
+    ["check the", "   ", null],
+  ];
+  for (const [draft, raw, want] of mergeCases) {
+    const got = merge(draft, raw);
+    check(
+      `merge(${JSON.stringify(draft)}, ${JSON.stringify(raw)}) → ${JSON.stringify(want)}`,
+      got === want,
+      `got ${JSON.stringify(got)}`
+    );
+  }
 
   // 3. Phrase corpus properties.
   const NOW = 1_800_000_000_000;

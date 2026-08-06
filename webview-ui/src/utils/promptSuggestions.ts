@@ -26,9 +26,11 @@ export interface RankedPrompt extends PromptHistoryEntry {
  * the local LLM's ("magie") completion of the draft. The magie row carries
  * word-provenance segments so the menu can render copied vs invented words
  * differently. */
+// `expand: true` marks the rewrite row — the LLM's clean version of rough
+// notes, which replaces the phrase instead of extending it.
 export type SuggestionRow =
   | { kind: "history"; entry: RankedPrompt }
-  | { kind: "magie"; text: string; segments: MagieSegment[] };
+  | { kind: "magie"; text: string; segments: MagieSegment[]; expand?: boolean };
 
 /** A run of the magie suggestion: `novel` words were introduced by the LLM
  * (from conversation context or its own phrasing); the rest are traceable to
@@ -170,12 +172,47 @@ function matchesWordStart(norm: string, token: string): boolean {
   return norm.startsWith(token) || norm.includes(" " + token);
 }
 
+/** The interpolation weights that fuse the ranking signals (match tier +
+ * recency + frequency + word-weight boosts) — the λs of a cache-LM-style
+ * mixture. Exposed so scripts/battletest/tune_weights.mjs can FIT them on
+ * the real replay corpus instead of hand-guessing; production always uses
+ * DEFAULT_RANK_WEIGHTS. */
+export interface RankWeights {
+  /** Bonus when the whole query appears contiguously (base < 100). */
+  contiguous: number;
+  /** How far a phrase chunk ranks under its whole-prompt siblings. */
+  phrasePenalty: number;
+  /** Recency curve: max(0, recencyBase − recencyLog·log2(1+ageDays)). */
+  recencyBase: number;
+  recencyLog: number;
+  /** Extra for entries used within the last day (the MRU battle-test fix —
+   * keep ≥ 2 or same-session phrases lose to aged lookalikes). */
+  mruBonus: number;
+  /** frequency = freqScale · log2(1 + min(count, 16)). */
+  freqScale: number;
+  /** Multipliers on the corrector word-weight boosts. */
+  vocabScale: number;
+  bigramScale: number;
+}
+
+export const DEFAULT_RANK_WEIGHTS: RankWeights = {
+  contiguous: 15,
+  phrasePenalty: 6,
+  recencyBase: 14,
+  recencyLog: 3,
+  mruBonus: 4,
+  freqScale: 4,
+  vocabScale: 1,
+  bigramScale: 1,
+};
+
 export function rankPromptSuggestions(
   query: string,
   entries: RankedPrompt[],
   now: number,
   limit = 5,
-  vocab?: VocabModel
+  vocab?: VocabModel,
+  weights: RankWeights = DEFAULT_RANK_WEIGHTS
 ): RankedPrompt[] {
   const nq = normalize(query);
   if (!nq) {
@@ -201,12 +238,12 @@ export function rankPromptSuggestions(
     }
     // Contiguous phrase match anywhere beats scattered tokens.
     if (base < 100 && nq.length >= 6 && entry.norm.includes(nq)) {
-      base += 15;
+      base += weights.contiguous;
     }
     // Whole prompts are the primary product; at equal evidence a phrase
     // chunk ranks just under its full-prompt siblings.
     if (entry.unit === "phrase") {
-      base -= 6;
+      base -= weights.phrasePenalty;
     }
 
     const ageDays = Math.max(0, now - entry.lastUsed) / 86_400_000;
@@ -216,8 +253,12 @@ export function rankPromptSuggestions(
     // a phrase from the current session lost to aged lookalikes on short
     // ambiguous drafts.
     const recency =
-      Math.max(0, 14 - 3 * Math.log2(1 + ageDays)) + (ageDays < 1 ? 4 : 0);
-    const frequency = 4 * Math.log2(1 + Math.min(entry.count, 16));
+      Math.max(
+        0,
+        weights.recencyBase - weights.recencyLog * Math.log2(1 + ageDays)
+      ) + (ageDays < 1 ? weights.mruBonus : 0);
+    const frequency =
+      weights.freqScale * Math.log2(1 + Math.min(entry.count, 16));
 
     // Corrector-style personalization: candidates whose continuation carries
     // the user's high-weight project words (and likely next words) win ties
@@ -225,8 +266,10 @@ export function rankPromptSuggestions(
     let vocabBoost = 0;
     if (vocab) {
       vocabBoost =
-        candidateVocabBoost(vocab, entry.norm, nq) +
-        (base >= 94 ? bigramContinuationBoost(vocab, entry.norm, nq) : 0);
+        weights.vocabScale * candidateVocabBoost(vocab, entry.norm, nq) +
+        (base >= 94
+          ? weights.bigramScale * bigramContinuationBoost(vocab, entry.norm, nq)
+          : 0);
     }
 
     scored.push({ entry, score: base + recency + frequency + vocabBoost });

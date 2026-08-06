@@ -279,13 +279,19 @@ export type WebviewMessage =
   | { type: "searchFiles"; query: string }
   /** Composer asks for this project's past-prompt corpus (once per load). */
   | { type: "requestPromptHistory" }
-  /** Composer asks the local LLM ("magie") to complete the draft. `examples`
-   * may be empty — the model then works from conversation context alone. */
+  /** Composer asks the local LLM ("magie") about the phrase being typed.
+   * `draft` is the CURRENT LINE only; `priorDraft` carries any lines already
+   * written above it. `kind` "continue" completes the phrase in place;
+   * "expand" rewrites rough/keyword notes into the clean phrase the user
+   * means. `examples` may be empty — the model then works from conversation
+   * context alone. */
   | {
       type: "suggestPhrase";
       conversationId?: string;
       draft: string;
       examples: string[];
+      kind?: "continue" | "expand";
+      priorDraft?: string;
     }
   | {
       // Files dragged in from outside VS Code: the webview only gets blob
@@ -376,7 +382,11 @@ export type ExtensionMessage =
       type: "phraseSuggestion";
       draft: string;
       suggestion: string | null;
+      /** Candidate completions, confidence-ranked (first === suggestion) —
+       * the webview shows up to 3 magie rows, keyboard-style. */
+      suggestions?: string[];
       examples: string[];
+      kind?: "continue" | "expand";
     }
   | { type: "addFile"; filePath: string }
   | { type: "diffUpdate"; filePath: string; diff: string; status: "pending" | "accepted" | "rejected" }

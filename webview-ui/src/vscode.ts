@@ -19,23 +19,45 @@ class VsCodeWrapper {
           // Harness-only loopback: answer suggestPhrase with a canned "magie"
           // completion after a realistic delay, so the blue row is demoable
           // without an extension host (the real model runs there).
-          const m = msg as { type?: string; draft?: string; examples?: string[] };
+          const m = msg as {
+            type?: string;
+            draft?: string;
+            examples?: string[];
+            kind?: "continue" | "expand";
+          };
           if (m?.type === "suggestPhrase" && typeof m.draft === "string") {
             const draft = m.draft.trim();
-            const canned = draft.toLowerCase().startsWith("add")
-              ? `${draft} yellow idle counter pill on the tab strip`
-              : `${draft} in the composer and explain how it works`;
-            setTimeout(() => {
-              window.postMessage(
-                {
-                  type: "phraseSuggestion",
-                  draft: m.draft,
-                  suggestion: canned,
-                  examples: m.examples ?? [],
-                },
-                "*"
-              );
-            }, 220);
+            const kind = m.kind ?? "continue";
+            const canned =
+              kind === "expand"
+                ? `can you ${draft.replace(/\s+/g, " ")} and show me a screenshot as proof?`
+                : draft.toLowerCase().startsWith("add")
+                  ? `${draft} yellow idle counter pill on the tab strip`
+                  : `${draft} in the composer and explain how it works`;
+            const suggestions =
+              kind === "expand"
+                ? [canned]
+                : [
+                    canned,
+                    `${draft} and run the battle suite`,
+                    `${draft} then screenshot it as proof`,
+                  ];
+            setTimeout(
+              () => {
+                window.postMessage(
+                  {
+                    type: "phraseSuggestion",
+                    draft: m.draft,
+                    suggestion: canned,
+                    suggestions,
+                    examples: m.examples ?? [],
+                    kind,
+                  },
+                  "*"
+                );
+              },
+              kind === "expand" ? 340 : 220
+            );
           }
         },
         getState: () => undefined,

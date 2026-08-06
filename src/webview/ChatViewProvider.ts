@@ -2356,7 +2356,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         await this.handleSuggestPhrase(
           message.conversationId,
           message.draft,
-          message.examples ?? []
+          message.examples ?? [],
+          message.kind ?? "continue",
+          message.priorDraft
         );
         break;
 
@@ -5113,6 +5115,28 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
+  /** The user's last sent prompts (newest last) — thread context for the
+   * suggester, independent of lexical match: mined transcripts show half of
+   * all prompts continue the current thread ("okay, now…", "did you…").
+   * loadPromptHistory caches for 60s and sorts by lastUsed, so this is one
+   * slice, not a rescan; the just-sent turn reaches the model through the
+   * conversation block long before the scanner sees it. */
+  private async recentPrompts(): Promise<string[]> {
+    const workspacePath = this.getWorkspacePath();
+    if (!workspacePath) {
+      return [];
+    }
+    try {
+      const entries = await loadPromptHistory(workspacePath);
+      return entries
+        .slice(0, 3)
+        .map((e) => e.text.slice(0, 140))
+        .reverse();
+    } catch {
+      return [];
+    }
+  }
+
   /** Local-LLM ("magie") completion of the draft the user is typing. The
    * suggester itself is single-flight and never throws; an unavailable model
    * (file not downloaded) just answers null and the feature stays invisible.
@@ -5121,7 +5145,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private async handleSuggestPhrase(
     conversationId: string | undefined,
     draft: string,
-    examples: string[]
+    examples: string[],
+    kind: "continue" | "expand" = "continue",
+    priorDraft?: string
   ): Promise<void> {
     const runtime = conversationId
       ? this.runtimes.get(conversationId)
@@ -5131,17 +5157,24 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       .slice(-4)
       .map((m) => ({ role: m.role, text: m.content.slice(0, 240) }));
     const usedExamples = examples.slice(0, 8);
-    const suggestion = await this.llmSuggester.suggest({
+    const detail = await this.llmSuggester.suggestWithConfidence({
       draft,
+      kind,
+      // Long earlier lines still fit the 2048 context after truncation, and
+      // the tail (closest to the phrase being completed) matters most.
+      priorDraft: priorDraft ? priorDraft.slice(-600) : undefined,
       examples: usedExamples,
       conversation,
+      recent: await this.recentPrompts(),
       vocabulary: await this.projectVocabulary(),
     });
     this.postMessage({
       type: "phraseSuggestion",
       draft,
-      suggestion,
+      suggestion: detail?.shown ?? null,
+      suggestions: detail?.rows.map((r) => r.text) ?? [],
       examples: usedExamples,
+      kind,
     });
   }
 
