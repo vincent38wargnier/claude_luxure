@@ -36,6 +36,11 @@ import {
   WebviewMessage,
 } from "../shared/types";
 import { buildVocabModel, topProjectWords } from "../shared/vocabWeights";
+import {
+  findDroppedFolder,
+  tiedCandidates,
+  type FolderCandidate,
+} from "../utils/droppedFolder";
 import { extractMentions, resolveFromMention } from "../utils/path-mentions";
 import { loadPromptHistory } from "../utils/promptHistory";
 import { LlmSuggester } from "../utils/llmSuggester";
@@ -2230,6 +2235,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
       case "saveDroppedFiles":
         this.handleSaveDroppedFiles(message.files);
+        break;
+
+      case "resolveDroppedFolders":
+        await this.handleResolveDroppedFolders(message.folders, message.hints);
         break;
 
       case "cancelRequest": {
@@ -5558,6 +5567,94 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         );
       }
     }
+  }
+
+  /**
+   * Folders dragged in from outside VS Code arrive as content handles with no
+   * path at all — the webview can only report the folder's name and listing.
+   * Find the matching directory on disk and mention it, so the CLI works on the
+   * real folder instead of a copy.
+   */
+  private async handleResolveDroppedFolders(
+    folders: { name: string; entries: string[]; truncated?: boolean }[],
+    hints?: string[]
+  ): Promise<void> {
+    const workspaceRoots = (vscode.workspace.workspaceFolders ?? []).map(
+      (f) => f.uri.fsPath
+    );
+    for (const folder of folders ?? []) {
+      const name = path.basename((folder?.name ?? "").trim());
+      if (!name || name === "." || name === "..") {
+        continue;
+      }
+
+      // A drop that handed over the real path needs no searching.
+      const hint = (hints ?? []).find((h) => {
+        try {
+          return (
+            path.basename(h) === name && fs.statSync(h).isDirectory()
+          );
+        } catch {
+          return false;
+        }
+      });
+      if (hint) {
+        this.mentionDroppedFolder(hint, workspaceRoots);
+        continue;
+      }
+
+      let candidates: FolderCandidate[] = [];
+      try {
+        candidates = await findDroppedFolder(
+          { name, entries: folder.entries ?? [], truncated: folder.truncated },
+          workspaceRoots
+        );
+      } catch (err) {
+        log("ERROR", "resolveDroppedFolders search failed:", name, String(err));
+      }
+
+      if (candidates.length === 0) {
+        log("INFO", "resolveDroppedFolders: no match on disk for", name);
+        vscode.window.showWarningMessage(
+          `Couldn't find the dropped folder "${name}" on disk — drag it from the Explorer, or paste its path.`
+        );
+        continue;
+      }
+
+      // Same-named folders with the same contents (a copy, a sibling checkout):
+      // only the user knows which one they dragged.
+      const tied = tiedCandidates(candidates);
+      let chosen = candidates[0].dirPath;
+      if (tied.length > 1) {
+        const pick = await vscode.window.showQuickPick(
+          tied.slice(0, 10).map((c) => ({
+            label: `$(folder) ${path.basename(c.dirPath)}`,
+            description: c.dirPath,
+          })),
+          {
+            title: `Which "${name}" did you drop?`,
+            placeHolder: "Several folders on disk match",
+          }
+        );
+        if (!pick?.description) {
+          continue;
+        }
+        chosen = pick.description;
+      }
+      log("INFO", "resolveDroppedFolders:", name, "->", chosen);
+      this.mentionDroppedFolder(chosen, workspaceRoots);
+    }
+  }
+
+  /** Mention a resolved folder: workspace-relative when it lives inside the
+   * workspace, absolute otherwise. */
+  private mentionDroppedFolder(dirPath: string, workspaceRoots: string[]): void {
+    const root = workspaceRoots.find(
+      (r) => r && (dirPath === r || dirPath.startsWith(r + path.sep))
+    );
+    const mention =
+      root && dirPath !== root ? path.relative(root, dirPath) : dirPath;
+    this.addFileToChat(mention);
   }
 
   /** Lightbox "open in editor tab": write the chat image (a data URL) to a

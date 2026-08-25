@@ -31,9 +31,12 @@ import {
   MAX_IMAGES,
   MAX_DROP_FILE_MB,
   classifyDrop,
+  dropPathHints,
   filesToBase64,
   imageFilesFromClipboard,
+  pathMentionSnippet,
   pathsFromUriList,
+  readFolderManifests,
   toRelativePath,
 } from "./imageAttachments";
 import AccountSwitcher from "./AccountSwitcher";
@@ -548,7 +551,7 @@ export default function ChatTextArea({
   // Merge external files at cursor position
   useEffect(() => {
     if (externalFiles && externalFiles.length > 0) {
-      const mentions = externalFiles.map((f) => `@${f}`).join(" ");
+      const mentions = externalFiles.map(pathMentionSnippet).join(" ");
       insertTextAtCursor(mentions + " ");
       onClearExternalFiles?.();
     }
@@ -958,7 +961,7 @@ export default function ChatTextArea({
 
       if (paths.length === 0) return;
 
-      const mentions = paths.map((p: string) => `@${p}`).join(" ");
+      const mentions = paths.map(pathMentionSnippet).join(" ");
       insertTextAtCursor(mentions + " ");
     },
     [workspacePath, insertTextAtCursor]
@@ -977,10 +980,19 @@ export default function ChatTextArea({
         return;
       }
 
-      if (drop.folderCount > 0) {
+      // Folders from outside VS Code carry no path either — send the host the
+      // folder name plus its listing and let it find the real directory, which
+      // comes back as an `addFile` mention.
+      if (drop.folders.length > 0) {
         showNotice(
-          "Folders can't be dropped from outside VS Code — drop files instead"
+          drop.folders.length === 1
+            ? `Locating "${drop.folders[0].name}" on disk…`
+            : `Locating ${drop.folders.length} dropped folders…`
         );
+        const hints = dropPathHints(drop.text);
+        void readFolderManifests(drop.folders).then((folders) => {
+          vscode.postMessage({ type: "resolveDroppedFolders", folders, hints });
+        });
       }
 
       // Drops from outside VS Code (Finder, browsers…) arrive as blobs only —
@@ -1010,8 +1022,10 @@ export default function ChatTextArea({
         return;
       }
 
-      // Last resort: dragged text (a path from a terminal, etc.).
-      if (drop.text) {
+      // Last resort: dragged text (a path from a terminal, etc.). Skipped for
+      // folder drops — the text is usually just the folder's name, and the host
+      // already got it as a resolver hint.
+      if (drop.text && drop.folders.length === 0) {
         insertPathMentions(drop.text);
       }
     },

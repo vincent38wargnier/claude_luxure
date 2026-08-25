@@ -10,9 +10,12 @@ import {
   MAX_IMAGES,
   MAX_DROP_FILE_MB,
   classifyDrop,
+  dropPathHints,
   filesToBase64,
   imageFilesFromClipboard,
+  pathMentionSnippet,
   pathsFromUriList,
+  readFolderManifests,
 } from "./imageAttachments";
 
 interface EditableUserMessageProps {
@@ -124,7 +127,7 @@ export default function EditableUserMessage({
       if (paths.length === 0) {
         return;
       }
-      insertSnippet(paths.map((p) => `@${p}`).join(" ") + " ");
+      insertSnippet(paths.map(pathMentionSnippet).join(" ") + " ");
     },
     [workspacePath, insertSnippet]
   );
@@ -133,7 +136,7 @@ export default function EditableUserMessage({
   // text, exactly like the composer's flow.
   useEffect(() => {
     if (externalFiles && externalFiles.length > 0) {
-      insertSnippet(externalFiles.map((f) => `@${f}`).join(" ") + " ");
+      insertSnippet(externalFiles.map(pathMentionSnippet).join(" ") + " ");
       onClearExternalFiles?.();
     }
   }, [externalFiles, onClearExternalFiles, insertSnippet]);
@@ -160,10 +163,18 @@ export default function EditableUserMessage({
         insertPathMentions(drop.pathList);
         return;
       }
-      if (drop.folderCount > 0) {
+      // Folders carry no path — the host locates them and answers with an
+      // `addFile` mention (same round-trip as the composer).
+      if (drop.folders.length > 0) {
         showNotice(
-          "Folders can't be dropped from outside VS Code — drop files instead"
+          drop.folders.length === 1
+            ? `Locating "${drop.folders[0].name}" on disk…`
+            : `Locating ${drop.folders.length} dropped folders…`
         );
+        const hints = dropPathHints(drop.text);
+        void readFolderManifests(drop.folders).then((folders) => {
+          vscode.postMessage({ type: "resolveDroppedFolders", folders, hints });
+        });
       }
       if (
         drop.images.length > 0 ||
@@ -187,7 +198,7 @@ export default function EditableUserMessage({
         }
         return;
       }
-      if (drop.text) {
+      if (drop.text && drop.folders.length === 0) {
         insertPathMentions(drop.text);
       }
     },

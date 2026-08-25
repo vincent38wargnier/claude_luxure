@@ -347,6 +347,15 @@ export type WebviewMessage =
       type: "saveDroppedFiles";
       files: { name: string; dataBase64: string }[];
     }
+  | {
+      // Folders dragged in from outside VS Code: the webview only sees the
+      // folder's name and listing, so the host finds the real directory on
+      // disk and answers with an `addFile` mention.
+      type: "resolveDroppedFolders";
+      folders: { name: string; entries: string[]; truncated?: boolean }[];
+      /** Absolute paths the drop's plain text carried, if any — checked first. */
+      hints?: string[];
+    }
   | { type: "openFile"; filePath: string }
   | { type: "openDiff"; filePath: string }
   | { type: "openExternal"; url: string }

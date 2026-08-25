@@ -37,6 +37,18 @@ export function pathsFromUriList(raw: string, workspacePath?: string): string[] 
     .map((p) => toRelativePath(p, workspacePath));
 }
 
+/** How many child names we send the host to fingerprint a dropped folder. */
+export const MAX_FOLDER_MANIFEST_ENTRIES = 200;
+
+/** A folder dropped from outside VS Code, as the webview can see it: no path,
+ * just a name and a listing. The host turns that back into a real path. */
+export interface DroppedFolder {
+  name: string;
+  entries: string[];
+  /** The listing hit the cap above, so it is a prefix of the real one. */
+  truncated: boolean;
+}
+
 export interface DropPayload {
   /** Real paths (VS Code explorer / editor tabs, file:// uris) — mention directly. */
   pathList: string;
@@ -45,9 +57,16 @@ export interface DropPayload {
   /** Non-image blobs within the size cap — the host writes temp copies. */
   sendable: File[];
   oversizeCount: number;
-  folderCount: number;
+  /** Dropped directories — the host resolves each to a real path. */
+  folders: FileSystemDirectoryEntry[];
   /** Dragged plain text (a path from a terminal, etc.) — last resort. */
   text: string;
+}
+
+/** `@mention` for a path, or a plain backticked path when it contains
+ * whitespace — the mention syntax stops at the first space. */
+export function pathMentionSnippet(filePath: string): string {
+  return /\s/.test(filePath) ? `\`${filePath}\`` : `@${filePath}`;
 }
 
 /** Classify a drop into the buckets the composer and edit box both handle.
@@ -63,16 +82,18 @@ export function classifyDrop(e: DragEvent): DropPayload {
     .join("\n");
   const pathList = (codeUriList || fileUris).trim();
 
-  // Collect dropped blobs, skipping folders (FileReader can't ingest them).
+  // Collect dropped blobs; directories come out as entry handles instead
+  // (FileReader can't ingest them, and they carry no path).
   const items = Array.from(e.dataTransfer.items ?? []).filter(
     (it) => it.kind === "file"
   );
   let droppedFiles: File[] = [];
-  let folderCount = 0;
+  const folders: FileSystemDirectoryEntry[] = [];
   if (items.length > 0) {
     for (const it of items) {
-      if (it.webkitGetAsEntry?.()?.isDirectory) {
-        folderCount++;
+      const entry = it.webkitGetAsEntry?.();
+      if (entry?.isDirectory) {
+        folders.push(entry as FileSystemDirectoryEntry);
         continue;
       }
       const f = it.getAsFile();
@@ -95,9 +116,58 @@ export function classifyDrop(e: DragEvent): DropPayload {
     images,
     sendable,
     oversizeCount: others.length - sendable.length,
-    folderCount,
+    folders,
     text: pathList ? "" : e.dataTransfer.getData("text/plain").trim(),
   };
+}
+
+/** Read a dropped directory's immediate child names — the fingerprint the host
+ * uses to tell two same-named folders apart. Entry handles stay valid after
+ * the drop event, so this can run async. */
+export async function readFolderManifest(
+  dir: FileSystemDirectoryEntry
+): Promise<DroppedFolder> {
+  const reader = dir.createReader();
+  const entries: string[] = [];
+  let truncated = false;
+  // readEntries answers in chunks and signals the end with an empty batch.
+  for (;;) {
+    const batch = await new Promise<FileSystemEntry[]>((resolve) => {
+      reader.readEntries(
+        (found) => resolve(found),
+        () => resolve([])
+      );
+    });
+    if (batch.length === 0) break;
+    for (const entry of batch) {
+      if (entries.length >= MAX_FOLDER_MANIFEST_ENTRIES) {
+        truncated = true;
+        break;
+      }
+      entries.push(entry.name);
+    }
+    if (truncated) break;
+  }
+  return { name: dir.name, entries, truncated };
+}
+
+export function readFolderManifests(
+  dirs: FileSystemDirectoryEntry[]
+): Promise<DroppedFolder[]> {
+  return Promise.all(dirs.map(readFolderManifest));
+}
+
+/** Absolute-looking paths carried by a drop's plain text — some sources (a
+ * terminal, some file managers) hand over the real path there, which saves the
+ * host a filesystem search. */
+export function dropPathHints(text: string): string[] {
+  return text
+    .split("\n")
+    .map((line) => line.trim())
+    .map((line) =>
+      line.startsWith("file://") ? decodeURIComponent(line.slice(7)) : line
+    )
+    .filter((line) => line.startsWith("/") || /^[A-Za-z]:[\\/]/.test(line));
 }
 
 /** Base64 payloads (data-url prefix stripped) for saveDroppedFiles. */
