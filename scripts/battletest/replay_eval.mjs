@@ -278,7 +278,9 @@ function contextFor(probe) {
   const examples = rankPromptSuggestions(probe.draft, corpus, probe.ts, 5, vocabModel).map(
     (e) => e.text
   );
-  // Conversation: same session, merged consecutive roles, last 4, head 240.
+  // Conversation: same session, merged consecutive roles, last 4 — the
+  // PRODUCTION cut (mirrors ChatViewProvider.handleSuggestPhrase): head 240
+  // per turn, except a question-ending last assistant turn gets head+tail.
   const sess = list.filter((r) => r.session === probe.session && r.ts < probe.ts);
   const merged = [];
   for (const r of sess) {
@@ -286,19 +288,52 @@ function contextFor(probe) {
     if (last && last.role === r.role) last.text += " " + r.text;
     else merged.push({ role: r.role, text: r.text });
   }
-  const conversation = merged.slice(-4).map((t) => ({ role: t.role, text: t.text.slice(0, 240) }));
+  const conversation = merged.slice(-4).map((t, i, arr) => {
+    const isLast = i === arr.length - 1;
+    if (
+      isLast &&
+      t.role === "assistant" &&
+      t.text.length > 440 &&
+      /\?/.test(t.text.slice(-200))
+    ) {
+      return { role: t.role, text: t.text.slice(0, 200) + " … " + t.text.slice(-200) };
+    }
+    return { role: t.role, text: t.text.slice(0, 240) };
+  });
   // Tail arm: keep the END of each turn — an assistant reply's conclusion /
   // question is its reaction surface, and production's head-240 cuts it off.
   const conversationTail = merged.slice(-4).map((t) => ({
     role: t.role,
     text: t.text.length > 240 ? "…" + t.text.slice(-239) : t.text,
   }));
+  // Head+tail arm: pure tail LOST to head (22.5% vs 25.5% — the opener says
+  // what happened), but the LAST assistant turn's tail carries the ask the
+  // next prompt reacts to ("are you next to the machine?"), so that one turn
+  // gets head AND tail.
+  const conversationHT = merged.slice(-4).map((t, i, arr) => {
+    const isLast = i === arr.length - 1;
+    if (isLast && t.role === "assistant" && t.text.length > 440) {
+      return {
+        role: t.role,
+        text: t.text.slice(0, 200) + " … " + t.text.slice(-200),
+      };
+    }
+    return { role: t.role, text: t.text.slice(0, 240) };
+  });
   const recent = beforeUsers.slice(-3).map((u) => u.text.slice(0, 140));
   // Conversation-lane retrieval (v4): related past prompts by topic, not
   // prefix — excludes what the draft lane already found.
   const exclude = new Set(examples.slice(0, 3).map((e) => norm(e)));
   const related = rankThreadRelated(conversation, entries, probe.ts, 2, exclude);
-  return { examples, conversation, conversationTail, vocabulary, recent, related };
+  return {
+    examples,
+    conversation,
+    conversationTail,
+    conversationHT,
+    vocabulary,
+    recent,
+    related,
+  };
 }
 
 // ---------- scoring ----------
@@ -456,7 +491,9 @@ async function main() {
               ? { ...ctx, conversation: [], recent: [], draft: probe.draft }
               : armName === "v3tail"
                 ? { ...ctx, conversation: ctx.conversationTail, draft: probe.draft }
-                : { ...ctx, draft: probe.draft };
+                : armName === "v3ht"
+                  ? { ...ctx, conversation: ctx.conversationHT, draft: probe.draft }
+                  : { ...ctx, draft: probe.draft };
         const isV3 = armName.startsWith("v3") || armName === "v4";
         const promptText = isV3
           ? buildPromptV3(req, armName === "v4")
@@ -467,6 +504,7 @@ async function main() {
           armName === "current" ||
           armName === "v3bias" ||
           armName === "v3tail" ||
+          armName === "v3ht" ||
           armName === "v4" ||
           armName === "v3noex" ||
           armName === "v3noconv"

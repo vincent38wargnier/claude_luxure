@@ -592,30 +592,37 @@ export class LlmSuggester {
     const midWordRisk = /\S$/.test(prefill);
     const probe = await this.probeFirstToken(handles, tokens, tokenBias);
     if (!probe) {
+      if (midWordRisk) {
+        // Immediate EOG after a half-typed word is itself a token-split
+        // symptom (the model bails on the mangled tail) — the healed prompt
+        // regenerates the word and often continues fine.
+        const healed = await this.decodeHealed(
+          handles,
+          contextTokens,
+          prefill,
+          tokenBias,
+          maxTokens,
+          earlyStop
+        );
+        return { primary: healed, alternatives: [] };
+      }
       return { primary: { continuation: "", words: [] }, alternatives: [] };
     }
     if (midWordRisk && /^[\p{L}\p{N}]/u.test(probe.text)) {
       // The greedy continuation fuses letters onto the draft's last word —
       // the token-split hazard: a prefill cut mid-word tokenizes differently
       // than the finished word, so the model re-derives it from a bad split
-      // ("…corr" + "rect" → "corrrect"). Token healing: back the prefill off
-      // to the last word boundary (never across a newline); the model
-      // regenerates the fragment itself — its output must start with it,
-      // else no suggestion — and only what follows counts ("…screensh" →
-      // " screenshot of…" → continuation "ot of…"). Healing must NOT run
-      // unconditionally: forcing the model to re-guess a COMPLETE last word
-      // collapsed the show rate 18%→7% on the replay corpus. Single branch:
-      // alternatives would need their own healed decodes.
-      const fragment = prefill.match(/(?:[^\S\n])?\S+$/)?.[0] ?? "";
-      const healedPrefill = prefill.slice(0, prefill.length - fragment.length);
-      const healed = await this.decodeOnce(
+      // ("…corr" + "rect" → "corrrect"). Token healing (decodeHealed): the
+      // model regenerates the last word itself and only what follows counts
+      // ("…screensh" → " screenshot of…" → continuation "ot of…"). Healing
+      // must NOT run unconditionally: forcing the model to re-guess a
+      // COMPLETE last word collapsed the show rate 18%→7% on the replay
+      // corpus. Single branch: alternatives would need their own healed
+      // decodes.
+      const healed = await this.decodeHealed(
         handles,
-        contextTokens.concat(
-          healedPrefill
-            ? handles.model.tokenize(healedPrefill, false, "trimLeadingSpace")
-            : []
-        ),
-        fragment,
+        contextTokens,
+        prefill,
         tokenBias,
         maxTokens,
         earlyStop
@@ -645,6 +652,32 @@ export class LlmSuggester {
       w1.confidence < CONF_CANDIDATE_FLOOR ||
       !/[\p{L}\p{N}]/u.test(w1.word)
     ) {
+      if (midWordRisk) {
+        // Mid-word draft whose naive continuation can't form a row: before
+        // hiding the block, try the healed completion — greedy may prefer a
+        // spaced token after a half-typed word ("…sitting ne" + " and")
+        // while the regenerated word ("…sitting" → " next…") completes it.
+        // Short decode (rescue rows are 1-2 words), and the healed result
+        // only WINS when it can actually form a row — otherwise the naive
+        // primary is kept (its full continuation still feeds benches and
+        // the fullDecode path).
+        const healed = await this.decodeHealed(
+          handles,
+          contextTokens,
+          prefill,
+          tokenBias,
+          12,
+          earlyStop
+        );
+        const hw1 = healed.words[0];
+        if (
+          hw1 &&
+          hw1.confidence >= CONF_CANDIDATE_FLOOR &&
+          /[\p{L}\p{N}]/u.test(hw1.word)
+        ) {
+          return { primary: healed, alternatives: [] };
+        }
+      }
       return { primary, alternatives: [] };
     }
     const alternatives: { continuation: string; words: ConfidentWord[] }[] =
@@ -665,6 +698,34 @@ export class LlmSuggester {
       );
     }
     return { primary, alternatives };
+  }
+
+  /** Token-healing decode: back the prefill off to the last word boundary
+   * (never across a newline), let the model regenerate the fragment itself —
+   * its output must start with it, else no suggestion — and count only what
+   * follows as the continuation. */
+  private async decodeHealed(
+    handles: LlamaHandles,
+    contextTokens: number[],
+    prefill: string,
+    tokenBias: TokenBiasLike | null,
+    maxTokens: number,
+    earlyStop?: { showFloor: number; extendFloor: number }
+  ): Promise<{ continuation: string; words: ConfidentWord[] }> {
+    const fragment = prefill.match(/(?:[^\S\n])?\S+$/)?.[0] ?? "";
+    const healedPrefill = prefill.slice(0, prefill.length - fragment.length);
+    return this.decodeOnce(
+      handles,
+      contextTokens.concat(
+        healedPrefill
+          ? handles.model.tokenize(healedPrefill, false, "trimLeadingSpace")
+          : []
+      ),
+      fragment,
+      tokenBias,
+      maxTokens,
+      earlyStop
+    );
   }
 
   /** Align the sequence KV to `tokens`, keeping at least one token free to

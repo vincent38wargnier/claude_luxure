@@ -5152,10 +5152,31 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const runtime = conversationId
       ? this.runtimes.get(conversationId)
       : this.runtimes.get(this.activeKey);
-    const conversation = (runtime?.messages ?? [])
+    const turns = (runtime?.messages ?? [])
       .filter((m) => (m.role === "user" || m.role === "assistant") && m.content)
-      .slice(-4)
-      .map((m) => ({ role: m.role, text: m.content.slice(0, 240) }));
+      .slice(-4);
+    const conversation = turns.map((m, i) => {
+      // Turns are cut to their HEAD (what the reply did — beats tail 25.5%
+      // vs 22.5% on the replay corpus). One exception, user-reported: when
+      // the LAST assistant turn ends on a question ("are you next to the
+      // machine?"), the user's next message often answers it and head-only
+      // cuts the question off — so that turn gets head AND tail. Benched
+      // flat on the replay average (25.0% vs 25.5%, within noise; arms
+      // v3tail/v3ht/spliced conditional in replay_eval).
+      const isLast = i === turns.length - 1;
+      if (
+        isLast &&
+        m.role === "assistant" &&
+        m.content.length > 440 &&
+        /\?/.test(m.content.slice(-200))
+      ) {
+        return {
+          role: m.role,
+          text: m.content.slice(0, 200) + " … " + m.content.slice(-200),
+        };
+      }
+      return { role: m.role, text: m.content.slice(0, 240) };
+    });
     const usedExamples = examples.slice(0, 8);
     const detail = await this.llmSuggester.suggestWithConfidence({
       draft,
