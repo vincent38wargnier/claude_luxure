@@ -110,10 +110,12 @@ interface ChatViewProps {
   usage?: UsageInfo | null;
   usageByAccount?: Record<string, UsageInfo | null>;
   disconnectedAccounts?: Record<string, boolean>;
+  loggedOutAccounts?: Record<string, boolean>;
   onSwitchAccount?: (accountId: string) => void;
   onAddAccount?: () => void;
   onRemoveAccount?: (accountId: string) => void;
   onReauthAccount?: (accountId: string) => void;
+  onLogoutAccount?: (accountId: string) => void;
   summarizingIds?: string[];
   summarizeProgress?: { done: number; total: number } | null;
   onSummarizeSession?: (sessionId: string) => void;
@@ -193,10 +195,12 @@ export default function ChatView({
   usage,
   usageByAccount,
   disconnectedAccounts,
+  loggedOutAccounts,
   onSwitchAccount,
   onAddAccount,
   onRemoveAccount,
   onReauthAccount,
+  onLogoutAccount,
   summarizingIds,
   summarizeProgress,
   onSummarizeSession,
@@ -555,10 +559,12 @@ export default function ChatView({
         usage={usage}
         usageByAccount={usageByAccount}
         disconnectedAccounts={disconnectedAccounts}
+        loggedOutAccounts={loggedOutAccounts}
         onSwitchAccount={onSwitchAccount}
         onAddAccount={onAddAccount}
         onRemoveAccount={onRemoveAccount}
         onReauthAccount={onReauthAccount}
+        onLogoutAccount={onLogoutAccount}
       />
     </div>
   );

@@ -365,6 +365,7 @@ export type WebviewMessage =
   | { type: "addAccount" }
   | { type: "removeAccount"; accountId: string }
   | { type: "reauthAccount"; accountId: string }
+  | { type: "logoutAccount"; accountId: string }
   | { type: "refreshUsage" }
   | { type: "summarizeSession"; sessionId: string }
   | { type: "summarizeAllSessions" }
@@ -487,6 +488,10 @@ export type ExtensionMessage =
       /** Account ids whose stored login can no longer authenticate and can't
        * self-heal (expired token, no refresh token) → show a Reconnect button. */
       disconnected?: Record<string, boolean>;
+      /** Account ids the user deliberately disconnected (their token was
+       * deleted) — a subset of `disconnected`, worded "disconnected" rather
+       * than "session expired". */
+      loggedOut?: Record<string, boolean>;
     }
   | {
       type: "summarizeStatus";

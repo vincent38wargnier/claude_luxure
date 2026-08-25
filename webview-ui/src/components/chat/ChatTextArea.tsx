@@ -83,10 +83,12 @@ interface ChatTextAreaProps {
   usage?: UsageInfo | null;
   usageByAccount?: Record<string, UsageInfo | null>;
   disconnectedAccounts?: Record<string, boolean>;
+  loggedOutAccounts?: Record<string, boolean>;
   onSwitchAccount?: (accountId: string) => void;
   onAddAccount?: () => void;
   onRemoveAccount?: (accountId: string) => void;
   onReauthAccount?: (accountId: string) => void;
+  onLogoutAccount?: (accountId: string) => void;
 }
 
 
@@ -294,10 +296,12 @@ export default function ChatTextArea({
   usage,
   usageByAccount,
   disconnectedAccounts,
+  loggedOutAccounts,
   onSwitchAccount,
   onAddAccount,
   onRemoveAccount,
   onReauthAccount,
+  onLogoutAccount,
 }: ChatTextAreaProps) {
   const [inputValue, setInputValue] = useState("");
   const [selectedImages, setSelectedImages] = useState<string[]>([]);
@@ -1206,12 +1210,14 @@ export default function ChatTextArea({
             activeAccountId={activeAccountId}
             usageByAccount={usageByAccount}
             disconnected={disconnectedAccounts}
+            loggedOut={loggedOutAccounts}
             fallbackEmail={accountEmail}
             fallbackOrg={accountOrg}
             onSwitch={onSwitchAccount}
             onAdd={onAddAccount}
             onRemove={onRemoveAccount}
             onReauth={onReauthAccount}
+            onLogout={onLogoutAccount}
           />
           <button
             className="p-1 rounded opacity-40 hover:opacity-70 transition-opacity text-vscode-fg"

@@ -9,8 +9,10 @@ import type {
   SessionInfo,
   SessionMarker,
   SkillInfo,
+  StoredAccount,
   TaskActivity,
   TimelinePart,
+  UsageInfo,
 } from "./types";
 
 /**
@@ -237,6 +239,51 @@ const initialRunningTasks: TaskActivity[] = [
 ];
 
 const noop = () => {};
+
+// Account switcher fixtures — one healthy Default, one healthy added account,
+// one whose token expired, one the user deliberately disconnected. Covers every
+// state the switcher rows render (usage bars, both Reconnect wordings).
+const HARNESS_ACCOUNTS: StoredAccount[] = [
+  {
+    id: "default",
+    label: "vincent@jarvio.io",
+    email: "vincent@jarvio.io",
+    isDefault: true,
+  },
+  {
+    id: "acct-gmail",
+    label: "vw.wargnier@gmail.com",
+    email: "vw.wargnier@gmail.com",
+    isDefault: false,
+    configDir: "/tmp/harness/acct-gmail",
+  },
+  {
+    id: "acct-expired",
+    label: "vince@magif.ai",
+    email: "vince@magif.ai",
+    isDefault: false,
+    configDir: "/tmp/harness/acct-expired",
+  },
+  {
+    id: "acct-out",
+    label: "old@jarvio.io",
+    email: "old@jarvio.io",
+    isDefault: false,
+    configDir: "/tmp/harness/acct-out",
+  },
+];
+
+const bucket = (utilization: number) => ({
+  utilization,
+  resetsAt: "2026-08-07T09:00:00Z",
+});
+
+const HARNESS_USAGE: Record<string, UsageInfo | null> = {
+  default: { fiveHour: bucket(10), sevenDay: bucket(100) },
+  "acct-gmail": { fiveHour: bucket(42), sevenDay: bucket(66) },
+  "acct-expired": null,
+  "acct-out": null,
+};
 
 const params = new URLSearchParams(window.location.search);
 const streaming = params.has("streaming");
@@ -584,6 +631,17 @@ function ChatHarness() {
           model: "claude-fable-5",
         }}
         accountEmail="vincent@jarvio.io"
+        accounts={HARNESS_ACCOUNTS}
+        activeAccountId="default"
+        usage={HARNESS_USAGE.default}
+        usageByAccount={HARNESS_USAGE}
+        disconnectedAccounts={{ "acct-expired": true, "acct-out": true }}
+        loggedOutAccounts={{ "acct-out": true }}
+        onSwitchAccount={(id) => console.log(`[harness] switchAccount ${id}`)}
+        onAddAccount={() => console.log("[harness] addAccount")}
+        onRemoveAccount={(id) => console.log(`[harness] removeAccount ${id}`)}
+        onReauthAccount={(id) => console.log(`[harness] reauthAccount ${id}`)}
+        onLogoutAccount={(id) => console.log(`[harness] logoutAccount ${id}`)}
         workspacePath="/Users/vincent/Documents/code/magify.fun/code/claude_luxure"
         onSend={(text) => {
           if (conv.isStreaming) {

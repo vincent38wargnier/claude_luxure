@@ -6,6 +6,7 @@ import {
   ChevronDown,
   AlertTriangle,
   RefreshCw,
+  LogOut,
 } from "lucide-react";
 import type { StoredAccount, UsageInfo } from "../../types";
 
@@ -16,6 +17,9 @@ interface Props {
   usageByAccount?: Record<string, UsageInfo | null>;
   /** Account ids whose login expired and can't refresh → show "Reconnect". */
   disconnected?: Record<string, boolean>;
+  /** Account ids the user deliberately disconnected — a subset of
+   * {@link disconnected}, worded "disconnected" rather than "session expired". */
+  loggedOut?: Record<string, boolean>;
   /** Shown when the accounts list hasn't loaded yet (keychain email). */
   fallbackEmail?: string;
   fallbackOrg?: string;
@@ -23,6 +27,34 @@ interface Props {
   onAdd?: () => void;
   onRemove?: (accountId: string) => void;
   onReauth?: (accountId: string) => void;
+  onLogout?: (accountId: string) => void;
+}
+
+/** Row action: a per-account icon button. Quiet at rest and full-strength on the
+ * hovered row (the cluster carries the opacity), and it must not also switch to
+ * the account whose row it sits in. */
+function RowAction({
+  title,
+  onClick,
+  children,
+}: {
+  title: string;
+  onClick: () => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      title={title}
+      className="p-0.5 rounded text-vscode-descriptionFg hover:text-vscode-fg hover:bg-[rgba(255,255,255,0.1)] transition-colors shrink-0"
+      onClick={(e) => {
+        e.stopPropagation();
+        onClick();
+      }}
+    >
+      {children}
+    </button>
+  );
 }
 
 /** A compact session/weekly usage readout shown under each account in the
@@ -62,19 +94,23 @@ function MiniUsage({ usage }: { usage: UsageInfo }) {
 
 /** The account indicator in the composer bottom bar. Click to open a switcher
  * listing every configured account (the keychain "Default" first, then added
- * config-dir accounts) with each account's live session/weekly usage, switch the
- * active conversation's account, add a new one, or remove a stored one. */
+ * config-dir accounts) with each account's live session/weekly usage. From there:
+ * switch the active conversation's account, add one, disconnect one (deletes its
+ * token, keeps the row), reconnect one (fresh login — recreates the token, or
+ * puts a different Claude account in the slot), or remove an added one. */
 export default function AccountSwitcher({
   accounts,
   activeAccountId,
   usageByAccount,
   disconnected,
+  loggedOut,
   fallbackEmail,
   fallbackOrg,
   onSwitch,
   onAdd,
   onRemove,
   onReauth,
+  onLogout,
 }: Props) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
@@ -97,6 +133,7 @@ export default function AccountSwitcher({
   const active = list.find((a) => a.id === activeId);
   const activeLabel = active?.label || fallbackEmail || "Account";
   const activeDisconnected = !!disconnected?.[activeId];
+  const activeLoggedOut = !!loggedOut?.[activeId];
 
   // Nothing to show or do.
   if (!onSwitch && !fallbackEmail) {
@@ -115,8 +152,8 @@ export default function AccountSwitcher({
         }
         title={
           activeDisconnected
-            ? `${activeLabel} — session expired. Click to reconnect.`
-            : `Account: ${activeLabel}${fallbackOrg ? ` (${fallbackOrg})` : ""}\nClick to switch the account for this conversation`
+            ? `${activeLabel} — ${activeLoggedOut ? "disconnected" : "session expired"}. Click to reconnect.`
+            : `Account: ${activeLabel}${fallbackOrg ? ` (${fallbackOrg})` : ""}\nClick to switch, reconnect or disconnect an account`
         }
       >
         {activeDisconnected && (
@@ -133,6 +170,7 @@ export default function AccountSwitcher({
           {list.map((a) => {
             const u = usageByAccount?.[a.id];
             const isDead = !!disconnected?.[a.id];
+            const isOut = !!loggedOut?.[a.id];
             return (
               <div
                 key={a.id}
@@ -163,26 +201,49 @@ export default function AccountSwitcher({
                       />
                     )}
                   </div>
-                  {!a.isDefault && onRemove && (
-                    <button
-                      type="button"
-                      className="opacity-0 group-hover:opacity-60 hover:!opacity-100 text-vscode-descriptionFg shrink-0"
-                      title="Remove this account"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        onRemove(a.id);
-                      }}
-                    >
-                      <Trash2 size={11} />
-                    </button>
-                  )}
+                  <div className="flex items-center gap-0.5 shrink-0 opacity-40 group-hover:opacity-100 transition-opacity">
+                    {onReauth && (
+                      <RowAction
+                        title="Reconnect — sign out and log in again, as this or another Claude account (recreates the token)"
+                        onClick={() => {
+                          onReauth(a.id);
+                          setOpen(false);
+                        }}
+                      >
+                        <RefreshCw size={11} />
+                      </RowAction>
+                    )}
+                    {onLogout && !isOut && (
+                      <RowAction
+                        title="Disconnect — delete this account's stored token (the account stays in the list)"
+                        onClick={() => {
+                          onLogout(a.id);
+                          setOpen(false);
+                        }}
+                      >
+                        <LogOut size={11} />
+                      </RowAction>
+                    )}
+                    {!a.isDefault && onRemove && (
+                      <RowAction
+                        title="Remove this account"
+                        onClick={() => onRemove(a.id)}
+                      >
+                        <Trash2 size={11} />
+                      </RowAction>
+                    )}
+                  </div>
                 </div>
                 {isDead ? (
                   onReauth && (
                     <button
                       type="button"
                       className="flex items-center gap-1 mt-1 ml-[18px] px-1.5 py-0.5 rounded text-[10px] text-[#f87171] border border-[#f87171]/40 hover:bg-[#f87171]/10 transition-colors"
-                      title="Session expired — log in again to restore this account"
+                      title={
+                        isOut
+                          ? "Disconnected — log in again to use this account"
+                          : "Session expired — log in again to restore this account"
+                      }
                       onClick={(e) => {
                         e.stopPropagation();
                         onReauth(a.id);
@@ -190,7 +251,7 @@ export default function AccountSwitcher({
                       }}
                     >
                       <RefreshCw size={10} className="shrink-0" />
-                      Reconnect — session expired
+                      {isOut ? "Reconnect — disconnected" : "Reconnect — session expired"}
                     </button>
                   )
                 ) : (

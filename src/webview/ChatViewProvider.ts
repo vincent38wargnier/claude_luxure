@@ -672,31 +672,38 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.renameTab(draftKey, sessionId);
   }
 
-  private fetchAccountInfo(): void {
-    execFile(resolveClaudePath(), ["auth", "status"], (err, stdout) => {
-      if (err) {
-        log("WARN", "Failed to fetch account info:", err.message);
-        return;
-      }
-      try {
-        const info = JSON.parse(stdout.trim());
-        this.accountEmail = info.email;
-        this.accountOrg = info.orgName;
-        this.accountSubscription = info.subscriptionType;
-        log("INFO", "Account info:", info.email, info.orgName);
-        this.postMessage({
-          type: "accountInfo",
-          account: {
-            email: info.email,
-            orgName: info.orgName,
-            subscriptionType: info.subscriptionType,
-          },
-        });
-        this.sendState();
-        this.sendAccountsList();
-      } catch {
-        log("WARN", "Failed to parse account info:", stdout.slice(0, 200));
-      }
+  /** Read the ambient (Default account) `auth status` and publish it. Awaitable
+   * so a reconnect can report the identity the user actually logged in as —
+   * callers that just want the refresh can ignore the promise. */
+  private fetchAccountInfo(): Promise<void> {
+    return new Promise((resolve) => {
+      execFile(resolveClaudePath(), ["auth", "status"], (err, stdout) => {
+        if (err) {
+          log("WARN", "Failed to fetch account info:", err.message);
+          resolve();
+          return;
+        }
+        try {
+          const info = JSON.parse(stdout.trim());
+          this.accountEmail = info.email;
+          this.accountOrg = info.orgName;
+          this.accountSubscription = info.subscriptionType;
+          log("INFO", "Account info:", info.email, info.orgName);
+          this.postMessage({
+            type: "accountInfo",
+            account: {
+              email: info.email,
+              orgName: info.orgName,
+              subscriptionType: info.subscriptionType,
+            },
+          });
+          this.sendState();
+          this.sendAccountsList();
+        } catch {
+          log("WARN", "Failed to parse account info:", stdout.slice(0, 200));
+        }
+        resolve();
+      });
     });
   }
 
@@ -2429,6 +2436,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         await this.handleReauthAccount(message.accountId);
         break;
 
+      case "logoutAccount":
+        await this.handleLogoutAccount(message.accountId);
+        break;
+
       case "refreshUsage":
         void this.pollUsageForAll();
         break;
@@ -2617,6 +2628,46 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       return undefined;
     }
     return this.getAddedAccounts().find((a) => a.id === accountId)?.configDir;
+  }
+
+  /** Accounts the user deliberately disconnected (their stored token was
+   * deleted). Persisted, unlike {@link authFailedAccountIds}: once the token is
+   * gone there is nothing left to infer the state from, so without this a
+   * reloaded window would show a credential-less account as healthy. */
+  private getLoggedOutAccountIds(): string[] {
+    return (
+      this.context.globalState.get<string[]>("claude-luxure.loggedOutAccounts") ||
+      []
+    );
+  }
+
+  private async setLoggedOut(
+    accountId: string,
+    loggedOut: boolean
+  ): Promise<void> {
+    const current = this.getLoggedOutAccountIds();
+    const next = loggedOut
+      ? Array.from(new Set([...current, accountId]))
+      : current.filter((id) => id !== accountId);
+    if (next.length !== current.length) {
+      await this.context.globalState.update(
+        "claude-luxure.loggedOutAccounts",
+        next
+      );
+    }
+  }
+
+  /** Whether an account has no usable stored login right now: a 401 was already
+   * seen, it was deliberately disconnected, or its token is expired beyond
+   * refresh. Same judgement the switcher's disconnected dot is built from. */
+  private async isAccountDisconnected(accountId: string): Promise<boolean> {
+    if (
+      this.authFailedAccountIds.has(accountId) ||
+      this.getLoggedOutAccountIds().includes(accountId)
+    ) {
+      return true;
+    }
+    return this.isOAuthDead(await this.resolveOAuthRecord(accountId));
   }
 
   private sendAccountsList(): void {
@@ -2812,6 +2863,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       return;
     }
     const acct = this.getAddedAccounts().find((a) => a.id === accountId);
+    // Revoke and delete the token before the profile goes — afterwards its
+    // config dir is unresolvable and the keychain entry would be orphaned.
+    await this.clearStoredCredential(accountId);
+    await this.setLoggedOut(accountId, false);
+    this.authFailedAccountIds.delete(accountId);
     const added = this.getAddedAccounts().filter((a) => a.id !== accountId);
     await this.context.globalState.update("claude-luxure.accounts", added);
     if (
@@ -2854,16 +2910,53 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     return `'${p.replace(/'/g, "'\\''")}'`;
   }
 
-  /** Re-run the browser login for an account whose stored token can no longer
-   * authenticate (see {@link isOAuthDead}) — the one-click "Reconnect" action.
-   * Same login mechanics as {@link handleAddAccount}, but refreshes an existing
-   * account in place instead of creating one. */
-  private async handleReauthAccount(accountId: string): Promise<void> {
+  /** Re-run the browser login for an account — the "Reconnect" action, offered on
+   * every row of the switcher. Heals an account whose stored token can no longer
+   * authenticate (see {@link isOAuthDead}), and equally recreates a token on
+   * demand: log in as a different Claude account when the wrong one ended up in
+   * the slot. Same login mechanics as {@link handleAddAccount}, but refreshes an
+   * existing account in place instead of creating one.
+   *
+   * The stored credential is deleted first. That's what makes a wrong-account
+   * login actually replaceable, and it's also what makes "a fresh token
+   * appeared" (see {@link waitForReconnect}) a truthful completion signal — with
+   * a still-valid token in place, that check would pass instantly without the
+   * user having logged in at all. */
+  private async handleReauthAccount(
+    accountId: string,
+    opts?: { skipConfirm?: boolean }
+  ): Promise<void> {
     const configDir = this.getConfigDirForAccount(accountId);
     const label = this.labelFor(accountId);
+    const isDefault = !accountId || accountId === "default";
+
+    // Reconnecting a *working* account throws away a good token, so confirm it.
+    // A disconnected one has nothing to lose — keep that path one click.
+    if (!opts?.skipConfirm && !(await this.isAccountDisconnected(accountId))) {
+      const choice = await vscode.window.showWarningMessage(
+        `Reconnect ${label}?`,
+        {
+          modal: true,
+          detail: isDefault
+            ? "Signs out the shared login in ~/.claude and starts a fresh browser login — you can log in as a different Claude account. Your terminal `claude` uses this same login, so it will need to log in again too."
+            : "Signs this account out and starts a fresh browser login, so you can log in as a different Claude account (or just recreate the token).",
+        },
+        "Reconnect"
+      );
+      if (choice !== "Reconnect") {
+        return;
+      }
+    }
+
     if (configDir) {
       this.linkSharedAssets(configDir);
     }
+
+    // Clear first — see the note above. The switcher shows the account as
+    // disconnected for the duration of the login.
+    await this.clearStoredCredential(accountId);
+    await this.setLoggedOut(accountId, true);
+    void this.pollUsageForAll();
 
     const terminal = vscode.window.createTerminal({
       name: `Reconnect ${label}`,
@@ -2879,18 +2972,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     terminal.dispose();
     if (!ok) {
       vscode.window.showWarningMessage(
-        `Didn't detect a completed login for ${label}. Click Reconnect to try again.`
+        `Didn't detect a completed login for ${label} — it stays disconnected until you finish one. Click Reconnect to try again.`
       );
       // Re-poll so the bar reflects the still-disconnected state.
       void this.pollUsageForAll();
       return;
     }
 
-    // Fresh token confirmed — clear any runtime auth-failure flag so the
-    // account stops showing as disconnected.
+    // Fresh token confirmed — clear both disconnected flags so the account
+    // stops showing as disconnected.
     this.authFailedAccountIds.delete(accountId);
+    await this.setLoggedOut(accountId, false);
 
-    // Refresh the stored profile (subscription/email can change on re-login).
+    // Refresh the stored profile (subscription/email can change on re-login —
+    // and a reconnect is allowed to land on a different Claude account).
     if (configDir) {
       const info = await this.authStatusForDir(configDir);
       if (info?.email) {
@@ -2903,6 +2998,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           await this.context.globalState.update("claude-luxure.accounts", added);
         }
       }
+    } else {
+      // The Default row's label comes from the ambient `auth status`, not from
+      // stored state — re-read it so a reconnect as a different account renames
+      // the row instead of showing the previous email.
+      await this.fetchAccountInfo();
     }
 
     // Any open conversation bound to this account is still pointing at the dead
@@ -2916,15 +3016,23 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     this.sendAccountsList();
     void this.pollUsageForAll();
-    vscode.window.showInformationMessage(`Reconnected ${label}.`);
+    // Re-read the label: a reconnect is allowed to land on a different account,
+    // and the profile refresh above has already stored the new identity.
+    const newLabel = this.labelFor(accountId);
+    vscode.window.showInformationMessage(
+      newLabel === label
+        ? `Reconnected ${label}.`
+        : `Reconnected as ${newLabel} (was ${label}).`
+    );
   }
 
   /** Poll until a re-login has stored a *fresh* (non-expired) token for the
    * account, or time out (~3 min). Unlike {@link waitForLogin} we can't watch
-   * `auth status` (a disconnected account already reports `loggedIn:true` from
-   * its stale credential) — so we watch the credential itself flip from
-   * expired-with-no-refresh to a future expiry, invalidating the 60s cache each
-   * pass so we read the keychain fresh. */
+   * `auth status` (a disconnected account still reports `loggedIn:true` from its
+   * stale credential) — so we watch the credential itself appear with a future
+   * expiry, invalidating the 60s cache each pass so we read the keychain fresh.
+   * Relies on {@link handleReauthAccount} having deleted the old credential
+   * first, so any token found here is necessarily the new one. */
   private async waitForReconnect(
     accountId: string,
     configDir: string | undefined,
@@ -2941,6 +3049,121 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       await new Promise((r) => setTimeout(r, 3000));
     }
     return false;
+  }
+
+  /** Sign an account out without removing it — the "Disconnect" action. The
+   * profile and its config dir stay, so Reconnect can log the same or a
+   * different Claude account back into the slot. */
+  private async handleLogoutAccount(accountId: string): Promise<void> {
+    const label = this.labelFor(accountId);
+    const isDefault = !accountId || accountId === "default";
+
+    const choice = await vscode.window.showWarningMessage(
+      `Disconnect ${label}?`,
+      {
+        modal: true,
+        detail: isDefault
+          ? "Deletes the stored token for the shared login in ~/.claude. Your terminal `claude` uses this same login, so it will need to log in again too. Use Reconnect to log back in."
+          : "Deletes this account's stored token. The account stays in the list — use Reconnect to log in again, as the same or a different Claude account.",
+      },
+      "Disconnect"
+    );
+    if (choice !== "Disconnect") {
+      return;
+    }
+
+    if (!(await this.clearStoredCredential(accountId))) {
+      vscode.window.showErrorMessage(
+        `Could not delete the stored login for ${label} — it is still connected. Check the keychain entry (Keychain Access → "Claude Code-credentials").`
+      );
+      void this.pollUsageForAll();
+      return;
+    }
+
+    await this.setLoggedOut(accountId, true);
+    this.sendAccountsList();
+    void this.pollUsageForAll();
+
+    // Any conversation bound to this account has no credential now; its next
+    // send would 401. Leave the process alone (a restart would only spawn
+    // another token-less one) and offer the fix straight from the toast.
+    const next = await vscode.window.showInformationMessage(
+      `Disconnected ${label}. Conversations on this account can't send until you reconnect.`,
+      "Reconnect"
+    );
+    if (next === "Reconnect") {
+      await this.handleReauthAccount(accountId, { skipConfirm: true });
+    }
+  }
+
+  /** Delete an account's stored OAuth credential: `claude auth logout` scoped to
+   * the account's config dir (so the token is revoked server-side), then the
+   * credential stores directly.
+   *
+   * That second step is load-bearing, not paranoia. Verified against the CLI
+   * (2.1.223): `CLAUDE_CONFIG_DIR=<dir> claude auth logout` prints "Successfully
+   * logged out", deletes `<dir>/.credentials.json` — and leaves the macOS
+   * keychain entry ("Claude Code-credentials-<sha256(dir)[:8]>") in place. That
+   * entry is the one {@link resolveOAuthRecord} reads first, so logout alone
+   * leaves the account looking (and working) as connected.
+   *
+   * Returns true once no credential remains — the caller must not report a
+   * disconnect it didn't achieve. */
+  private async clearStoredCredential(
+    accountId: string | undefined
+  ): Promise<boolean> {
+    const configDir = this.getConfigDirForAccount(accountId);
+    await this.runAuthLogout(configDir);
+    if (process.platform === "darwin") {
+      await this.deleteKeychainItem(
+        configDir
+          ? this.keychainServiceForConfigDir(configDir)
+          : "Claude Code-credentials"
+      );
+    }
+    // Linux/other store the credential in the config dir instead.
+    const credFile = path.join(
+      configDir ?? path.join(os.homedir(), ".claude"),
+      ".credentials.json"
+    );
+    try {
+      fs.rmSync(credFile, { force: true });
+    } catch {
+      // Non-fatal — the check below is what decides success.
+    }
+    this.invalidateKeychainCache(configDir);
+    const record = await this.resolveOAuthRecord(accountId);
+    return !record?.accessToken;
+  }
+
+  private runAuthLogout(configDir: string | undefined): Promise<void> {
+    return new Promise((resolve) => {
+      execFile(
+        resolveClaudePath(),
+        ["auth", "logout"],
+        {
+          env: configDir
+            ? { ...process.env, CLAUDE_CONFIG_DIR: configDir }
+            : process.env,
+        },
+        (err) => {
+          if (err) {
+            log("WARN", "claude auth logout failed:", err.message);
+          }
+          resolve();
+        }
+      );
+    });
+  }
+
+  private deleteKeychainItem(service: string): Promise<void> {
+    return new Promise((resolve) => {
+      execFile(
+        "security",
+        ["delete-generic-password", "-s", service],
+        () => resolve() // Missing item exits non-zero — that's already the goal.
+      );
+    });
   }
 
   // ───────────────────────── Usage ─────────────────────────
@@ -3169,6 +3392,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.usageAllInFlight = true;
     try {
       const accounts = this.getAllAccounts();
+      const loggedOutIds = new Set(this.getLoggedOutAccountIds());
       const entries = await Promise.all(
         accounts.map(async (a) => {
           const record = await this.resolveOAuthRecord(a.id);
@@ -3185,21 +3409,36 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           const shouldFetch =
             !heuristicDead && !!token && (!wasAuthFailed || looksRenewed);
           const usage = shouldFetch ? await this.fetchUsage(token) : null;
-          // A successful probe is ground truth that the token works again.
+          // A successful probe is ground truth that the token works again —
+          // including after a re-login done outside the extension, which also
+          // undoes a deliberate disconnect.
+          let loggedOut = loggedOutIds.has(a.id);
           if (usage) {
             this.authFailedAccountIds.delete(a.id);
+            if (loggedOut) {
+              await this.setLoggedOut(a.id, false);
+              loggedOut = false;
+            }
           }
-          const dead = heuristicDead || this.authFailedAccountIds.has(a.id);
-          return [a.id, usage, dead] as const;
+          const dead =
+            heuristicDead || this.authFailedAccountIds.has(a.id) || loggedOut;
+          return [a.id, usage, dead, loggedOut] as const;
         })
       );
       const usageByAccount: Record<string, UsageInfo | null> = {};
       const disconnected: Record<string, boolean> = {};
-      for (const [id, usage, dead] of entries) {
+      const loggedOut: Record<string, boolean> = {};
+      for (const [id, usage, dead, out] of entries) {
         usageByAccount[id] = usage;
         disconnected[id] = dead;
+        loggedOut[id] = out;
       }
-      this.postMessage({ type: "usageByAccount", usageByAccount, disconnected });
+      this.postMessage({
+        type: "usageByAccount",
+        usageByAccount,
+        disconnected,
+        loggedOut,
+      });
       // Keep the bottom bars in sync with the same data, no extra request.
       const runtime = this.activeKey
         ? this.runtimes.get(this.activeKey)
