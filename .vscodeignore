@@ -1,5 +1,6 @@
 .vscode/**
 node_modules/**
+vendor/**
 webview-ui/node_modules/**
 webview-ui/src/**
 src/**

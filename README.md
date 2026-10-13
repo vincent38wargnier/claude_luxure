@@ -120,6 +120,29 @@ Extension Host (Node.js)          Webview (React + Vite)
   claude --stream-json (CLI subprocess)
 ```
 
+## Lightpanda — bundled default browser tool
+
+Every session the panel spawns gets a `lightpanda` MCP server: a headless
+[Lightpanda](https://github.com/lightpanda-io/browser) browser driven over CDP
+through `chrome-devtools-mcp` (same 30 tools — `new_page`, `take_snapshot`,
+`evaluate_script`, `click`, `list_network_requests`, …), announced to the model
+as the default browser. Light and Chrome-free; rendering is simplified
+(screenshots are real but text-first), so keep a real-Chrome `chrome-devtools`
+server in `.mcp.json` for pixel-accurate work — both load side by side.
+
+- **Source reference**: `vendor/lightpanda` is a shallow git **submodule**
+  pinned to the official repo — never copied into this repo's history.
+  `npm install` auto-initializes it (`prepare` hook); on fresh clones you can
+  also `git clone --recurse-submodules`. Bump the pin with
+  `git submodule update --remote vendor/lightpanda`.
+- **Runtime binary**: resolved per `src/mcp/lightpanda-mcp-launcher.ts` —
+  `$LIGHTPANDA_BIN` → a source build at `vendor/lightpanda/zig-out/bin/`
+  (`npm run lightpanda:build`, needs zig) → the official nightly, auto-download
+  to `~/Library/Caches/claude-luxure/` on first use (~90MB; that first session
+  may need `MCP_TIMEOUT=120000` on a slow connection).
+- Each session gets its own Lightpanda on a free localhost port; it dies with
+  the session (no orphans).
+
 ## Development (Run locally in VS Code)
 
 ### Quick start
