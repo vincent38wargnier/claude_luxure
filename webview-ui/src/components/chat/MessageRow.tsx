@@ -6,6 +6,7 @@ import type { ReactNode, MouseEvent as ReactMouseEvent } from "react";
 import vscode from "../../vscode";
 import type { ChatMessage, Mode, ActivityEvent, TimelinePart } from "../../types";
 import ImageGrid from "../common/ImageGrid";
+import WorkingDots from "../common/WorkingDots";
 import EditableUserMessage from "./EditableUserMessage";
 import ActivityFeed from "./ActivityFeed";
 
@@ -353,19 +354,24 @@ const SETTLE_FILE_TOOLS = new Set([
 
 /** The quiet anchor at the end of a finished turn: "Done · 4m12s · 23 tools ·
  * 3 files · 2 agents". Turns end by things disappearing otherwise; this line
- * is the settle. Skipped for quick text-only replies. */
+ * is the settle. While a background agent the turn launched is still running
+ * it reads "Waiting on N agents" instead — the CLI turn ended, but the work
+ * didn't; the card's completion patch flips it to Done (with a restamped
+ * duration) when the last agent settles. Skipped for quick text-only replies. */
 function TurnSettle({ message }: { message: ChatMessage }) {
   const stats = message.turnStats;
   if (!stats) return null;
 
   let tools = 0;
   let agents = 0;
+  let runningAgents = 0;
   const files = new Set<string>();
   const scan = (acts?: ActivityEvent[]) => {
     for (const a of acts || []) {
       if (a.type === "task") {
         agents++;
         tools++;
+        if (a.status === "running") runningAgents++;
       } else if (a.type === "tool_use") {
         tools++;
         if (SETTLE_FILE_TOOLS.has(a.toolName)) {
@@ -394,6 +400,19 @@ function TurnSettle({ message }: { message: ChatMessage }) {
   ];
   if (tools > 0) bits.push(`${tools} tool${tools === 1 ? "" : "s"}`);
   if (files.size > 0) bits.push(`${files.size} file${files.size === 1 ? "" : "s"}`);
+
+  if (runningAgents > 0) {
+    return (
+      <div className="flex items-center gap-1.5 px-1 pt-1 text-[11px] text-vscode-descriptionFg select-none">
+        <WorkingDots color="#a78bfa" />
+        <span>
+          Waiting on {runningAgents} agent{runningAgents === 1 ? "" : "s"} ·{" "}
+          {bits.join(" · ")}
+        </span>
+      </div>
+    );
+  }
+
   if (agents > 0) bits.push(`${agents} agent${agents === 1 ? "" : "s"}`);
 
   return (

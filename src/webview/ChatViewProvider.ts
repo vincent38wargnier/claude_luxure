@@ -3,12 +3,14 @@ import * as path from "path";
 import * as fs from "fs";
 import * as os from "os";
 import * as https from "https";
+import * as http from "http";
 import * as crypto from "crypto";
 import { execFile } from "child_process";
 import {
   ClaudeBridge,
   ClaudeEvent,
   type ApiRetryEvent,
+  type CustomApiSpec,
   type TaskUpdateEvent,
 } from "../cli/claude-bridge";
 import { CodexBridge } from "../cli/codex-bridge";
@@ -20,6 +22,11 @@ import {
   startCodexDeviceLogin,
 } from "../cli/codex-auth";
 import { resolveCodexPath, hasCodexBinary } from "../utils/codex-path";
+import {
+  detectKeyAuth,
+  fetchModelCatalog,
+  type KeyAuthResult,
+} from "../utils/customApiProbe";
 
 /** Either CLI's bridge. They expose the same methods and emit the same events,
  * so everything downstream of {@link ChatViewProvider.spawnBridge} is
@@ -31,6 +38,7 @@ import { SessionManager } from "../sessions/SessionManager";
 import {
   AccountProvider,
   ActivityEvent,
+  ApiKeyEnvVar,
   ChatMessage,
   ContextInfo,
   CostInfo,
@@ -46,6 +54,7 @@ import {
   StoredAccount,
   TaskActivity,
   TimelinePart,
+  TurnStats,
   UsageBucket,
   UsageInfo,
   WebviewMessage,
@@ -137,6 +146,24 @@ function mergeTaskInto(into: TaskActivity, from: TaskActivity): void {
   if (from.status !== "running") { into.status = from.status; }
 }
 
+/** The immediate tool_result of a background Agent launch ("Async agent
+ * launched successfully…") — an ack, not the agent's report. Agents launch in
+ * the background by default with no run_in_background in the call's input, so
+ * this text is the only signal at that moment that the agent is still going. */
+const BACKGROUND_LAUNCH_ACK = /^\s*Async agent launched/;
+
+/** Any task card still "running" in this message (activities or timeline)? */
+function hasRunningTask(msg: ChatMessage): boolean {
+  const running = (acts?: ActivityEvent[]) =>
+    (acts || []).some((a) => a.type === "task" && a.status === "running");
+  if (running(msg.activities)) {
+    return true;
+  }
+  return (msg.timeline || []).some(
+    (p) => p.type === "activities" && running(p.activities)
+  );
+}
+
 /** Rehydrate persisted messages: clear streaming flags and settle task cards
  * that were still "running" when the window closed — the CLI (and its agents)
  * died with the extension host, so a still-running card would spin forever. */
@@ -196,6 +223,9 @@ const MAX_TOOL_RESULT_CHARS = 20_000;
 const HEARTBEAT_INTERVAL_MS = 15_000;
 const HEARTBEAT_DEAD_MS = 50_000;
 const RECOVERY_COOLDOWN_MS = 90_000;
+/** A tab idle at least this long (the strip's "1d" badge) is stale: stale
+ * tabs are kept sorted newest → oldest at the right end of their strip. */
+const STALE_TAB_MS = 24 * 60 * 60 * 1000;
 
 /** The bundled visual-proof MCP server, in both shapes the two CLIs need. */
 interface LuxureToolsSpec {
@@ -205,6 +235,10 @@ interface LuxureToolsSpec {
   env: Record<string, string>;
   /** Codex: the server definition itself, injected as a thread config overlay. */
   server: { command: string; args: string[]; env: Record<string, string> };
+  /** The bundled "lightpanda" browser server (default browser tool), when its
+   * launcher is built. Claude reads it from the same --mcp-config file; Codex
+   * gets it as a second overlay entry. */
+  browserServer?: { command: string; args: string[]; env: Record<string, string> };
 }
 
 interface SessionRuntime {
@@ -235,6 +269,12 @@ interface SessionRuntime {
    * two providers' model ids are not interchangeable — switching accounts must
    * not hand a Claude id to Codex (or the reverse). */
   codexModel?: string;
+  /** Custom-API model for this conversation — same separation as codexModel:
+   * a GLM id must not leak into a Claude spawn, nor a Claude id into GLM. */
+  customModel?: string;
+  /** Per-conversation global-memory switch; undefined → the workspace default
+   * ({@link ChatViewProvider.globalMemory}), which itself defaults to on. */
+  globalMemory?: boolean;
   /** Watchdog that ends a turn which has gone silent (no CLI output) for too
    * long — e.g. the model parked work in the background and never resumes. */
   watchdogTimer?: ReturnType<typeof setTimeout>;
@@ -466,6 +506,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
    * Claude's static list. */
   private codexModelOptions: { id: string; label: string }[] = [];
   private effort: EffortLevel | undefined;
+  /** Workspace default for the global-memory switch (per-conversation override
+   * lives on the runtime). undefined → on (load the machine-wide CLAUDE.md). */
+  private globalMemory: boolean | undefined;
   private snapshotManager = new SnapshotManager();
   private diffManager = new DiffManager(this.snapshotManager);
   private accountEmail: string | undefined;
@@ -533,6 +576,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       "claude-luxure.codexModel"
     );
     this.effort = this.context.workspaceState.get<EffortLevel>("claude-luxure.effort");
+    this.globalMemory = this.context.workspaceState.get<boolean>(
+      "claude-luxure.globalMemory"
+    );
     this.transcripts = new TranscriptStore(context);
     startLoopLagSampler();
     this.fetchAccountInfo();
@@ -571,11 +617,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           mode?: Mode;
           model?: string;
           effort?: EffortLevel;
+          globalMemory?: boolean;
         }>(`claude-luxure.settingsFor.${key}`)
       : undefined;
     runtime.mode = persisted?.mode ?? this.mode;
     runtime.model = persisted?.model ?? this.model;
     runtime.effort = persisted?.effort ?? this.effort;
+    runtime.globalMemory = persisted?.globalMemory ?? this.globalMemory;
   }
 
   private persistSettingsFor(runtime: SessionRuntime): void {
@@ -584,7 +632,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
     this.context.workspaceState.update(
       `claude-luxure.settingsFor.${runtime.sessionId}`,
-      { mode: runtime.mode, model: runtime.model, effort: runtime.effort }
+      {
+        mode: runtime.mode,
+        model: runtime.model,
+        effort: runtime.effort,
+        globalMemory: runtime.globalMemory,
+      }
     );
   }
 
@@ -712,6 +765,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.persistMarker(runtime);
     this.persistSettingsFor(runtime);
 
+    this.postMessage({ type: "tabRenamed", from: draftKey, to: sessionId });
     this.renameTab(draftKey, sessionId);
   }
 
@@ -1063,12 +1117,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
    * history); the transcript it does write is deleted afterwards. */
   private runClaudePrint(prompt: string, accountId?: string): Promise<string> {
     // These one-shots are always `claude -p` (post-it emoji, summaries). A Codex
-    // conversation's config dir is a CODEX_HOME — handing it to the Claude CLI
-    // as CLAUDE_CONFIG_DIR would point it at a profile with no Claude
-    // credential, so fall back to the ambient login instead.
-    const configDir = this.isCodexAccount(accountId)
-      ? undefined
-      : this.getConfigDirForAccount(accountId);
+    // conversation's config dir is a CODEX_HOME, and a custom-API profile holds
+    // no OAuth login at all — handing either to the Claude CLI as
+    // CLAUDE_CONFIG_DIR would point it at a credential-less profile, so fall
+    // back to the ambient login instead.
+    const configDir =
+      this.isCodexAccount(accountId) || this.isCustomAccount(accountId)
+        ? undefined
+        : this.getConfigDirForAccount(accountId);
     const env: NodeJS.ProcessEnv = { ...process.env };
     if (configDir) {
       env.CLAUDE_CONFIG_DIR = configDir;
@@ -1360,6 +1416,53 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       );
     }
     return this.lastReplyFallback.get(key) || undefined;
+  }
+
+  /** Re-sorts the strips when the next fresh tab turns a day idle, so the
+   * order catches up without waiting for some other tab-strip update. */
+  private staleTabTimer?: ReturnType<typeof setTimeout>;
+
+  /** Tab-strip order rule, per pane: tabs idle for a day or more sit at the
+   * right end, most recent first; fresher tabs — and running or never-sent
+   * ones — keep the user's order on the left. Returns whether anything moved. */
+  private sortStaleTabs(): boolean {
+    const now = Date.now();
+    let moved = false;
+    let nextStaleAt = Infinity;
+    for (const pane of [0, 1] as const) {
+      const fresh: string[] = [];
+      const stale: { id: string; at: number }[] = [];
+      for (const id of this.paneTabs[pane]) {
+        const rt = this.runtimes.get(id);
+        const at = rt?.streamingMessageId ? undefined : this.lastReplyAtFor(id, rt);
+        if (at !== undefined && now - at >= STALE_TAB_MS) {
+          stale.push({ id, at });
+        } else {
+          fresh.push(id);
+          if (at !== undefined) {
+            nextStaleAt = Math.min(nextStaleAt, at + STALE_TAB_MS);
+          }
+        }
+      }
+      stale.sort((a, b) => b.at - a.at);
+      const sorted = [...fresh, ...stale.map((s) => s.id)];
+      if (sorted.some((id, i) => id !== this.paneTabs[pane][i])) {
+        this.paneTabs[pane] = sorted;
+        moved = true;
+      }
+    }
+    clearTimeout(this.staleTabTimer);
+    this.staleTabTimer = undefined;
+    if (nextStaleAt !== Infinity) {
+      // Clamped: a clock-skewed future timestamp must not overflow setTimeout
+      // (Node fires an overflowing delay immediately → re-arm hot loop).
+      const delay = Math.min(nextStaleAt - now, STALE_TAB_MS) + 1000;
+      this.staleTabTimer = setTimeout(() => {
+        this.staleTabTimer = undefined;
+        this.sendOpenTabs();
+      }, delay);
+    }
+    return moved;
   }
 
   // ───────────────────────────── Split view ─────────────────────────────
@@ -1727,6 +1830,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   private sendOpenTabs(): void {
     const perfT0 = performance.now();
+    // Applied at publish time so every path that touches the strip (open,
+    // close, move, restore, a turn settling, the stale timer) gets the order.
+    if (this.sortStaleTabs()) {
+      this.persistPanes();
+    }
     const names: Record<string, string> = {};
     const markers: Record<string, SessionMarker> = {};
     const lastReplyAt: Record<string, number> = {};
@@ -2333,6 +2441,23 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           this.sendState();
           break;
         }
+        if (this.isCustomAccount(runtime.accountId)) {
+          // Same slot separation as Codex — and remember the pick as the
+          // account's default so new conversations (and reloads) start on it.
+          runtime.customModel = message.model;
+          const added = this.getAddedAccounts().map((a) =>
+            a.id === runtime.accountId
+              ? { ...a, defaultModel: message.model }
+              : a
+          );
+          await this.context.globalState.update("claude-luxure.accounts", added);
+          if (runtime.bridge) {
+            runtime.bridge.restart({ model: message.model });
+          }
+          this.persistSettingsFor(runtime);
+          this.sendState();
+          break;
+        }
         runtime.model = message.model;
         this.model = message.model;
         this.context.workspaceState.update("claude-luxure.model", this.model);
@@ -2351,6 +2476,28 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         this.context.workspaceState.update("claude-luxure.effort", this.effort);
         if (runtime.bridge) {
           runtime.bridge.restart({ effort: message.effort });
+        }
+        this.persistSettingsFor(runtime);
+        this.sendState();
+        break;
+      }
+
+      case "changeGlobalMemory": {
+        const runtime = this.getActiveRuntime();
+        runtime.globalMemory = message.enabled;
+        this.globalMemory = message.enabled;
+        this.context.workspaceState.update(
+          "claude-luxure.globalMemory",
+          this.globalMemory
+        );
+        // Swap the Claude CLI's config dir so the next turn sees (or stops
+        // seeing) the machine-wide CLAUDE.md. Codex memory works differently
+        // (AGENTS.md), so its conversations just keep the stored preference.
+        if (runtime.bridge instanceof ClaudeBridge) {
+          const base = this.getConfigDirForAccount(runtime.accountId);
+          runtime.bridge.restart({
+            configDir: this.claudeConfigDirFor(runtime, base),
+          });
         }
         this.persistSettingsFor(runtime);
         this.sendState();
@@ -2709,6 +2856,86 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     return this.getAddedAccounts().find((a) => a.id === accountId)?.configDir;
   }
 
+  /** A CLAUDE_CONFIG_DIR for a "global memory OFF" conversation: a sibling of
+   * the account's real config dir that mirrors it entry-for-entry via symlinks
+   * EXCEPT CLAUDE.md, which is an empty real file. The CLI reads user memory
+   * from $CLAUDE_CONFIG_DIR/CLAUDE.md and, when that file exists, does NOT fall
+   * back to ~/.claude/CLAUDE.md — so an empty one shadows the machine-wide
+   * memory while auth, the session store (`projects`) and skills still resolve
+   * through the symlinks. Verified against CLI 2.1.285 (the `--setting-sources`
+   * flag does not gate memory in this version; shadowing does). Rebuilt each
+   * spawn so newly created entries in the base dir are picked up. Project-tree
+   * CLAUDE.md is untouched — only the global file is withheld. */
+  private memoryOffConfigDir(baseConfigDir: string | undefined): string {
+    const base = baseConfigDir ?? path.join(os.homedir(), ".claude");
+    const mirror = path.join(
+      this.context.globalStorageUri.fsPath,
+      "nomem",
+      Buffer.from(base).toString("base64url")
+    );
+    fs.mkdirSync(mirror, { recursive: true });
+
+    let baseEntries: string[] = [];
+    try {
+      baseEntries = fs.readdirSync(base);
+    } catch {
+      /* base may not exist yet (e.g. a never-spawned account) */
+    }
+    const keep = new Set(baseEntries.filter((e) => e !== "CLAUDE.md"));
+
+    let mirrorEntries: string[] = [];
+    try {
+      mirrorEntries = fs.readdirSync(mirror);
+    } catch {
+      /* fresh mirror */
+    }
+    // Drop stale links no longer backed by the base dir (never the memory file).
+    for (const entry of mirrorEntries) {
+      if (entry === "CLAUDE.md" || keep.has(entry)) {
+        continue;
+      }
+      try {
+        fs.rmSync(path.join(mirror, entry), { recursive: true, force: true });
+      } catch {
+        /* ignore */
+      }
+    }
+    for (const entry of keep) {
+      const link = path.join(mirror, entry);
+      try {
+        if (!fs.existsSync(link)) {
+          fs.symlinkSync(path.join(base, entry), link);
+        }
+      } catch {
+        /* a single link failing shouldn't sink the spawn */
+      }
+    }
+    // The shadowing empty memory file — a real file, replacing any stale symlink.
+    const claudeMd = path.join(mirror, "CLAUDE.md");
+    try {
+      if (!fs.existsSync(claudeMd) || fs.lstatSync(claudeMd).isSymbolicLink()) {
+        fs.rmSync(claudeMd, { force: true });
+        fs.writeFileSync(claudeMd, "");
+      }
+    } catch {
+      /* ignore */
+    }
+    return mirror;
+  }
+
+  /** The effective CLAUDE_CONFIG_DIR for a conversation, honoring its
+   * global-memory switch. "" clears back to the ambient login (Default account,
+   * memory on). */
+  private claudeConfigDirFor(
+    runtime: SessionRuntime,
+    baseConfigDir: string | undefined
+  ): string {
+    if ((runtime.globalMemory ?? this.globalMemory) === false) {
+      return this.memoryOffConfigDir(baseConfigDir);
+    }
+    return baseConfigDir ?? "";
+  }
+
   /** Which CLI an account speaks. The synthetic "Default" is always Claude (it
    * IS the ambient ~/.claude login), and accounts stored before Codex support
    * carry no `provider` field — both fall back to "claude". */
@@ -2723,6 +2950,56 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   private isCodexAccount(accountId: string | undefined): boolean {
     return this.providerFor(accountId) === "codex";
+  }
+
+  private isCustomAccount(accountId: string | undefined): boolean {
+    return this.providerFor(accountId) === "custom";
+  }
+
+  private accountFor(accountId: string | undefined): StoredAccount | undefined {
+    return this.getAddedAccounts().find((a) => a.id === accountId);
+  }
+
+  /** SecretStorage key holding a custom-API account's API key. The key lives
+   * ONLY there (OS keychain via VS Code) — never in globalState or settings. */
+  private secretKeyFor(accountId: string): string {
+    return `claude-luxure.apiKey.${accountId}`;
+  }
+
+  /** Spawn-time endpoint spec for a custom-API account: base URL + key from
+   * SecretStorage. null for every other provider — and null is meaningful on
+   * restart: it CLEARS a previous spec when the conversation switches away. */
+  private async customApiFor(
+    accountId: string | undefined
+  ): Promise<CustomApiSpec | null> {
+    if (!accountId || !this.isCustomAccount(accountId)) {
+      return null;
+    }
+    const acct = this.accountFor(accountId);
+    const apiKey = await this.context.secrets.get(this.secretKeyFor(accountId));
+    if (!acct || !apiKey) {
+      return null;
+    }
+    return {
+      baseUrl: acct.baseUrl || undefined,
+      apiKey,
+      keyEnvVar: acct.keyEnvVar ?? "ANTHROPIC_AUTH_TOKEN",
+      protocol: acct.protocol ?? "anthropic",
+    };
+  }
+
+  /** Model for a custom-API conversation. Reads its own slot (a Claude id must
+   * never reach a GLM-style endpoint), falling back to the account's remembered
+   * default, then its first listed model. A slot value that isn't in the bound
+   * account's list is stale — left over from a different custom account — and
+   * is skipped the same way a Claude id would be. */
+  private customModelFor(runtime: SessionRuntime): string | undefined {
+    const acct = this.accountFor(runtime.accountId);
+    const picked = runtime.customModel;
+    if (picked && acct?.models?.some((m) => m.id === picked)) {
+      return picked;
+    }
+    return acct?.defaultModel ?? acct?.models?.[0]?.id ?? undefined;
   }
 
   /** Accounts the user deliberately disconnected (their stored token was
@@ -2771,6 +3048,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       );
       return !info;
     }
+    if (this.isCustomAccount(accountId)) {
+      // A custom-API account is connected iff its key is stored — there is no
+      // OAuth record to judge. A key the endpoint rejects surfaces as a 401 at
+      // send time, which flags authFailedAccountIds (checked above).
+      return !(await this.context.secrets.get(this.secretKeyFor(accountId)));
+    }
     return this.isOAuthDead(await this.resolveOAuthRecord(accountId));
   }
 
@@ -2804,8 +3087,24 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       vscode.window.showInformationMessage(
         `Switching to ${this.labelFor(accountId)} (restarting Claude — your conversation is preserved)…`
       );
+      // The model must follow the provider: each provider reads its own slot,
+      // so a GLM id never reaches a Claude spawn (or the reverse).
+      const model = this.isCodexAccount(accountId)
+        ? this.codexModelFor(runtime)
+        : this.isCustomAccount(accountId)
+          ? this.customModelFor(runtime)
+          : runtime.model ?? this.model;
       // Empty string clears it → switch back to the Default account.
-      runtime.bridge.restart({ configDir: configDir ?? "" });
+      if (runtime.bridge instanceof ClaudeBridge) {
+        runtime.bridge.restart({
+          configDir: configDir ?? "",
+          model,
+          // null clears a previous custom-API spec when switching away from it.
+          customApi: await this.customApiFor(accountId),
+        });
+      } else {
+        runtime.bridge.restart({ configDir: configDir ?? "", model });
+      }
     }
     this.sendAccountsList();
     this.sendState();
@@ -2831,6 +3130,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             ? "OpenAI — ChatGPT device-code login"
             : "OpenAI — `codex` CLI not found on this machine",
           provider: "codex" as AccountProvider,
+        },
+        {
+          label: "$(key) Custom API endpoint",
+          description:
+            "API key against any Anthropic-compatible API — GLM (z.ai), an Anthropic key, a local proxy",
+          provider: "custom" as AccountProvider,
         },
       ],
       { title: "Add account", placeHolder: "Which CLI should this account use?" }
@@ -2868,6 +3173,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     if (picked.provider === "codex") {
       await this.addCodexAccount(id, configDir);
+      return;
+    }
+
+    if (picked.provider === "custom") {
+      await this.addCustomAccount(id, configDir);
       return;
     }
 
@@ -3000,6 +3310,186 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     );
   }
 
+  /**
+   * Connect a custom Anthropic-compatible endpoint (GLM via z.ai, a raw
+   * Anthropic API key, any proxy speaking /v1/messages): base URL → key →
+   * model ids (prefilled for known hosts) → display name (prefilled from the
+   * host), then a 1-token probe that also detects which auth header the
+   * endpoint wants — only what authenticated is stored: the key in
+   * SecretStorage (OS keychain), everything else in the account record. The
+   * Claude CLI drives it via ANTHROPIC_BASE_URL + the key env var; there is no
+   * OAuth login, so the isolated config dir only carries shared assets and
+   * session state.
+   */
+  private async addCustomAccount(id: string, configDir: string): Promise<void> {
+    const baseUrlRaw = await vscode.window.showInputBox({
+      title: "Base URL (1/4)",
+      prompt:
+        "The Anthropic-compatible endpoint (becomes ANTHROPIC_BASE_URL). Leave empty for api.anthropic.com.",
+      placeHolder: "e.g. https://api.z.ai/api/anthropic — empty = api.anthropic.com",
+      ignoreFocusOut: true,
+    });
+    if (baseUrlRaw === undefined) {
+      this.discardAccountDir(configDir);
+      return;
+    }
+    const baseUrl = baseUrlRaw.trim().replace(/\/+$/, "");
+    let host = "api.anthropic.com";
+    if (baseUrl) {
+      try {
+        host = new URL(baseUrl).host;
+        if (!host) {
+          throw new Error("no host");
+        }
+      } catch {
+        this.discardAccountDir(configDir);
+        vscode.window.showErrorMessage(
+          `"${baseUrl}" is not a valid URL — account not added. Try again.`
+        );
+        return;
+      }
+    }
+
+    const apiKey = await vscode.window.showInputBox({
+      title: `API key for ${host} (2/4)`,
+      prompt:
+        "Stored in your OS keychain (VS Code SecretStorage) and injected only into this account's processes.",
+      password: true,
+      ignoreFocusOut: true,
+    });
+    if (!apiKey) {
+      this.discardAccountDir(configDir);
+      return;
+    }
+
+    // Prefill the model list: ask the endpoint itself first (both protocols
+    // commonly serve GET /models), then fall back to known hosts. Anything
+    // typed wins.
+    const catalog = await vscode.window.withProgress(
+      {
+        location: vscode.ProgressLocation.Notification,
+        title: `Asking ${host} for its model list…`,
+      },
+      () => fetchModelCatalog(baseUrl, apiKey)
+    );
+    const suggestedModels = catalog.length
+      ? catalog.slice(0, 8).join(", ")
+      : /(^|\.)z\.ai$|(^|\.)bigmodel\.cn$/.test(host)
+        ? "glm-4.6, glm-4.5-air"
+        : host === "api.anthropic.com"
+          ? "claude-opus-5-5, claude-sonnet-5-5, claude-haiku-4-5"
+          : "";
+    const modelsRaw = await vscode.window.showInputBox({
+      title: `Models on ${host} (3/4)`,
+      prompt:
+        "Model ids this endpoint serves, comma-separated — the first is the default this account starts on.",
+      value: suggestedModels,
+      placeHolder: suggestedModels
+        ? undefined
+        : "e.g. glm-4.6, glm-4.5-air — first is the default",
+      ignoreFocusOut: true,
+    });
+    if (modelsRaw === undefined) {
+      this.discardAccountDir(configDir);
+      return;
+    }
+    const models = modelsRaw
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean)
+      .map((modelId) => ({ id: modelId, label: modelId }));
+    if (models.length === 0) {
+      this.discardAccountDir(configDir);
+      vscode.window.showErrorMessage(
+        "At least one model id is needed — account not added. Try again."
+      );
+      return;
+    }
+
+    const namePrefill = host.replace(/^api\./, "");
+    const name = await vscode.window.showInputBox({
+      title: "Account name (4/4)",
+      prompt: "How this account appears in the switcher — Enter to accept.",
+      value: namePrefill,
+      // Pre-selected so typing replaces the suggestion instead of appending.
+      valueSelection: [0, namePrefill.length],
+      ignoreFocusOut: true,
+    });
+    if (name === undefined) {
+      this.discardAccountDir(configDir);
+      return;
+    }
+    const label = name.trim() || host;
+
+    // Prove the key works before anything is stored — same "only store what
+    // authenticated" contract as the login flows — and let the probe decide
+    // which auth header the endpoint wants (Bearer vs x-api-key), so the user
+    // never has to know the difference. Endpoints that reject the minimal
+    // probe shape can still be added deliberately.
+    const { keyEnvVar, protocol, baseUrlOverride, probeErr } =
+      await vscode.window.withProgress(
+        {
+          location: vscode.ProgressLocation.Notification,
+          title: `Testing ${host} with a 1-token request…`,
+        },
+        () => this.resolveKeyAuth(baseUrl, apiKey, models[0].id)
+      );
+    if (probeErr) {
+      const choice = await vscode.window.showWarningMessage(
+        `${host} didn't accept a test request`,
+        {
+          modal: true,
+          detail: `${probeErr}\n\nYou can add the account anyway (some endpoints reject minimal probes) — or cancel and re-check the URL/key/model.`,
+        },
+        "Add anyway"
+      );
+      if (choice !== "Add anyway") {
+        this.discardAccountDir(configDir);
+        return;
+      }
+    }
+
+    await this.context.secrets.store(this.secretKeyFor(id), apiKey);
+    const added = this.getAddedAccounts();
+    added.push({
+      id,
+      label,
+      isDefault: false,
+      configDir,
+      provider: "custom",
+      // The probe may have adjusted the base (e.g. appended /v1 for an
+      // OpenAI-protocol endpoint given as a bare host).
+      baseUrl: (baseUrlOverride ?? baseUrl) || undefined,
+      models,
+      defaultModel: models[0].id,
+      keyEnvVar,
+      protocol,
+    });
+    await this.context.globalState.update("claude-luxure.accounts", added);
+    await this.setLoggedOut(id, false);
+    this.sendAccountsList();
+    // Adding a key means "use it": bind the active conversation to it now
+    // (this also restarts a running process with the key injected).
+    await this.handleSwitchAccount(id);
+    vscode.window.showInformationMessage(
+      probeErr
+        ? `Added ${label} (unverified). This conversation now runs on it.`
+        : `Added ${label} (key verified, ${models[0].id} replied${
+            protocol === "openai" ? " via the OpenAI-protocol bridge" : ""
+          }). This conversation now runs on it.`
+    );
+  }
+
+  /** Probe the endpoint to decide key header AND wire protocol (Anthropic
+   * direct vs OpenAI via the api-bridge sidecar) — see customApiProbe.ts. */
+  private resolveKeyAuth(
+    baseUrl: string,
+    apiKey: string,
+    model: string
+  ): Promise<KeyAuthResult> {
+    return detectKeyAuth(baseUrl, apiKey, model);
+  }
+
   private discardAccountDir(configDir: string): void {
     try {
       fs.rmSync(configDir, { recursive: true, force: true });
@@ -3127,6 +3617,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     // the dir below is what deletes it; still revoke server-side first.
     if (acct?.provider === "codex") {
       await codexLogout(resolveCodexPath(), acct.configDir);
+    } else if (acct?.provider === "custom") {
+      // The stored key is ours alone — delete it; nothing to revoke upstream.
+      await this.context.secrets.delete(this.secretKeyFor(accountId));
     } else {
       await this.clearStoredCredential(accountId);
     }
@@ -3352,6 +3845,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       return;
     }
 
+    if (this.isCustomAccount(accountId)) {
+      await this.reauthCustomAccount(accountId, label);
+      return;
+    }
+
     // Reconnecting a *working* account throws away a good token, so confirm it.
     // A disconnected one has nothing to lose — keep that path one click.
     if (!opts?.skipConfirm && !(await this.isAccountDisconnected(accountId))) {
@@ -3473,12 +3971,121 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     return false;
   }
 
+  /** Reconnect a custom-API account: enter a new key, probed like at add time,
+   * replacing the stored one. The old key keeps working until the new one is
+   * stored — mirroring the Codex rule that an abandoned reconnect must not
+   * destroy a working login. */
+  private async reauthCustomAccount(
+    accountId: string,
+    label: string
+  ): Promise<void> {
+    const acct = this.accountFor(accountId);
+    if (!acct) {
+      return;
+    }
+    const host = acct.baseUrl || "api.anthropic.com";
+    const apiKey = await vscode.window.showInputBox({
+      title: `Reconnect ${label}`,
+      prompt: `New API key for ${host} (stored in your OS keychain). The current key stays until this one is saved.`,
+      password: true,
+      ignoreFocusOut: true,
+    });
+    if (!apiKey) {
+      return;
+    }
+    const probeModel = acct.defaultModel ?? acct.models?.[0]?.id ?? "";
+    const { keyEnvVar, protocol, probeErr } = await vscode.window.withProgress(
+      {
+        location: vscode.ProgressLocation.Notification,
+        title: `Testing the new key against ${host}…`,
+      },
+      () => this.resolveKeyAuth(acct.baseUrl || "", apiKey, probeModel)
+    );
+    if (probeErr) {
+      const choice = await vscode.window.showWarningMessage(
+        `${host} didn't accept the new key`,
+        {
+          modal: true,
+          detail: `${probeErr}\n\nStore it anyway?`,
+        },
+        "Store anyway"
+      );
+      if (choice !== "Store anyway") {
+        return;
+      }
+    }
+    // The probe re-detects the auth header and the wire protocol; persist them
+    // if either settled differently (an unverified "store anyway" keeps the
+    // existing choice).
+    if (
+      !probeErr &&
+      (keyEnvVar !== (acct.keyEnvVar ?? "ANTHROPIC_AUTH_TOKEN") ||
+        protocol !== (acct.protocol ?? "anthropic"))
+    ) {
+      const updated = this.getAddedAccounts().map((a) =>
+        a.id === accountId ? { ...a, keyEnvVar, protocol } : a
+      );
+      await this.context.globalState.update("claude-luxure.accounts", updated);
+    }
+    await this.context.secrets.store(this.secretKeyFor(accountId), apiKey);
+    this.authFailedAccountIds.delete(accountId);
+    await this.setLoggedOut(accountId, false);
+    // Conversations bound to this account still run with the old key — restart
+    // them so the fresh one is injected (conversation preserved via --resume).
+    const customApi = await this.customApiFor(accountId);
+    for (const runtime of this.runtimes.values()) {
+      if (runtime.accountId === accountId && runtime.bridge instanceof ClaudeBridge) {
+        runtime.bridge.restart({ customApi });
+      }
+    }
+    this.sendAccountsList();
+    void this.pollUsageForAll();
+    vscode.window.showInformationMessage(
+      probeErr ? `Stored a new key for ${label} (unverified).` : `Reconnected ${label}.`
+    );
+  }
+
+  /** Disconnect a custom-API account: delete the stored key. The account row
+   * stays; Reconnect asks for a new key. Nothing is revoked server-side — the
+   * key itself stays valid wherever else it's used. */
+  private async disconnectCustomAccount(accountId: string): Promise<void> {
+    const label = this.labelFor(accountId);
+    const choice = await vscode.window.showWarningMessage(
+      `Disconnect ${label}?`,
+      {
+        modal: true,
+        detail:
+          "Deletes this account's stored API key from the keychain. The account stays in the list — use Reconnect to enter a key again.",
+      },
+      "Disconnect"
+    );
+    if (choice !== "Disconnect") {
+      return;
+    }
+    await this.context.secrets.delete(this.secretKeyFor(accountId));
+    this.authFailedAccountIds.delete(accountId);
+    await this.setLoggedOut(accountId, true);
+    this.sendAccountsList();
+    void this.pollUsageForAll();
+    const next = await vscode.window.showInformationMessage(
+      `Disconnected ${label}. Conversations on this account can't send until you reconnect.`,
+      "Reconnect"
+    );
+    if (next === "Reconnect") {
+      await this.handleReauthAccount(accountId, { skipConfirm: true });
+    }
+  }
+
   /** Sign an account out without removing it — the "Disconnect" action. The
    * profile and its config dir stay, so Reconnect can log the same or a
    * different Claude account back into the slot. */
   private async handleLogoutAccount(accountId: string): Promise<void> {
     if (this.isCodexAccount(accountId)) {
       await this.disconnectCodexAccount(accountId);
+      return;
+    }
+    if (this.isCustomAccount(accountId)) {
+      await this.disconnectCustomAccount(accountId);
       return;
     }
     const label = this.labelFor(accountId);
@@ -3845,6 +4452,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             const dead = !usage || this.authFailedAccountIds.has(a.id) || out;
             return [a.id, usage, dead, out] as const;
           }
+          if (a.provider === "custom") {
+            // No subscription usage endpoint behind a custom key — health is
+            // just "a key is stored" plus any 401 observed at send time. The
+            // auth-failed flag only clears via Reconnect (a new key): there is
+            // no cheap authoritative probe to self-heal from here.
+            const hasKey = !!(await this.context.secrets.get(
+              this.secretKeyFor(a.id)
+            ));
+            const out = loggedOutIds.has(a.id);
+            const dead = !hasKey || this.authFailedAccountIds.has(a.id) || out;
+            return [a.id, null, dead, out] as const;
+          }
           const record = await this.resolveOAuthRecord(a.id);
           const heuristicDead = this.isOAuthDead(record);
           const token = record?.accessToken;
@@ -4122,9 +4741,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     group.versions.push({ sessionId: undefined, tail: [] });
     group.activeIndex = group.versions.length - 1;
 
-    this.stopRuntimeBridge(this.activeKey, runtime);
-
-    // Rewind onto a fresh session; the fork registry rides along on the runtime.
+    // Stop the current run and rewind onto a fresh session; the fork registry
+    // rides along on the runtime.
     this.resetRuntimeToFreshSession(runtime);
     runtime.messages = [...priorMessages];
     runtime.contextSummarized = false;
@@ -4217,7 +4835,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     group.activeIndex = index;
     const target = group.versions[index];
 
-    this.stopRuntimeBridge(this.activeKey, runtime);
     this.rekeyRuntime(runtime, target.sessionId);
     runtime.messages = [...prefix, ...target.tail];
     runtime.streamingMessageId = null;
@@ -4242,14 +4859,22 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
    * Re-key the active runtime to a different session id (or a fresh draft when
    * undefined), preserving its in-memory state (messages, fork registry). Used by
    * edit (fresh session) and fork switching (adopt an existing version's session).
+   * Stops the runtime's current CLI first.
    */
   private rekeyRuntime(runtime: SessionRuntime, newSessionId?: string): void {
     const oldKey = this.activeKey;
     const newKey = newSessionId || `draft-${generateId()}`;
 
+    // Announce the new key BEFORE stopping. Stopping a running turn pushes an
+    // idle state under the old key, which the webview reads as "turn done, send
+    // the next queued follow-up" — with the queue still filed under that key,
+    // an edit sent its head into the session being torn down and lost the rest.
+    if (newKey !== oldKey) {
+      this.postMessage({ type: "tabRenamed", from: oldKey, to: newKey });
+    }
+    this.stopRuntimeBridge(oldKey, runtime);
+
     runtime.sessionId = newSessionId;
-    runtime.bridge = undefined;
-    runtime.cliStatus = "stopped";
     if (newSessionId) {
       delete runtime.draftId;
     } else {
@@ -4380,6 +5005,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (this.isActiveKey(runtimeKey)) {
       this.postMessage({ type: "message", message: assistantMessage });
     }
+    // A stale tab that just got a message is fresh again: re-sort the strip
+    // now rather than when the reply lands.
+    this.sendOpenTabs();
 
     this.armStreamWatchdog(runtimeKey, runtime);
     this.sendState();
@@ -4424,6 +5052,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     // spawn so the model can push screenshots/annotations into this chat.
     const luxureTools = await this.prepareLuxureTools(runtime);
 
+    // A custom-API account runs the normal Claude CLI with key credentials
+    // injected at spawn — resolved here (SecretStorage) so the key only ever
+    // travels process-to-process.
+    const customApi = await this.customApiFor(runtime.accountId);
+
+    // Honor the per-conversation global-memory switch: OFF swaps in a config
+    // dir whose empty CLAUDE.md shadows the machine-wide ~/.claude/CLAUDE.md.
+    const claudeConfigDir = this.claudeConfigDirFor(runtime, configDir);
+
     // The two bridges are interchangeable from here on — same methods, same
     // events — so only this construction branches on the bound account's CLI.
     const bridge: AgentBridge = this.isCodexAccount(runtime.accountId)
@@ -4441,15 +5078,21 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           env: runtime.worktreeEnv,
           luxureTools,
           luxureServer: this.luxureServerSpec(luxureTools),
+          browserServer: luxureTools?.browserServer,
         })
       : new ClaudeBridge({
           cwd,
           mode: runtime.mode ?? this.mode,
-          model: runtime.model ?? this.model,
+          // Same id separation as Codex: a custom conversation reads its own
+          // model slot — the Claude default must not reach a GLM-style endpoint.
+          model: this.isCustomAccount(runtime.accountId)
+            ? this.customModelFor(runtime)
+            : runtime.model ?? this.model,
           effort: runtime.effort ?? this.effort,
           sessionId: runtime.sessionId,
           sessionName: runtime.sessionName,
-          configDir,
+          configDir: claudeConfigDir,
+          customApi,
           claudePath: resolveClaudePath(),
           env: runtime.worktreeEnv,
           luxureTools,
@@ -4527,7 +5170,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       LUXURE_BRIDGE_TOKEN: channel.token,
       LUXURE_BRIDGE_ID: bridgeId,
     };
-    const config = {
+    const config: {
+      mcpServers: Record<string, { command: string; args: string[]; env: Record<string, string> }>;
+    } = {
       mcpServers: {
         luxure: {
           // The extension host's own runtime in node mode — works even when
@@ -4539,6 +5184,26 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       },
     };
 
+    // Default browser tool: the bundled Lightpanda launcher (vendored
+    // submodule / nightly binary + chrome-devtools-mcp over CDP). Additive —
+    // a real-Chrome "chrome-devtools" server from .mcp.json still loads.
+    const lightpandaScript = path.join(
+      this.context.extensionUri.fsPath,
+      "dist",
+      "lightpanda-mcp.js"
+    );
+    let browserServer: LuxureToolsSpec["browserServer"];
+    if (fs.existsSync(lightpandaScript)) {
+      browserServer = {
+        command: process.execPath,
+        args: [lightpandaScript],
+        env: { ELECTRON_RUN_AS_NODE: "1" },
+      };
+      config.mcpServers.lightpanda = browserServer;
+    } else {
+      log("WARN", "lightpanda-mcp.js not built; lightpanda browser tools disabled");
+    }
+
     const dir = path.join(this.context.globalStorageUri.fsPath, "mcp");
     fs.mkdirSync(dir, { recursive: true });
     this.cleanupStaleMcpConfigs(dir);
@@ -4547,7 +5212,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     // `server` is the same definition in structured form: Claude reads it from
     // the file above via --mcp-config, Codex takes it as a thread config
     // overlay (`mcp_servers.luxure`) since it has no equivalent flag.
-    return { mcpConfigPath, env, server: config.mcpServers.luxure };
+    return { mcpConfigPath, env, server: config.mcpServers.luxure, browserServer };
   }
 
   /** The luxure MCP server definition, in the shape CodexBridge wants. */
@@ -5025,6 +5690,21 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         const owner = this.findTaskActivity(runtime, activity.toolUseId);
         if (owner) {
           const t = owner.task;
+          // A background launch acks its Agent call within milliseconds while
+          // the agent keeps running — treating that ack as the result painted
+          // a ✓ on a live agent (and let the turn settle as "Done"). Keep the
+          // card running; only task_notification/task_updated may end it. The
+          // ack text is not the agent's report, so don't store it as one.
+          const isLaunchAck =
+            !activity.isError &&
+            t.status === "running" &&
+            (t.background === true ||
+              BACKGROUND_LAUNCH_ACK.test(activity.content || ""));
+          if (isLaunchAck) {
+            t.background = true;
+            this.postTaskUpdate(t, owner.messageId, isActive());
+            return;
+          }
           t.result = {
             content:
               (t.result?.content ? `${t.result.content}\n` : "") +
@@ -5382,7 +6062,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private postTaskUpdate(
     task: TaskActivity,
     messageId: string | undefined,
-    active: boolean
+    active: boolean,
+    turnStats?: TurnStats
   ): void {
     if (!active) {
       return;
@@ -5391,6 +6072,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       type: "taskUpdate",
       task: { ...task, children: task.children ? [...task.children] : undefined },
       messageId,
+      turnStats,
     });
   }
 
@@ -5535,6 +6217,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         t.status = u.status === "failed" ? "failed" : "completed";
         if (u.summary) {
           t.progressSummary = u.summary;
+        } else {
+          // Without a summary, the last progress one-liner ("Running X…")
+          // would sit under the ✓ as if it were the outcome — drop it.
+          t.progressSummary = undefined;
         }
         break;
     }
@@ -5550,6 +6236,23 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       }
     }
 
+    // A terminal update landing on a finalized message was holding that
+    // turn's settle line at "Waiting on N agents…" — once nothing in the
+    // message is left running, restamp the duration so its "Done · …" line
+    // reflects when the work (agents included) actually ended.
+    let turnStats: TurnStats | undefined;
+    if (
+      found.messageId &&
+      (u.kind === "task_notification" || u.kind === "task_updated") &&
+      (t.status === "completed" || t.status === "failed")
+    ) {
+      const msg = runtime.messages.find((m) => m.id === found.messageId);
+      if (msg?.turnStats && !hasRunningTask(msg)) {
+        msg.turnStats = { durationMs: Math.max(0, Date.now() - msg.timestamp) };
+        turnStats = msg.turnStats;
+      }
+    }
+
     // Status transitions on an already-finalized message must survive a reload;
     // per-tool progress ticks need not (finalize persists the latest anyway).
     if (
@@ -5558,7 +6261,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     ) {
       this.persistRuntime(runtimeKey, runtime);
     }
-    this.postTaskUpdate(t, found.messageId, active);
+    this.postTaskUpdate(t, found.messageId, active, turnStats);
   }
 
   /** Nest a subagent's own activity (tagged with parentToolUseId) under its
@@ -6287,18 +6990,24 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           }
         : undefined,
       mode: runtime.mode ?? this.mode,
-      // A Codex conversation reads its model from the Codex slot — the two
-      // providers' ids aren't interchangeable, so they're kept apart.
+      // A Codex or custom-API conversation reads its model from its own slot —
+      // the providers' ids aren't interchangeable, so they're kept apart.
       model: this.isCodexAccount(runtime.accountId)
         ? this.codexModelFor(runtime)
-        : runtime.model ?? this.model,
+        : this.isCustomAccount(runtime.accountId)
+          ? this.customModelFor(runtime)
+          : runtime.model ?? this.model,
       provider: this.providerFor(runtime.accountId),
       // Claude's model list is static and lives in the webview; Codex's depends
-      // on the signed-in account, so it's pushed with the state.
+      // on the signed-in account and a custom endpoint's on what the user
+      // listed for it, so those are pushed with the state.
       modelOptions: this.isCodexAccount(runtime.accountId)
         ? this.codexModelOptions
-        : undefined,
+        : this.isCustomAccount(runtime.accountId)
+          ? this.accountFor(runtime.accountId)?.models
+          : undefined,
       effort: runtime.effort ?? this.effort,
+      globalMemory: (runtime.globalMemory ?? this.globalMemory) !== false,
       messages: windowed.map((m) => this.slimMessage(m)),
       cliStatus: runtime.bridge?.status || runtime.cliStatus || "stopped",
       pendingDiffs: this.diffManager.getPendingDiffs(),
@@ -6513,6 +7222,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       clearInterval(this.paneTicker);
       this.paneTicker = undefined;
     }
+    clearTimeout(this.staleTabTimer);
+    this.staleTabTimer = undefined;
     for (const [key, runtime] of this.runtimes) {
       this.persistRuntime(key, runtime);
       runtime.bridge?.stop();

@@ -128,7 +128,7 @@
     "setup": "./setup.sh",
     "build": "npm run build:webview && npm run build:ext && npm run build:mcp",
     "build:ext": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --external:node-llama-cpp --format=cjs --platform=node --sourcemap",
-    "build:mcp": "esbuild src/mcp/luxure-mcp-server.ts --bundle --outfile=dist/luxure-mcp.js --format=cjs --platform=node --sourcemap && esbuild src/mcp/lightpanda-mcp-launcher.ts --bundle --outfile=dist/lightpanda-mcp.js --format=cjs --platform=node --sourcemap",
+    "build:mcp": "esbuild src/mcp/luxure-mcp-server.ts --bundle --outfile=dist/luxure-mcp.js --format=cjs --platform=node --sourcemap && esbuild src/mcp/lightpanda-mcp-launcher.ts --bundle --outfile=dist/lightpanda-mcp.js --format=cjs --platform=node --sourcemap && esbuild src/cli/api-bridge-server.ts --bundle --outfile=dist/api-bridge.js --format=cjs --platform=node --sourcemap",
     "lightpanda:build": "git submodule update --init vendor/lightpanda && cd vendor/lightpanda && zig build --release=safe",
     "build:webview": "cd webview-ui && npm run build",
     "watch:ext": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --external:node-llama-cpp --format=cjs --platform=node --sourcemap --watch",

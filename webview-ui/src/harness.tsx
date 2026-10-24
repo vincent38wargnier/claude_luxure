@@ -65,6 +65,24 @@ const finishedTask: TaskActivity = {
   },
 };
 
+/** A background agent still running after its parent turn finalized — the
+ * settle line under that message must read "Waiting on 1 agent", not Done. */
+const waitingTask: TaskActivity = {
+  type: "task",
+  toolUseId: "toolu_task_waiting",
+  taskId: "task-wait1",
+  subagentType: "Explore",
+  description: "Map MAX internals and CI",
+  prompt:
+    "Explore both repos and report how the LLM call boundary and the CI deploy-to-test pipeline work.",
+  status: "running",
+  progressSummary: "Running Locate tools_wrapper shaping and budget constants",
+  toolUses: 85,
+  totalTokens: 211_000,
+  durationMs: 373_000,
+  background: true,
+};
+
 const timeline: TimelinePart[] = [
   {
     type: "text",
@@ -185,6 +203,33 @@ const messages: ChatMessage[] = [
     // Short text-only turn: the settle line must NOT render for this one.
     turnStats: { durationMs: 8_000 },
   },
+  {
+    id: "u3",
+    role: "user",
+    content:
+      "Check the data and propose the simplest architecture for the MAX auto-improvement loop.",
+    timestamp: now - 7 * 60_000,
+  },
+  {
+    id: "a3",
+    role: "assistant",
+    content: "",
+    timestamp: now - 6 * 60_000,
+    timeline: [
+      {
+        type: "text",
+        text: "MAX activity confirmed at meaningful volume: 205 assistant conversations active in the last 30 days.",
+      },
+      { type: "activities", activities: [waitingTask] },
+      {
+        type: "text",
+        text: "The repo-exploration agent is still running — I'll assemble the full architecture proposal as soon as it reports back.",
+      },
+    ],
+    // Turn finalized while its background agent still runs: the settle line
+    // must read "Waiting on 1 agent · …" (amber dots), not "Done".
+    turnStats: { durationMs: 301_000 },
+  },
 ];
 
 const sessions: SessionInfo[] = [
@@ -280,6 +325,19 @@ const HARNESS_ACCOUNTS: StoredAccount[] = [
     configDir: "/tmp/harness/acct-codex",
     provider: "codex",
   },
+  {
+    id: "acct-glm",
+    label: "GLM — api.z.ai",
+    isDefault: false,
+    configDir: "/tmp/harness/acct-glm",
+    provider: "custom",
+    baseUrl: "https://api.z.ai/api/anthropic",
+    models: [
+      { id: "glm-4.6", label: "glm-4.6" },
+      { id: "glm-4.5-air", label: "glm-4.5-air" },
+    ],
+    defaultModel: "glm-4.6",
+  },
 ];
 
 const bucket = (utilization: number) => ({
@@ -293,6 +351,8 @@ const HARNESS_USAGE: Record<string, UsageInfo | null> = {
   "acct-expired": null,
   "acct-out": null,
   "acct-codex": { fiveHour: null, sevenDay: bucket(7) },
+  // Custom-API accounts have no subscription usage endpoint — bars stay hidden.
+  "acct-glm": null,
 };
 
 const params = new URLSearchParams(window.location.search);
@@ -603,6 +663,7 @@ function ChatHarness() {
         mode="agent"
         model="claude-fable-5"
         effort="high"
+        globalMemory={false}
         sessionId={activeId}
         activeTabId={activeId}
         sessions={sessions}
@@ -676,6 +737,7 @@ function ChatHarness() {
         onModeChange={noop}
         onModelChange={noop}
         onEffortChange={noop}
+        onGlobalMemoryChange={noop}
         onNewConversation={noop}
         onNewWorktreeConversation={noop}
         onSwitchSession={(id) => selectTab(id, i)}

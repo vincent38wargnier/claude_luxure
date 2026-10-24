@@ -46,6 +46,9 @@ export interface CodexBridgeOptions {
   /** Server definition for the luxure MCP server, injected into the thread
    * config as `mcp_servers.luxure`. */
   luxureServer?: { command: string; args: string[]; env: Record<string, string> };
+  /** The bundled Lightpanda browser server (default browser tool), injected
+   * as `mcp_servers.lightpanda`. */
+  browserServer?: { command: string; args: string[]; env: Record<string, string> };
 }
 
 const PLAN_MODE_INSTRUCTIONS = `You are in PLAN MODE. You must ONLY:
@@ -66,6 +69,8 @@ const VISUAL_PROOF_INSTRUCTIONS = `This chat panel can display images inline. Yo
 - present_screenshot: display an existing image file (PNG/JPEG/WebP/GIF) in the chat panel.
 - annotate_screenshot: draw arrows, boxes, highlights, labels or numbered badges onto an image file and show the result.
 Use them to PROVE visual work: after implementing or fixing UI, capture a screenshot of the result and present it in the chat.`;
+
+const LIGHTPANDA_INSTRUCTIONS = `Your default browser tool is the "lightpanda" MCP server — a bundled headless Lightpanda browser driven over CDP (new_page, navigate_page, take_snapshot, evaluate_script, click, fill, list_network_requests, …). Use it by default for anything web: opening pages, scraping, checking content, filling forms, running JS in a page, inspecting requests. Page tools take a pageId from new_page/list_pages output; rendering is simplified (screenshots are real but text-first and approximately styled).`;
 
 /** Default context window when Codex doesn't report one for the active model. */
 const DEFAULT_CODEX_WINDOW = 272_000;
@@ -90,6 +95,13 @@ interface ToolShape {
   toolInput: Record<string, unknown>;
 }
 
+/** One call as the chat draws it — see {@link toolCallsFor}. */
+interface ToolCall extends ToolShape {
+  toolUseId: string;
+  /** What the call's result reports on: the item, or one file's slice of it. */
+  item: Record<string, any>;
+}
+
 /**
  * Translate a Codex thread item into the {toolName, toolInput} shape the chat
  * renders. Names deliberately mirror Claude's tools so the existing cards
@@ -106,15 +118,27 @@ function toolShapeFor(item: Record<string, any>): ToolShape {
         },
       };
     case "fileChange": {
-      const changes: any[] = Array.isArray(item.changes) ? item.changes : [];
-      const first = changes[0] || {};
-      const kind = first?.kind?.type;
+      // One file per call (toolCallsFor splits a multi-file patch). Codex's
+      // `diff` is the new file's text for an add, the old text for a delete,
+      // and unified-diff hunks for an update — the card needs it to show the
+      // change, so it rides along as Write `content` / Edit `diff`.
+      const change = (Array.isArray(item.changes) && item.changes[0]) || {};
+      const diff = String(change.diff ?? "");
+      if (change.kind?.type === "add") {
+        return {
+          toolName: "Write",
+          toolInput: { file_path: String(change.path ?? ""), content: diff },
+        };
+      }
       return {
-        toolName: kind === "add" ? "Write" : "Edit",
+        toolName: "Edit",
         toolInput: {
-          file_path: String(first.path ?? ""),
-          // Every path in the patch, so a multi-file change still reads right.
-          paths: changes.map((c) => String(c?.path ?? "")).filter(Boolean),
+          // A moved file's card opens it where it now lives.
+          file_path: String(change.kind?.move_path || change.path || ""),
+          diff:
+            change.kind?.type === "delete"
+              ? deletionDiff(diff)
+              : diff.replace(/\n+Moved to: .*$/, "\n"),
         },
       };
     }
@@ -159,6 +183,33 @@ function toolShapeFor(item: Record<string, any>): ToolShape {
     default:
       return { toolName: String(item.type ?? "tool"), toolInput: {} };
   }
+}
+
+/** A deleted file's old text as one all-removed hunk, so its card lists what
+ * went away the same way an update's diff does. */
+function deletionDiff(content: string): string {
+  if (!content) {
+    return "";
+  }
+  const lines = content.replace(/\n$/, "").split("\n");
+  return [`@@ -1,${lines.length} +0,0 @@`, ...lines.map((l) => `-${l}`)].join("\n");
+}
+
+/**
+ * The calls the chat draws for one item. A single Codex patch can touch
+ * several files, so a fileChange becomes one call per file — each gets its own
+ * diff card, as separate Edit/Write calls do on the Claude side.
+ */
+function toolCallsFor(item: Record<string, any>): ToolCall[] {
+  const id = String(item.id ?? "");
+  if (item.type !== "fileChange") {
+    return [{ ...toolShapeFor(item), toolUseId: id, item }];
+  }
+  const changes: any[] = Array.isArray(item.changes) ? item.changes : [];
+  return changes.map((change, i) => {
+    const one = { ...item, changes: [change] };
+    return { ...toolShapeFor(one), toolUseId: i === 0 ? id : `${id}:${i}`, item: one };
+  });
 }
 
 /** Human-readable result text for a completed tool item. */
@@ -407,8 +458,13 @@ export class CodexBridge extends EventEmitter {
     const instructions = [MARKDOWN_STYLE_INSTRUCTIONS];
     if (this.options.mode === "plan") {
       instructions.push(PLAN_MODE_INSTRUCTIONS);
-    } else if (this.options.luxureServer) {
-      instructions.push(VISUAL_PROOF_INSTRUCTIONS);
+    } else {
+      if (this.options.luxureServer) {
+        instructions.push(VISUAL_PROOF_INSTRUCTIONS);
+      }
+      if (this.options.browserServer) {
+        instructions.push(LIGHTPANDA_INSTRUCTIONS);
+      }
     }
 
     const params: Record<string, unknown> = {
@@ -427,17 +483,26 @@ export class CodexBridge extends EventEmitter {
     if (this.options.model) {
       params.model = this.options.model;
     }
-    if (this.options.luxureServer && this.options.mode !== "plan") {
+    if (this.options.mode !== "plan") {
       // Codex takes MCP servers as a config overlay, not a --mcp-config file.
-      params.config = {
-        mcp_servers: {
-          luxure: {
-            command: this.options.luxureServer.command,
-            args: this.options.luxureServer.args,
-            env: this.options.luxureServer.env,
-          },
-        },
-      };
+      const mcpServers: Record<string, { command: string; args: string[]; env: Record<string, string> }> = {};
+      if (this.options.luxureServer) {
+        mcpServers.luxure = {
+          command: this.options.luxureServer.command,
+          args: this.options.luxureServer.args,
+          env: this.options.luxureServer.env,
+        };
+      }
+      if (this.options.browserServer) {
+        mcpServers.lightpanda = {
+          command: this.options.browserServer.command,
+          args: this.options.browserServer.args,
+          env: this.options.browserServer.env,
+        };
+      }
+      if (Object.keys(mcpServers).length > 0) {
+        params.config = { mcp_servers: mcpServers };
+      }
     }
     return params;
   }
@@ -687,20 +752,25 @@ export class CodexBridge extends EventEmitter {
         return;
       }
       if (this.handleAgentItem(item, method === "item/completed") || !TOOL_ITEM_TYPES.has(item.type)) { return; }
-      const shape = toolShapeFor(item);
-      if (!agent.items.has(item.id)) {
+      const calls = toolCallsFor(item);
+      if (!agent.items.has(item.id) && calls.length > 0) {
         agent.items.add(item.id);
         agent.toolUses++;
-        this.emit("activity", {
-          type: "tool_use", ...shape, toolUseId: item.id, parentToolUseId: agent.toolUseId,
-        });
-        this.updateAgent(threadId, "running", { summary: `Using ${shape.toolName}` });
+        for (const call of calls) {
+          this.emit("activity", {
+            type: "tool_use", toolName: call.toolName, toolInput: call.toolInput,
+            toolUseId: call.toolUseId, parentToolUseId: agent.toolUseId,
+          });
+        }
+        this.updateAgent(threadId, "running", { summary: `Using ${calls[0].toolName}` });
       }
       if (method === "item/completed") {
-        this.emit("activity", {
-          type: "tool_result", toolUseId: item.id, parentToolUseId: agent.toolUseId,
-          content: toolResultText(item).slice(0, 10000), isError: isFailedItem(item),
-        });
+        for (const call of calls) {
+          this.emit("activity", {
+            type: "tool_result", toolUseId: call.toolUseId, parentToolUseId: agent.toolUseId,
+            content: toolResultText(call.item).slice(0, 10000), isError: isFailedItem(call.item),
+          });
+        }
       }
     }
   }
@@ -768,18 +838,22 @@ export class CodexBridge extends EventEmitter {
         if (this.handleAgentItem(item, false)) { return; }
         if (TOOL_ITEM_TYPES.has(item.type)) {
           const id = String(item.id ?? "");
-          if (id && !this.openItems.has(id)) {
+          const calls = toolCallsFor(item);
+          // A fileChange is drawn from its changes; if it starts without
+          // any, item/completed draws it instead.
+          if (id && !this.openItems.has(id) && calls.length > 0) {
             this.openItems.set(id, item.type);
-            const shape = toolShapeFor(item);
             if (item.type === "fileChange") {
               this.emitFileChangeSnapshot(item);
             }
-            this.emit("activity", {
-              type: "tool_use",
-              toolName: shape.toolName,
-              toolInput: shape.toolInput,
-              toolUseId: id,
-            });
+            for (const call of calls) {
+              this.emit("activity", {
+                type: "tool_use",
+                toolName: call.toolName,
+                toolInput: call.toolInput,
+                toolUseId: call.toolUseId,
+              });
+            }
           }
         }
         return;
@@ -810,23 +884,27 @@ export class CodexBridge extends EventEmitter {
         if (!TOOL_ITEM_TYPES.has(item.type)) {
           return;
         }
+        const calls = toolCallsFor(item);
         if (id && !this.openItems.has(id)) {
           // Completed without a start (fast tools) — render the call first.
-          const shape = toolShapeFor(item);
           this.openItems.set(id, item.type);
+          for (const call of calls) {
+            this.emit("activity", {
+              type: "tool_use",
+              toolName: call.toolName,
+              toolInput: call.toolInput,
+              toolUseId: call.toolUseId,
+            });
+          }
+        }
+        for (const call of calls) {
           this.emit("activity", {
-            type: "tool_use",
-            toolName: shape.toolName,
-            toolInput: shape.toolInput,
-            toolUseId: id,
+            type: "tool_result",
+            toolUseId: call.toolUseId,
+            content: toolResultText(call.item).slice(0, 10000),
+            isError: isFailedItem(call.item),
           });
         }
-        this.emit("activity", {
-          type: "tool_result",
-          toolUseId: id,
-          content: toolResultText(item).slice(0, 10000),
-          isError: isFailedItem(item),
-        });
         return;
       }
 
@@ -1049,6 +1127,7 @@ export class CodexBridge extends EventEmitter {
       if (options.env !== undefined) { this.options.env = options.env; }
       if (options.luxureTools !== undefined) { this.options.luxureTools = options.luxureTools; }
       if (options.luxureServer !== undefined) { this.options.luxureServer = options.luxureServer; }
+      if (options.browserServer !== undefined) { this.options.browserServer = options.browserServer; }
     }
     void this.start();
   }

@@ -1,8 +1,16 @@
 import { spawn, ChildProcess } from "child_process";
 import { EventEmitter } from "events";
+import * as path from "path";
 import * as readline from "readline";
 import { PERF, perfLog, r1 } from "../utils/perf";
-import type { ContextInfo, Mode, EffortLevel } from "../shared/types";
+import { log } from "../utils/logger";
+import type {
+  ApiKeyEnvVar,
+  ContextInfo,
+  CustomApiProtocol,
+  Mode,
+  EffortLevel,
+} from "../shared/types";
 import {
   contextTokensUsed,
   resolveContextWindow,
@@ -45,6 +53,22 @@ export interface ApiRetryEvent {
   status: number | null;
 }
 
+/** A custom Anthropic-compatible endpoint (provider "custom" account): the CLI
+ * authenticates with an API key against `baseUrl` instead of an OAuth login.
+ * The key is read from SecretStorage by the provider and handed here per spawn
+ * — it never lives in stored options or settings files. */
+export interface CustomApiSpec {
+  /** Injected as ANTHROPIC_BASE_URL. Unset → the default api.anthropic.com. */
+  baseUrl?: string;
+  apiKey: string;
+  /** Which env var carries the key — see {@link ApiKeyEnvVar}. */
+  keyEnvVar: ApiKeyEnvVar;
+  /** Wire protocol the endpoint speaks (probe-detected). "openai" interposes
+   * the bundled api-bridge translator sidecar, since the CLI itself can only
+   * talk the Anthropic Messages protocol. Unset → "anthropic". */
+  protocol?: CustomApiProtocol;
+}
+
 export interface ClaudeBridgeOptions {
   cwd: string;
   mode?: Mode;
@@ -53,6 +77,9 @@ export interface ClaudeBridgeOptions {
   sessionId?: string;
   forkSession?: boolean;
   sessionName?: string;
+  /** Custom-API credentials for the spawn. null/undefined → OAuth (configDir
+   * or ambient keychain) authenticates instead. */
+  customApi?: CustomApiSpec | null;
   /** Isolated CLAUDE_CONFIG_DIR for the bound account (a full `auth login`).
    * When set, it is injected as CLAUDE_CONFIG_DIR so the spawned process
    * authenticates as that account (full scope); when unset, the process uses
@@ -73,7 +100,13 @@ export interface ClaudeBridgeOptions {
    * "luxure" MCP server, and `env` (the side-channel URL/token/bridge id) is
    * also merged into the CLI child env as a fallback for CLIs that propagate
    * their environment to stdio servers. */
-  luxureTools?: { mcpConfigPath: string; env: Record<string, string> };
+  luxureTools?: {
+    mcpConfigPath: string;
+    env: Record<string, string>;
+    /** Present when the bundled Lightpanda browser server is in the config —
+     * gates the "default browser" system prompt. */
+    browserServer?: { command: string; args: string[]; env: Record<string, string> };
+  };
 }
 
 const PLAN_MODE_SYSTEM_PROMPT = `You are in PLAN MODE. You must ONLY:
@@ -100,6 +133,10 @@ const VISUAL_PROOF_SYSTEM_PROMPT = `This chat panel can display images inline. Y
 - mcp__luxure__present_screenshot: display an existing image file (PNG/JPEG/WebP/GIF) in the chat panel.
 - mcp__luxure__annotate_screenshot: draw arrows, boxes, highlights, labels or numbered badges onto an image file and show the result.
 Use them to PROVE visual work: after implementing or fixing UI, capture (or save with a browser tool, e.g. chrome-devtools take_screenshot with a filePath) a screenshot of the result and present it in the chat; annotate it first when you want to point at what changed (percent coordinates are the most reliable). These tools show pixels to the USER; to see an image yourself, use the Read tool on its file path.`;
+
+// Appended when the bundled "lightpanda" browser server is wired in, so the
+// model reaches for it first instead of a heavier real-Chrome setup.
+const LIGHTPANDA_SYSTEM_PROMPT = `Your default browser tool is the "lightpanda" MCP server — a bundled headless Lightpanda browser driven over CDP (mcp__lightpanda__new_page, navigate_page, take_snapshot, evaluate_script, click, fill, list_network_requests, …). Use it by default for anything web: opening pages, scraping, checking content, filling forms, running JS in a page, inspecting requests. It is fast, light, and needs no Chrome install. Notes: page tools take a pageId from new_page/list_pages output; rendering is simplified (screenshots are real but text-first and approximately styled). Fall back to a real-Chrome server (e.g. "chrome-devtools", when configured) only when a task needs pixel-accurate rendering, Chrome-specific behavior, or an existing logged-in browser profile.`;
 
 // Always appended so the assistant's prose renders cleanly in the chat webview.
 const MARKDOWN_STYLE_SYSTEM_PROMPT = `Format every response as clean, well-structured GitHub-flavored Markdown:
@@ -239,6 +276,9 @@ function extractToolResultImages(content: unknown): string[] | undefined {
 
 export class ClaudeBridge extends EventEmitter {
   private proc: ChildProcess | null = null;
+  /** The api-bridge translator sidecar (openai-protocol custom accounts only).
+   * Lifecycle matches the CLI process: spawned per start(), killed with it. */
+  private apiBridgeProc: ChildProcess | null = null;
   private rl: readline.Interface | null = null;
   private _status: "starting" | "ready" | "busy" | "error" | "stopped" = "stopped";
   private _sessionId: string | undefined;
@@ -323,21 +363,77 @@ export class ClaudeBridge extends EventEmitter {
     if (this.options.luxureTools && this.options.mode !== "plan") {
       args.push("--mcp-config", this.options.luxureTools.mcpConfigPath);
       systemPromptParts.push(VISUAL_PROOF_SYSTEM_PROMPT);
+      if (this.options.luxureTools.browserServer) {
+        systemPromptParts.push(LIGHTPANDA_SYSTEM_PROMPT);
+      }
     }
     args.push("--append-system-prompt", systemPromptParts.join("\n\n"));
 
+    // An OpenAI-protocol endpoint can't be given to the CLI directly — boot
+    // the translator sidecar first and point the CLI at it below. Failing to
+    // start it is fatal for the spawn: without it the CLI would send this
+    // account's key to api.anthropic.com.
+    let apiBridgePort: number | undefined;
+    if (this.options.customApi?.protocol === "openai") {
+      const upstream = this.options.customApi.baseUrl;
+      if (!upstream) {
+        this._status = "error";
+        this.emit("status", this._status);
+        this.emit("error", "OpenAI-protocol account has no base URL configured.");
+        return;
+      }
+      try {
+        apiBridgePort = await this.startApiBridge(upstream);
+      } catch (err) {
+        this._status = "error";
+        this.emit("status", this._status);
+        this.emit(
+          "error",
+          `Failed to start the API protocol bridge for ${upstream}: ${
+            err instanceof Error ? err.message : String(err)
+          }`
+        );
+        return;
+      }
+    }
+
     // Build the child env with the bound account's auth. A non-default account
     // gets its own CLAUDE_CONFIG_DIR (isolated full login); we also strip any
-    // ambient token/API key so that config dir's login is authoritative. The
-    // Default account uses the ambient keychain (clear only an inherited token).
+    // ambient token/API key/base URL so that config dir's login is
+    // authoritative. The Default account uses the ambient keychain (clear only
+    // an inherited token).
     const childEnv: NodeJS.ProcessEnv = { ...process.env };
     if (this.options.configDir) {
       childEnv.CLAUDE_CONFIG_DIR = this.options.configDir;
       delete childEnv.CLAUDE_CODE_OAUTH_TOKEN;
       delete childEnv.ANTHROPIC_API_KEY;
       delete childEnv.ANTHROPIC_AUTH_TOKEN;
+      delete childEnv.ANTHROPIC_BASE_URL;
     } else {
       delete childEnv.CLAUDE_CODE_OAUTH_TOKEN;
+    }
+    // A custom-API account authenticates with its key against an
+    // Anthropic-compatible endpoint. Injected after the strip above so the
+    // bound account's key is the only credential the child can see — the CLI
+    // resolves env keys before any OAuth login, so this wins.
+    if (this.options.customApi) {
+      const { baseUrl, apiKey, keyEnvVar, protocol } = this.options.customApi;
+      if (protocol === "openai" && apiBridgePort) {
+        // The CLI talks the Anthropic protocol to the local sidecar, which
+        // forwards the key upstream as a Bearer token. Internal fast-model
+        // calls (titles, summaries) must not use a claude-* id the upstream
+        // doesn't serve, so the account's model covers those too.
+        childEnv.ANTHROPIC_BASE_URL = `http://127.0.0.1:${apiBridgePort}`;
+        childEnv.ANTHROPIC_AUTH_TOKEN = apiKey;
+        if (this.options.model) {
+          childEnv.ANTHROPIC_SMALL_FAST_MODEL = this.options.model;
+        }
+      } else {
+        if (baseUrl) {
+          childEnv.ANTHROPIC_BASE_URL = baseUrl;
+        }
+        childEnv[keyEnvVar] = apiKey;
+      }
     }
     // Side-channel coordinates for the luxure MCP server (fallback path; the
     // authoritative copy lives in the mcp-config's own env block).
@@ -360,6 +456,7 @@ export class ClaudeBridge extends EventEmitter {
       this._status = "error";
       this.emit("status", this._status);
       this.emit("error", `Failed to spawn claude CLI: ${err}`);
+      this.stopApiBridge();
       return;
     }
     this.proc = spawned;
@@ -388,6 +485,9 @@ export class ClaudeBridge extends EventEmitter {
       this.emit("exit", { code, signal });
       this.proc = null;
       this.rl = null;
+      // The CLI died on its own (stop()/restart() would have disowned it
+      // first) — its sidecar must not linger.
+      this.stopApiBridge();
     });
 
     if (spawned.stderr) {
@@ -488,6 +588,7 @@ export class ClaudeBridge extends EventEmitter {
         subagentType: typeof ev.subagent_type === "string" ? ev.subagent_type : undefined,
         taskType: typeof ev.task_type === "string" ? ev.task_type : undefined,
         prompt: typeof ev.prompt === "string" ? ev.prompt : undefined,
+        background: typeof ev.background === "boolean" ? ev.background : undefined,
         status:
           typeof ev.status === "string"
             ? ev.status
@@ -721,6 +822,66 @@ export class ClaudeBridge extends EventEmitter {
     this.proc.stdin.write(JSON.stringify(response) + "\n");
   }
 
+  /** Boot the api-bridge sidecar and resolve its port (it prints
+   * "API_BRIDGE_LISTENING <port>" when ready). */
+  private startApiBridge(upstream: string): Promise<number> {
+    this.stopApiBridge(); // never two sidecars from one bridge
+    const script = path.join(__dirname, "api-bridge.js");
+    const proc = spawn(process.execPath, [script], {
+      env: {
+        ...process.env,
+        ELECTRON_RUN_AS_NODE: "1",
+        API_BRIDGE_UPSTREAM: upstream,
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    this.apiBridgeProc = proc;
+    proc.stderr?.on("data", (d) => {
+      log("INFO", `[api-bridge] ${String(d).trim()}`);
+    });
+    return new Promise<number>((resolve, reject) => {
+      const timer = setTimeout(
+        () => reject(new Error("api-bridge did not become ready within 10s")),
+        10_000
+      );
+      let buf = "";
+      proc.stdout?.on("data", (d) => {
+        buf += String(d);
+        const m = buf.match(/API_BRIDGE_LISTENING (\d+)/);
+        if (m) {
+          clearTimeout(timer);
+          resolve(Number(m[1]));
+        }
+      });
+      proc.on("error", (err) => {
+        clearTimeout(timer);
+        reject(err);
+      });
+      proc.on("exit", (code, signal) => {
+        if (this.apiBridgeProc === proc) {
+          this.apiBridgeProc = null;
+          log("WARN", `api-bridge exited (code=${code} signal=${signal})`);
+        }
+        clearTimeout(timer);
+        reject(new Error(`api-bridge exited (code ${code}) before becoming ready`));
+      });
+    });
+  }
+
+  /** Same disown-then-kill contract as stop(): act on the captured handle. */
+  private stopApiBridge(): void {
+    const proc = this.apiBridgeProc;
+    this.apiBridgeProc = null;
+    if (proc) {
+      proc.kill("SIGTERM");
+      setTimeout(() => {
+        if (proc.exitCode === null && proc.signalCode === null) {
+          proc.kill("SIGKILL");
+        }
+      }, 3000);
+    }
+  }
+
   stop(): void {
     // Disown before killing: restart() spawns a replacement immediately, so
     // by the time this process's exit event (or the escalation timer) fires,
@@ -730,6 +891,7 @@ export class ClaudeBridge extends EventEmitter {
     const rl = this.rl;
     this.proc = null;
     this.rl = null;
+    this.stopApiBridge();
     rl?.close();
     if (proc) {
       proc.kill("SIGTERM");
@@ -755,6 +917,8 @@ export class ClaudeBridge extends EventEmitter {
       if (options.sessionName !== undefined) { this.options.sessionName = options.sessionName; }
       // An empty string clears it → switch back to the Default account.
       if (options.configDir !== undefined) { this.options.configDir = options.configDir; }
+      // null clears it → back to OAuth auth (account switch away from custom).
+      if (options.customApi !== undefined) { this.options.customApi = options.customApi; }
       if (options.env !== undefined) { this.options.env = options.env; }
       if (options.luxureTools !== undefined) { this.options.luxureTools = options.luxureTools; }
     }

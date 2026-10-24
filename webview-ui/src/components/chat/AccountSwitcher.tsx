@@ -32,19 +32,32 @@ interface Props {
 
 /** Which CLI a row's account talks to. Only shown once more than one provider
  * is configured — with a Claude-only list it would be noise on every row. */
-function ProviderChip({ provider }: { provider: AccountProvider }) {
-  const codex = provider === "codex";
+function ProviderChip({
+  provider,
+  baseUrl,
+}: {
+  provider: AccountProvider;
+  baseUrl?: string;
+}) {
+  const style =
+    provider === "codex"
+      ? { color: "#6ee7b7", borderColor: "rgba(110,231,183,0.35)" }
+      : provider === "custom"
+        ? { color: "#c4b5fd", borderColor: "rgba(196,181,253,0.35)" }
+        : { color: "#d9a066", borderColor: "rgba(217,160,102,0.35)" };
+  const title =
+    provider === "codex"
+      ? "Codex (OpenAI)"
+      : provider === "custom"
+        ? `Custom API endpoint — ${baseUrl || "api.anthropic.com"} (API key)`
+        : "Claude (Anthropic)";
   return (
     <span
-      title={codex ? "Codex (OpenAI)" : "Claude (Anthropic)"}
+      title={title}
       className="shrink-0 px-1 rounded text-[8px] uppercase tracking-wide leading-[13px] border"
-      style={
-        codex
-          ? { color: "#6ee7b7", borderColor: "rgba(110,231,183,0.35)" }
-          : { color: "#d9a066", borderColor: "rgba(217,160,102,0.35)" }
-      }
+      style={style}
     >
-      {codex ? "codex" : "claude"}
+      {provider === "custom" ? "api" : provider}
     </span>
   );
 }
@@ -210,7 +223,10 @@ export default function AccountSwitcher({
                       {a.label}
                     </span>
                     {mixedProviders && (
-                      <ProviderChip provider={a.provider ?? "claude"} />
+                      <ProviderChip
+                        provider={a.provider ?? "claude"}
+                        baseUrl={a.baseUrl}
+                      />
                     )}
                     {a.isDefault && (
                       <span className="text-[9px] text-vscode-descriptionFg opacity-50 shrink-0">
@@ -230,7 +246,9 @@ export default function AccountSwitcher({
                         title={
                           (a.provider ?? "claude") === "codex"
                             ? "Reconnect — start a fresh ChatGPT device sign-in for this Codex account"
-                            : "Reconnect — sign out and log in again, as this or another Claude account (recreates the token)"
+                            : (a.provider ?? "claude") === "custom"
+                              ? "Reconnect — enter a new API key for this endpoint"
+                              : "Reconnect — sign out and log in again, as this or another Claude account (recreates the token)"
                         }
                         onClick={() => {
                           onReauth(a.id);
@@ -242,7 +260,7 @@ export default function AccountSwitcher({
                     )}
                     {onLogout && !isOut && (
                       <RowAction
-                        title="Disconnect — delete this account's stored token (the account stays in the list)"
+                        title="Disconnect — delete this account's stored token / API key (the account stays in the list)"
                         onClick={() => {
                           onLogout(a.id);
                           setOpen(false);

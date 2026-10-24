@@ -2,6 +2,7 @@ import { useState } from "react";
 import { Check } from "lucide-react";
 import type { ActivityEvent, TaskActivity } from "../../types";
 import AgentTaskCard from "../common/AgentTaskCard";
+import { patchToCodeLines } from "../common/DiffLines";
 import FileChangeCard from "../common/FileChangeCard";
 import McpCallCard, { type McpCall } from "../common/McpCallCard";
 import ProofCard from "../common/ProofCard";
@@ -315,10 +316,23 @@ function fileEditFrom(a: ActivityEvent): FileEdit | null {
     });
   } else if (input.old_string != null || input.new_string != null) {
     pushDiff(input.old_string, input.new_string);
+  } else if (typeof input.diff === "string") {
+    // A ready-made unified diff (how Codex reports a patch), shown as the
+    // Review panel shows one: hunk headers kept, counts from the +/- lines.
+    for (const line of patchToCodeLines(input.diff.replace(/\n+$/, ""))) {
+      lines.push(line);
+      if (line.startsWith("+ ")) added++;
+      else if (line.startsWith("- ")) removed++;
+    }
   } else {
-    for (const line of String(input.content ?? input.file_text ?? "").split("\n")) {
-      lines.push(`+ ${line}`);
-      added++;
+    // A whole new file. Its final newline ends the last line rather than
+    // starting an empty extra one.
+    const content = String(input.content ?? input.file_text ?? "").replace(/\n$/, "");
+    if (content) {
+      for (const line of content.split("\n")) {
+        lines.push(`+ ${line}`);
+        added++;
+      }
     }
   }
 

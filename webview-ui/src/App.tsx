@@ -132,8 +132,6 @@ export default function App() {
   // Edge detection for the streaming→idle transition that drains the queue.
   const prevStreamingRef = useRef(false);
   const prevTabRef = useRef<string | undefined>(undefined);
-  // Separate prev-tab tracker for draft→real id migration of a pending queue.
-  const migratePrevTabRef = useRef<string | undefined>(undefined);
 
   const sendQueued = useCallback((item: QueuedMessage) => {
     vscode.postMessage({
@@ -274,6 +272,11 @@ export default function App() {
                 patched.activities = m.activities.map((a) =>
                   a.type === "task" && a.toolUseId === task.toolUseId ? task : a
                 );
+              }
+              if (msg.turnStats) {
+                // Last agent of the turn settled — the restamped duration
+                // makes the "Done · …" line reflect the real end of work.
+                patched.turnStats = msg.turnStats;
               }
               return patched;
             }),
@@ -439,6 +442,22 @@ export default function App() {
         }
         break;
 
+      case "tabRenamed": {
+        // The conversation changed keys (edit → fresh session, draft → real
+        // id, fork switch): its queued follow-ups go with it. Arrives before
+        // the old key's stop, so that stop's idle edge finds nothing to drain.
+        const { from, to } = msg;
+        setQueues((q) => {
+          const items = q[from];
+          if (!items || items.length === 0) return q;
+          const rest = { ...q };
+          delete rest[from];
+          rest[to] = [...(rest[to] ?? []), ...items];
+          return rest;
+        });
+        break;
+      }
+
       case "markerUpdate": {
         const { key, marker, busy } = msg;
         setTabMarkers((prev) => ({ ...prev, [key]: marker }));
@@ -585,30 +604,6 @@ export default function App() {
     }
   }, [state.isStreaming, state.activeTabId, sendQueued]);
 
-  // A brand-new chat's tab id flips from "draft-…" to the real session id once
-  // it starts; carry any queue parked under the draft id over to the real one.
-  useEffect(() => {
-    const tab = state.activeTabId;
-    const prev = migratePrevTabRef.current;
-    migratePrevTabRef.current = tab;
-    if (
-      prev &&
-      tab &&
-      prev !== tab &&
-      prev.startsWith("draft-") &&
-      !tab.startsWith("draft-")
-    ) {
-      setQueues((q) => {
-        const items = q[prev];
-        if (!items || items.length === 0) return q;
-        const rest = { ...q };
-        delete rest[prev];
-        rest[tab] = [...(rest[tab] ?? []), ...items];
-        return rest;
-      });
-    }
-  }, [state.activeTabId]);
-
   /** Pane-aware send: `tabId` targets that pane's conversation (the provider
    * moves focus to it first), and queueing keys off THAT pane's streaming
    * state — a busy left pane must not queue a message meant for an idle
@@ -720,6 +715,10 @@ export default function App() {
 
   const handleEffortChange = useCallback((effort: EffortLevel) => {
     vscode.postMessage({ type: "changeEffort", effort });
+  }, []);
+
+  const handleGlobalMemoryChange = useCallback((enabled: boolean) => {
+    vscode.postMessage({ type: "changeGlobalMemory", enabled });
   }, []);
 
   const handleNewConversation = useCallback(() => {
@@ -909,6 +908,7 @@ export default function App() {
         model={pv.model ?? state.model}
         modelOptions={pv.modelOptions ?? state.modelOptions}
         effort={pv.effort ?? state.effort}
+        globalMemory={pv.globalMemory ?? state.globalMemory}
         sessionId={pv.sessionId}
         activeTabId={activeId}
         sessions={sessions}
@@ -958,6 +958,7 @@ export default function App() {
         onModeChange={handleModeChange}
         onModelChange={handleModelChange}
         onEffortChange={handleEffortChange}
+        onGlobalMemoryChange={handleGlobalMemoryChange}
         onNewConversation={handleNewConversation}
         onNewWorktreeConversation={handleNewWorktreeConversation}
         onSwitchSession={(sessionId) => handleSwitchSession(sessionId, i)}

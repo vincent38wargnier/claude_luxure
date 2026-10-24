@@ -56,6 +56,8 @@ interface ChatTextAreaProps {
   /** Provider-supplied model list (Codex); undefined uses Claude's static one. */
   modelOptions?: { id: string; label: string }[];
   effort?: EffortLevel;
+  /** Whether this conversation loads the global (machine-wide) CLAUDE.md. */
+  globalMemory?: boolean;
   cliStatus: string;
   isStreaming: boolean;
   /** Active conversation id — the composer keeps a separate draft per id. */
@@ -78,6 +80,7 @@ interface ChatTextAreaProps {
   onModeChange: (mode: Mode) => void;
   onModelChange: (model: string) => void;
   onEffortChange: (effort: EffortLevel) => void;
+  onGlobalMemoryChange?: (enabled: boolean) => void;
   onReview?: () => void;
   onOpenSkills?: () => void;
   onOpenMcp?: () => void;
@@ -241,6 +244,37 @@ function EffortSelector({
   );
 }
 
+function GlobalMemoryToggle({
+  enabled,
+  onChange,
+}: {
+  enabled: boolean;
+  onChange: (enabled: boolean) => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={() => onChange(!enabled)}
+      title={
+        enabled
+          ? "Global memory ON — your machine-wide CLAUDE.md is sent with this chat. Click to withhold it."
+          : "Global memory OFF — your machine-wide CLAUDE.md is withheld from this chat. Click to include it."
+      }
+      className={`flex items-center gap-1 px-1.5 py-0.5 rounded text-[11px] transition-colors ${
+        enabled
+          ? "text-vscode-descriptionFg hover:text-vscode-fg hover:bg-[rgba(255,255,255,0.05)]"
+          : "text-[#fbbf24] hover:bg-[rgba(251,191,36,0.1)]"
+      }`}
+    >
+      <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={enabled ? "opacity-60" : "opacity-90"}>
+        <path d="M12 5a3 3 0 0 0-3 3 3 3 0 0 0-3 3 3 3 0 0 0 0 6 3 3 0 0 0 3 2 3 3 0 0 0 6 0 3 3 0 0 0 3-2 3 3 0 0 0 0-6 3 3 0 0 0-3-3 3 3 0 0 0-3-3z" />
+        {!enabled && <path d="M4 4l16 16" stroke="currentColor" strokeWidth="2" />}
+      </svg>
+      <span>{enabled ? "memory" : "no memory"}</span>
+    </button>
+  );
+}
+
 function ContextBadge({ context }: { context: ContextInfo }) {
   const contextUsed = contextTokensUsed(context);
   const pct = contextUsedPercent(contextUsed, context.contextWindow);
@@ -273,6 +307,7 @@ export default function ChatTextArea({
   model,
   modelOptions,
   effort,
+  globalMemory,
   cliStatus,
   isStreaming,
   activeTabId,
@@ -292,6 +327,7 @@ export default function ChatTextArea({
   onModeChange,
   onModelChange,
   onEffortChange,
+  onGlobalMemoryChange,
   onReview,
   onOpenSkills,
   onOpenMcp,
@@ -1179,6 +1215,15 @@ export default function ChatTextArea({
           />
           <span className="text-[10px] text-vscode-descriptionFg opacity-30 select-none">|</span>
           <EffortSelector effort={effort} onChange={onEffortChange} />
+          {onGlobalMemoryChange && (
+            <>
+              <span className="text-[10px] text-vscode-descriptionFg opacity-30 select-none">|</span>
+              <GlobalMemoryToggle
+                enabled={globalMemory !== false}
+                onChange={onGlobalMemoryChange}
+              />
+            </>
+          )}
           {contextInfo && (
             <>
               <span className="text-[10px] text-vscode-descriptionFg opacity-30 select-none">|</span>

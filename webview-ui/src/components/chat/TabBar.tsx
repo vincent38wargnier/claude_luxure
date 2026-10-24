@@ -195,6 +195,28 @@ export default function TabBar({
     }
   };
 
+  // Keep the shown conversation in view: stale tabs are sorted to the right
+  // end, which can sit past the edge of a narrow (scrollbar-less) strip.
+  const currentIndex = currentTabId ? openTabIds.indexOf(currentTabId) : -1;
+  useEffect(() => {
+    const strip = stripRef.current;
+    const el = strip
+      ? ([...strip.querySelectorAll("[data-tab-id]")] as HTMLElement[]).find(
+          (t) => t.dataset.tabId === currentTabId
+        )
+      : undefined;
+    if (!strip || !el) {
+      return;
+    }
+    const s = strip.getBoundingClientRect();
+    const r = el.getBoundingClientRect();
+    if (r.left < s.left) {
+      strip.scrollLeft -= s.left - r.left;
+    } else if (r.right > s.right) {
+      strip.scrollLeft += r.right - s.right;
+    }
+  }, [currentTabId, currentIndex]);
+
   useEffect(() => {
     if (!showHistory) return;
     const handle = (e: MouseEvent) => {

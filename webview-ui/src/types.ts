@@ -82,8 +82,10 @@ export interface AccountInfo {
   subscriptionType?: string;
 }
 
-/** Which CLI an account authenticates — and therefore which bridge drives it. */
-export type AccountProvider = "claude" | "codex";
+/** Which CLI an account authenticates — and therefore which bridge drives it.
+ * "custom" is the Claude CLI pointed at an Anthropic-compatible endpoint
+ * (GLM via z.ai, a raw Anthropic API key, a local proxy) with an API key. */
+export type AccountProvider = "claude" | "codex" | "custom";
 
 /** An account selectable in the composer switcher. The "default" account uses
  * the ambient keychain login; others have their own isolated config dir
@@ -99,6 +101,13 @@ export interface StoredAccount {
   configDir?: string;
   /** Absent on accounts stored before Codex support — treat as "claude". */
   provider?: AccountProvider;
+  /** Custom-API account: the Anthropic-compatible endpoint (shown as a hint —
+   * the key itself never reaches the webview). Undefined → api.anthropic.com. */
+  baseUrl?: string;
+  /** Custom-API account: model ids the endpoint serves — the picker's list. */
+  models?: { id: string; label: string }[];
+  /** Custom-API account: the model new conversations start on. */
+  defaultModel?: string;
 }
 
 /** One rate-limit bucket from GET /api/oauth/usage. */
@@ -211,6 +220,7 @@ export interface PromptHistoryEntry {
 
 export const AVAILABLE_MODELS = [
   { id: "claude-fable-5", alias: "fable", label: "Fable 5" },
+  { id: "claude-opus-5-5", alias: "opus-5-5", label: "Opus 5.5" },
   { id: "claude-opus-5", alias: "opus-5", label: "Opus 5" },
   { id: "claude-sonnet-4-20250514", alias: "sonnet", label: "Sonnet 4" },
   { id: "claude-opus-4-20250514", alias: "opus", label: "Opus 4" },
@@ -243,6 +253,8 @@ export interface ExtensionState {
    * signed-in account); undefined for Claude, whose list is static. */
   modelOptions?: { id: string; label: string }[];
   effort?: EffortLevel;
+  /** Whether this conversation loads the global (machine-wide) CLAUDE.md. */
+  globalMemory?: boolean;
   messages: ChatMessage[];
   cliStatus: "starting" | "ready" | "busy" | "error" | "stopped";
   pendingDiffs: PendingDiff[];
@@ -315,6 +327,7 @@ export type WebviewMessage =
   | { type: "mode"; mode: Mode }
   | { type: "changeModel"; model: string }
   | { type: "changeEffort"; effort: EffortLevel }
+  | { type: "changeGlobalMemory"; enabled: boolean }
   | { type: "newConversation" }
   | { type: "newWorktreeConversation" }
   | { type: "switchSession"; sessionId: string; pane?: number; perfId?: string }
@@ -463,8 +476,10 @@ export type ExtensionMessage =
   | { type: "activity"; activity: ActivityEvent }
   /** In-place update of a task card (matched by task.toolUseId). When messageId
    * is set the task lives in that finalized message's timeline — background
-   * agents keep reporting after their parent turn already ended. */
-  | { type: "taskUpdate"; task: TaskActivity; messageId?: string }
+   * agents keep reporting after their parent turn already ended. turnStats
+   * rides along when the last agent of a finalized turn settles, restamping
+   * its "Done · …" line with the real end-to-end duration. */
+  | { type: "taskUpdate"; task: TaskActivity; messageId?: string; turnStats?: TurnStats }
   /** Live thinking-token counter for the streaming turn (system:thinking_tokens). */
   | { type: "thinkingTokens"; tokens: number }
   /** Transient status chip above the composer (API retry / rate limit); null clears. */
@@ -488,6 +503,10 @@ export type ExtensionMessage =
       panes?: { tabIds: string[]; activeId: string | null }[];
       focusedPane?: number;
     }
+  /** A conversation's key changed (edit → fresh draft, draft → real session
+   * id, fork switch). Webview-only per-tab state — the follow-up queue —
+   * moves with it. Sent before the old key's run is stopped. */
+  | { type: "tabRenamed"; from: string; to: string }
   /** In-place update of one conversation's post-it (emoji picked / picking). */
   | { type: "markerUpdate"; key: string; marker: SessionMarker; busy?: boolean }
   /** Full display state of the UNFOCUSED pane's conversation (the focused

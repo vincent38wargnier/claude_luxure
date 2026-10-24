@@ -41,6 +41,7 @@ interface ChatViewProps {
   model?: string;
   modelOptions?: { id: string; label: string }[];
   effort?: EffortLevel;
+  globalMemory?: boolean;
   sessionId?: string;
   activeTabId?: string;
   sessions: SessionInfo[];
@@ -94,6 +95,7 @@ interface ChatViewProps {
   onModeChange: (mode: Mode) => void;
   onModelChange: (model: string) => void;
   onEffortChange: (effort: EffortLevel) => void;
+  onGlobalMemoryChange?: (enabled: boolean) => void;
   onNewConversation: () => void;
   onNewWorktreeConversation: () => void;
   onSwitchSession: (sessionId: string) => void;
@@ -139,6 +141,7 @@ export default function ChatView({
   model,
   modelOptions,
   effort,
+  globalMemory,
   sessionId,
   activeTabId,
   sessions,
@@ -180,6 +183,7 @@ export default function ChatView({
   onModeChange,
   onModelChange,
   onEffortChange,
+  onGlobalMemoryChange,
   onNewConversation,
   onNewWorktreeConversation,
   onSwitchSession,
@@ -537,6 +541,7 @@ export default function ChatView({
         model={model}
         modelOptions={modelOptions}
         effort={effort}
+        globalMemory={globalMemory}
         cliStatus={cliStatus}
         isStreaming={isStreaming}
         activeTabId={activeTabId}
@@ -556,6 +561,7 @@ export default function ChatView({
         onModeChange={onModeChange}
         onModelChange={onModelChange}
         onEffortChange={onEffortChange}
+        onGlobalMemoryChange={onGlobalMemoryChange}
         onReview={handleReview}
         onOpenSkills={onOpenSkills}
         onOpenMcp={onOpenMcp}
