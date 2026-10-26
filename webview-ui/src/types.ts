@@ -87,6 +87,20 @@ export interface AccountInfo {
  * (GLM via z.ai, a raw Anthropic API key, a local proxy) with an API key. */
 export type AccountProvider = "claude" | "codex" | "custom";
 
+export type OrbStyle = "glass" | "plasma" | "iridescent" | "energy";
+
+/** Voice mode: `off` when disabled; otherwise idle / preparing (rephrase or
+ * TTS fetch in flight) / speaking. `speakingMessageId` is the message whose
+ * audio is playing, so its replay button can show a stop state. */
+export interface VoiceStatus {
+  enabled: boolean;
+  state: "off" | "idle" | "waking" | "speaking";
+  orbStyle: OrbStyle;
+  speakingMessageId?: string;
+  /** Set when voice can't run here (e.g. a remote extension host). */
+  unavailable?: string;
+}
+
 /** An account selectable in the composer switcher. The "default" account uses
  * the ambient keychain login; others have their own isolated config dir
  * (CLAUDE_CONFIG_DIR or CODEX_HOME — a full login, full scope), so both chat
@@ -417,6 +431,10 @@ export type WebviewMessage =
   /** Heartbeat reply. Any incoming message counts as liveness; this one exists
    * so an idle-but-alive webview still answers pings. */
   | { type: "pong"; t?: number }
+  | { type: "voiceToggle" }
+  | { type: "voiceStop" }
+  | { type: "voiceReplay"; messageId: string; text: string }
+  | { type: "setFontSize"; size: number }
   /** Periodic heap telemetry from the webview memory watchdog. */
   | { type: "memStats"; usedMB: number; limitMB: number; pct: number }
   /** Heap crossed the pressure threshold — host trims display windows. */
@@ -550,4 +568,6 @@ export type ExtensionMessage =
     }
   /** Liveness probe; the webview answers "pong". A visible webview that stays
    * silent gets recreated (a crashed renderer emits no VS Code event). */
-  | { type: "ping"; t: number };
+  | { type: "ping"; t: number }
+  | { type: "voiceState"; voice: VoiceStatus }
+  | { type: "fontSize"; size: number };

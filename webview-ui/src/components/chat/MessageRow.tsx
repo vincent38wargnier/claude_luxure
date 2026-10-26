@@ -1,6 +1,6 @@
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { Check, Copy, Pencil, RefreshCw } from "lucide-react";
+import { Check, Copy, Pencil, RefreshCw, Square, Volume2 } from "lucide-react";
 import { useState } from "react";
 import type { ReactNode, MouseEvent as ReactMouseEvent } from "react";
 import vscode from "../../vscode";
@@ -31,6 +31,8 @@ interface MessageRowProps {
   onModeChange?: (mode: Mode) => void;
   onModelChange?: (model: string) => void;
   onSwitchFork?: (anchorId: string, index: number) => void;
+  /** This message is being read aloud (or prepared) by voice mode. */
+  voiceSpeaking?: boolean;
 }
 
 function cleanUserContent(content: string): string {
@@ -59,6 +61,7 @@ export default function MessageRow({
   onModeChange,
   onModelChange,
   onSwitchFork,
+  voiceSpeaking,
 }: MessageRowProps) {
   const content = streamingContent ?? message.content;
   const isUser = message.role === "user";
@@ -184,7 +187,7 @@ export default function MessageRow({
           }`}
         >
           <div
-            className="text-sm text-vscode-fg whitespace-pre-wrap select-text cursor-text"
+            className="chat-text text-sm text-vscode-fg whitespace-pre-wrap select-text cursor-text"
             onClick={
               canEdit && onStartEdit
                 ? () => {
@@ -239,8 +242,35 @@ export default function MessageRow({
   // order they happened) when present; older messages fall back to the feed.
   const timeline = isStreaming ? liveTimeline : message.timeline;
 
+  const canReplay = !message.isStreaming && !!message.content.trim();
+
   return (
-    <div className="mx-1 py-1">
+    <div className="group/msg relative mx-1 py-1">
+      {canReplay && (
+        <div
+          className={`absolute -top-1 right-1 z-10 flex rounded-md border border-[var(--app-border)] bg-[var(--app-surface-2)] px-0.5 py-0.5 shadow-sm transition-opacity ${
+            voiceSpeaking
+              ? "opacity-100"
+              : "opacity-0 group-hover/msg:opacity-100 focus-within:opacity-100"
+          }`}
+        >
+          <button
+            type="button"
+            onClick={() =>
+              vscode.postMessage(
+                voiceSpeaking
+                  ? { type: "voiceStop" }
+                  : { type: "voiceReplay", messageId: message.id, text: message.content }
+              )
+            }
+            aria-label={voiceSpeaking ? "Stop reading aloud" : "Read aloud"}
+            title={voiceSpeaking ? "Stop reading aloud" : "Read aloud"}
+            className="p-1 rounded text-vscode-descriptionFg hover:text-vscode-fg transition-colors"
+          >
+            {voiceSpeaking ? <Square size={11} /> : <Volume2 size={12} />}
+          </button>
+        </div>
+      )}
       {timeline && timeline.length > 0 ? (
         <Timeline parts={timeline} isStreaming={!!isStreaming} />
       ) : (

@@ -32,7 +32,14 @@ import {
  * so everything downstream of {@link ChatViewProvider.spawnBridge} is
  * provider-agnostic — only the construction site branches. */
 type AgentBridge = ClaudeBridge | CodexBridge;
+
+/** Chat text-size bounds, mirrored by the composer's Aa control and the
+ * `claude-luxure.fontSize` setting's min/max. */
+const FONT_SIZE_MIN = 11;
+const FONT_SIZE_MAX = 24;
+const FONT_SIZE_DEFAULT = 14;
 import { DiffManager } from "../diff/DiffManager";
+import { VoiceController } from "../voice/VoiceController";
 import { SnapshotManager } from "../diff/SnapshotManager";
 import { SessionManager } from "../sessions/SessionManager";
 import {
@@ -520,6 +527,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private accountSubscription: string | undefined;
   private usagePollTimer: ReturnType<typeof setInterval> | undefined;
   private usagePollInFlight = false;
+  /** Last usage each account actually reported. A transient endpoint failure
+   * falls back to this instead of blanking the bars. */
+  private readonly lastUsage = new Map<string, UsageInfo>();
+  /** Epoch ms before which the usage endpoint must not be called again — set
+   * from a 429's Retry-After. The limit is per account, not per process, so
+   * several open editors (and our own post-turn/tab-switch bursts) share it. */
+  private usageCooldownUntil = 0;
+  private lastUsagePollAt = 0;
+  private usageRetryTimer: ReturnType<typeof setTimeout> | undefined;
   private usageAllInFlight = false;
   // Accounts whose CLI process returned a real auth failure (401) this session.
   // Ground truth that the stored token can't authenticate — flags the account as
@@ -559,10 +575,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   // re-read transcript files. A session's first user message never changes.
   private readonly tabNameCache = new Map<string, string>();
 
+  /** Voice mode — speaks finished replies in the focused conversation. */
+  readonly voice: VoiceController;
+
   constructor(
     private readonly context: vscode.ExtensionContext,
     private readonly outputChannel: vscode.OutputChannel
   ) {
+    this.voice = new VoiceController(
+      context,
+      (system, user, accountId) =>
+        this.runClaudePrint(user, accountId, ["--system-prompt", system, "--tools", ""]),
+      (voice) => this.postMessage({ type: "voiceState", voice })
+    );
     this.diffManager.setDiffCallback((diff) => {
       this.postMessage({
         type: "diffUpdate",
@@ -1115,7 +1140,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
    * and in a throwaway cwd so the transient print-mode session is NOT written
    * into the project's transcript folder (which would otherwise pollute the
    * history); the transcript it does write is deleted afterwards. */
-  private runClaudePrint(prompt: string, accountId?: string): Promise<string> {
+  private runClaudePrint(
+    prompt: string,
+    accountId?: string,
+    extraArgs: string[] = []
+  ): Promise<string> {
     // These one-shots are always `claude -p` (post-it emoji, summaries). A Codex
     // conversation's config dir is a CODEX_HOME, and a custom-API profile holds
     // no OAuth login at all — handing either to the Claude CLI as
@@ -1148,6 +1177,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           "claude-haiku-4-5-20251001",
           "--output-format",
           "json",
+          ...extraArgs,
         ],
         { cwd, env, timeout: 60000, maxBuffer: 4 * 1024 * 1024 },
         (err, stdout) => {
@@ -2305,6 +2335,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         this.handleListSessions();
         this.sendAccountsList();
         void this.pollUsageForActive();
+        this.postMessage({ type: "voiceState", voice: this.voice.status() });
+        this.sendFontSize();
         break;
       }
 
@@ -2350,8 +2382,37 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         break;
       }
 
+      case "setFontSize": {
+        const size = Math.round(Math.min(FONT_SIZE_MAX, Math.max(FONT_SIZE_MIN, message.size)));
+        await vscode.workspace
+          .getConfiguration("claude-luxure")
+          .update("fontSize", size, vscode.ConfigurationTarget.Global);
+        this.sendFontSize();
+        break;
+      }
+
+      case "voiceToggle": {
+        await this.voice.toggle();
+        break;
+      }
+
+      case "voiceStop": {
+        this.voice.stop();
+        break;
+      }
+
+      case "voiceReplay": {
+        const runtime = this.activeKey ? this.runtimes.get(this.activeKey) : undefined;
+        this.voice.replay(message.messageId, message.text, runtime?.accountId);
+        break;
+      }
+
       case "sendMessage": {
         log("INFO", "sendMessage:", (message as any).text?.slice(0, 100));
+        // The user has moved on — cut off any reply still being read out.
+        if (this.voice.status().speakingMessageId) {
+          this.voice.stop();
+        }
         // A composer in the unfocused pane targets ITS conversation: focus
         // follows the send, deterministically, before the message is handled.
         const targetTab = (message as { tabId?: string }).tabId;
@@ -4342,8 +4403,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   /** Fetch subscription usage. The endpoint is undocumented (it powers the CLI's
-   * /usage view); isolated here so it's easy to fix if the contract changes. */
-  private async fetchUsage(token: string): Promise<UsageInfo | null> {
+   * /usage view); isolated here so it's easy to fix if the contract changes.
+   * Resolves undefined for a transient failure (429 from several editor windows
+   * polling at once, a 5xx, a dropped connection) so callers can keep the last
+   * known numbers on screen, and null only when the answer is authoritative —
+   * an auth rejection, or a body we can't read. */
+  private async fetchUsage(
+    token: string
+  ): Promise<UsageInfo | null | undefined> {
     const version = await this.getCliVersion();
     return new Promise((resolve) => {
       const req = https.request(
@@ -4362,10 +4429,21 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           res.on("end", () => {
             const status = res.statusCode || 0;
             if (status < 200 || status >= 300) {
-              log("WARN", "usage endpoint status:", String(status));
-              resolve(null);
+              if (status === 429) {
+                const retryAfter = Number(res.headers["retry-after"]) || 60;
+                this.usageCooldownUntil = Date.now() + retryAfter * 1000;
+                log(
+                  "WARN",
+                  `usage endpoint rate-limited; pausing polls for ${retryAfter}s`
+                );
+                this.scheduleUsageRetry();
+              } else {
+                log("WARN", "usage endpoint status:", String(status));
+              }
+              resolve(status === 401 || status === 403 ? null : undefined);
               return;
             }
+            this.usageCooldownUntil = 0;
             try {
               const data = JSON.parse(body) as Record<string, any>;
               const bucket = (b: any): UsageBucket | null =>
@@ -4386,16 +4464,45 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       );
       req.on("error", (err) => {
         log("WARN", "usage fetch error:", String(err));
-        resolve(null);
+        resolve(undefined);
       });
       req.end();
     });
   }
 
+  /** Cache a successful usage read; on a transient failure hand back the last
+   * known value for that account (undefined if we never had one). */
+  private rememberUsage(
+    accountId: string,
+    usage: UsageInfo | null | undefined
+  ): UsageInfo | null | undefined {
+    if (usage) {
+      this.lastUsage.set(accountId, usage);
+      return usage;
+    }
+    if (usage === null) {
+      this.lastUsage.delete(accountId);
+      return null;
+    }
+    return this.lastUsage.get(accountId);
+  }
+
+  /** True when a poll must be skipped: one is in flight, we're inside a
+   * Retry-After cooldown, or the last poll was seconds ago (a turn ending, a
+   * tab switch and a focus change can all fire within the same moment). */
+  private usagePollBlocked(minIntervalMs = 30_000): boolean {
+    const now = Date.now();
+    if (now < this.usageCooldownUntil) {
+      return true;
+    }
+    return now - this.lastUsagePollAt < minIntervalMs;
+  }
+
   private async pollUsageForActive(): Promise<void> {
-    if (this.usagePollInFlight) {
+    if (this.usagePollInFlight || this.usagePollBlocked()) {
       return;
     }
+    this.lastUsagePollAt = Date.now();
     this.usagePollInFlight = true;
     try {
       const runtime = this.activeKey
@@ -4414,7 +4521,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         this.postMessage({ type: "usageUpdate", usage: null });
         return;
       }
-      const usage = await this.fetchUsage(token);
+      const accountId = runtime?.accountId || "default";
+      const fetched = await this.fetchUsage(token);
+      const usage = this.rememberUsage(accountId, fetched);
+      if (usage === undefined) {
+        return; // transient failure, nothing cached — leave the bars as they are
+      }
       this.postMessage({ type: "usageUpdate", usage });
     } finally {
       this.usagePollInFlight = false;
@@ -4427,9 +4539,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
    * {@link pollUsageForActive} (timer + account changes) to bound endpoint load —
    * N accounts = N requests, vs. 1 for the active-only poll. */
   private async pollUsageForAll(): Promise<void> {
+    // The timer drives this one, so it only defers to an in-flight poll and
+    // the cooldown — not to the burst throttle.
     if (this.usageAllInFlight) {
       return;
     }
+    if (Date.now() < this.usageCooldownUntil) {
+      // Don't wait out the full 180s interval — the bars are empty until a poll
+      // lands, so retry as soon as the cooldown expires.
+      this.scheduleUsageRetry();
+      return;
+    }
+    this.lastUsagePollAt = Date.now();
     this.usageAllInFlight = true;
     try {
       const accounts = this.getAllAccounts();
@@ -4441,6 +4562,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           // app-server only serves rate limits for a home that's logged in.
           if (a.provider === "codex") {
             const usage = await codexUsage(resolveCodexPath(), a.configDir);
+            if (usage) {
+              this.lastUsage.set(a.id, usage);
+            }
             let out = loggedOutIds.has(a.id);
             if (usage) {
               this.authFailedAccountIds.delete(a.id);
@@ -4477,12 +4601,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           const wasAuthFailed = this.authFailedAccountIds.has(a.id);
           const shouldFetch =
             !heuristicDead && !!token && (!wasAuthFailed || looksRenewed);
-          const usage = shouldFetch ? await this.fetchUsage(token) : null;
+          const fetched = shouldFetch ? await this.fetchUsage(token) : null;
+          const usage = this.rememberUsage(a.id, fetched) ?? null;
           // A successful probe is ground truth that the token works again —
           // including after a re-login done outside the extension, which also
-          // undoes a deliberate disconnect.
+          // undoes a deliberate disconnect. Only a FRESH read proves that; a
+          // cached one stood in for a request that never got an answer.
           let loggedOut = loggedOutIds.has(a.id);
-          if (usage) {
+          if (fetched) {
             this.authFailedAccountIds.delete(a.id);
             if (loggedOut) {
               await this.setLoggedOut(a.id, false);
@@ -4534,7 +4660,23 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     );
   }
 
+  /** One pending retry just after the current cooldown ends. */
+  private scheduleUsageRetry(): void {
+    if (this.usageRetryTimer) {
+      return;
+    }
+    const delay = Math.max(1000, this.usageCooldownUntil - Date.now() + 500);
+    this.usageRetryTimer = setTimeout(() => {
+      this.usageRetryTimer = undefined;
+      void this.pollUsageForAll();
+    }, delay);
+  }
+
   private stopUsagePolling(): void {
+    if (this.usageRetryTimer) {
+      clearTimeout(this.usageRetryTimer);
+      this.usageRetryTimer = undefined;
+    }
     if (this.usagePollTimer) {
       clearInterval(this.usagePollTimer);
       this.usagePollTimer = undefined;
@@ -5623,7 +5765,21 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         );
       }
 
+      const finishedId = runtime.streamingMessageId;
       this.finalizeStreamingMessage(runtimeKey, runtime, isActive());
+
+      // Voice mode: read the finished reply aloud — only for a successful turn
+      // in the conversation the user is looking at (the focused pane's tab).
+      if (
+        finishedId &&
+        isActive() &&
+        (event as ClaudeEvent & { is_error?: boolean }).is_error !== true
+      ) {
+        const finished = runtime.messages.find((m) => m.id === finishedId);
+        if (finished?.role === "assistant" && finished.content.trim()) {
+          this.voice.speak(finished.id, finished.content, runtime.accountId);
+        }
+      }
 
       // First completed turn: pick the conversation's post-it emoji from the
       // real content (one user message alone is usually not enough context).
@@ -6931,6 +7087,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
+  /** Push the chat text size (a user setting, so it holds across reloads and
+   * windows) to the webview. */
+  sendFontSize(): void {
+    const size = vscode.workspace
+      .getConfiguration("claude-luxure")
+      .get<number>("fontSize", FONT_SIZE_DEFAULT);
+    this.postMessage({
+      type: "fontSize",
+      size: Math.round(Math.min(FONT_SIZE_MAX, Math.max(FONT_SIZE_MIN, size))),
+    });
+  }
+
   private postMessage(message: ExtensionMessage): void {
     this.webview?.postMessage(message);
   }
@@ -7216,6 +7384,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   dispose(): void {
+    this.voice.dispose();
     this.stopUsagePolling();
     this.stopHeartbeat();
     if (this.paneTicker) {

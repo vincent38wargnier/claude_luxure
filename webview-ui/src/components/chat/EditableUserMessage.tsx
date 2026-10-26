@@ -256,7 +256,7 @@ export default function EditableUserMessage({
           onKeyDown={handleKeyDown}
           minRows={2}
           maxRows={16}
-          className="w-full px-3 py-2.5 text-sm text-vscode-fg bg-transparent resize-none outline-none leading-relaxed"
+          className="chat-text w-full px-3 py-2.5 text-sm text-vscode-fg bg-transparent resize-none outline-none leading-relaxed"
           placeholder="Edit message..."
         />
         <div className="flex items-center justify-between px-3 py-1.5 border-t border-[rgba(255,255,255,0.06)]">

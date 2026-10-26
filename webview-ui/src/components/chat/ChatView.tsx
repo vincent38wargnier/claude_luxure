@@ -1,6 +1,7 @@
 import { useRef, useEffect, useState, useCallback, Fragment } from "react";
+import type { CSSProperties } from "react";
 import { useRenderPerf } from "../../perf";
-import type { ChatMessage, CostInfo, ContextInfo, ActivityEvent, TaskActivity, TimelinePart, SessionInfo, SessionMarker, Mode, EffortLevel, PendingDiff, McpServerStatus, StoredAccount, UsageInfo, QueuedMessage } from "../../types";
+import type { ChatMessage, CostInfo, ContextInfo, ActivityEvent, TaskActivity, TimelinePart, SessionInfo, SessionMarker, Mode, EffortLevel, PendingDiff, McpServerStatus, StoredAccount, UsageInfo, QueuedMessage, VoiceStatus, AccountProvider } from "../../types";
 import MessageRow from "./MessageRow";
 import ChatTextArea from "./ChatTextArea";
 import TabBar from "./TabBar";
@@ -8,6 +9,7 @@ import SessionPostIt from "./SessionPostIt";
 import MarkerNoteModal from "./MarkerNoteModal";
 import QueuedMessages from "./QueuedMessages";
 import RunStatus from "./RunStatus";
+import VoiceOrb from "../voice/VoiceOrb";
 import DiffPanel from "../common/DiffPanel";
 import WorkingDots from "../common/WorkingDots";
 
@@ -106,6 +108,12 @@ interface ChatViewProps {
   onAcceptAll: () => void;
   onRejectAll: () => void;
   onOpenSkills?: () => void;
+  /** Voice mode status — set only for the focused pane (the one that speaks). */
+  voice?: VoiceStatus | null;
+  /** Active conversation's provider — tints the voice orb. */
+  provider?: AccountProvider;
+  /** Text size (px) for the transcript and message boxes. */
+  fontSize?: number;
   onOpenMcp?: () => void;
   onRestartMcp?: () => void;
   mcpServers?: McpServerStatus[];
@@ -194,6 +202,9 @@ export default function ChatView({
   onAcceptAll,
   onRejectAll,
   onOpenSkills,
+  voice,
+  provider,
+  fontSize = 14,
   onOpenMcp,
   onRestartMcp,
   mcpServers,
@@ -302,7 +313,11 @@ export default function ChatView({
   return (
     // data-pane-root scopes the Lightbox's gallery collection to this
     // instance's transcript (each split pane is its own gallery).
-    <div className="flex flex-col h-full" data-pane-root="">
+    <div
+      className="chat-scale flex flex-col h-full"
+      style={{ "--chat-font-size": `${fontSize}px` } as CSSProperties}
+      data-pane-root=""
+    >
       {/* Tab bar */}
       <TabBar
         sessions={sessions}
@@ -417,6 +432,9 @@ export default function ChatView({
                 onModeChange={onModeChange}
                 onModelChange={onModelChange}
                 onSwitchFork={onSwitchFork}
+                voiceSpeaking={
+                  !!voice?.speakingMessageId && voice.speakingMessageId === msg.id
+                }
               />
               {msg.compactBoundary && <SummaryDivider />}
             </Fragment>
@@ -445,10 +463,11 @@ export default function ChatView({
         />
       )}
 
+      <div className="shrink-0 border-t border-[rgba(255,255,255,0.12)]">
       {/* Cost bar */}
       {cost && (
         <div
-          className="px-3 py-0.5 text-[10px] text-vscode-descriptionFg border-t border-[rgba(255,255,255,0.04)] flex items-center gap-3"
+          className="px-3 py-0.5 text-[10px] text-vscode-descriptionFg flex items-center gap-3"
           title={`Session cost $${cost.totalCostUsd.toFixed(4)} · ${cost.inputTokens.toLocaleString()} tokens in · ${cost.outputTokens.toLocaleString()} tokens out`}
         >
           <span>${cost.totalCostUsd.toFixed(2)}</span>
@@ -460,10 +479,12 @@ export default function ChatView({
       {/* Live status strip: the agent dock (one clickable chip per working
           agent — click scrolls to its card), retry/limit chip, thinking
           ticker. Survives the turn ending, for background agents. */}
-      {(transientStatus ||
+      {(voice ||
+        transientStatus ||
         (runningTasks && runningTasks.length > 0) ||
         isStreaming) && (
-        <div className="px-2 pt-1 space-y-1" role="status" aria-live="polite">
+        <div className="px-2 py-2 flex items-start gap-2" role="status" aria-live="polite">
+          <div className="flex-1 min-w-0 space-y-1">
           {isStreaming && (
             <RunStatus
               key={messages.find((m) => m.isStreaming)?.id || activeTabId}
@@ -524,6 +545,12 @@ export default function ChatView({
               })}
             </div>
           )}
+          </div>
+          {voice && (
+            <div className="h-[40px] flex items-center">
+              <VoiceOrb voice={voice} provider={provider} />
+            </div>
+          )}
         </div>
       )}
 
@@ -564,6 +591,7 @@ export default function ChatView({
         onGlobalMemoryChange={onGlobalMemoryChange}
         onReview={handleReview}
         onOpenSkills={onOpenSkills}
+        fontSize={fontSize}
         onOpenMcp={onOpenMcp}
         onRestartMcp={onRestartMcp}
         mcpServers={mcpServers}
@@ -579,6 +607,7 @@ export default function ChatView({
         onReauthAccount={onReauthAccount}
         onLogoutAccount={onLogoutAccount}
       />
+      </div>
     </div>
   );
 }

@@ -279,6 +279,19 @@ textarea:focus-visible {
   }
 }
 
+/* Chat text size — set per pane from the composer's Aa control, so readable
+   prose doesn't require zooming the whole editor. Only the conversation and
+   the message boxes scale; chrome (tabs, bars, tool lines) stays put. */
+.chat-scale .md,
+.chat-scale .chat-text {
+  font-size: var(--chat-font-size, 14px);
+}
+
+.chat-scale .chat-input-text {
+  /* The composer has always sat a hair below the transcript. */
+  font-size: calc(var(--chat-font-size, 14px) - 1px);
+}
+
 /* Mentions highlight in textarea */
 .mention-highlight {
   color: var(--vscode-textLink-foreground);

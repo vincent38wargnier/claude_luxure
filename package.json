@@ -65,6 +65,18 @@
       {
         "command": "claude-luxure.addToChat",
         "title": "Add to Claude Luxure"
+      },
+      {
+        "command": "claude-luxure.voiceToggle",
+        "title": "Claude Luxure: Toggle Voice"
+      },
+      {
+        "command": "claude-luxure.voiceStop",
+        "title": "Claude Luxure: Stop Speaking"
+      },
+      {
+        "command": "claude-luxure.voiceSetElevenLabsKey",
+        "title": "Claude Luxure: Set ElevenLabs API Key"
       }
     ],
     "keybindings": [
@@ -118,6 +130,98 @@
           "type": "string",
           "default": "",
           "markdownDescription": "Absolute path to the `codex` CLI binary, used by Codex accounts. Leave empty to auto-detect (common install locations, then the binary bundled with the official Codex/ChatGPT extension). Set this if Codex sends fail with `spawn codex ENOENT`."
+        },
+        "claude-luxure.voice.enabled": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Read Claude's finished replies aloud (focused conversation only). Toggle by clicking the orb above the composer. macOS only."
+        },
+        "claude-luxure.voice.backend": {
+          "type": "string",
+          "enum": [
+            "say",
+            "elevenlabs"
+          ],
+          "enumDescriptions": [
+            "macOS system voice — free, no key",
+            "ElevenLabs — premium voices; needs a key (\"Claude Luxure: Set ElevenLabs API Key\"). Falls back to `say` on error."
+          ],
+          "default": "say",
+          "description": "Text-to-speech engine for voice mode."
+        },
+        "claude-luxure.voice.sayVoice": {
+          "type": "string",
+          "default": "Samantha",
+          "markdownDescription": "macOS voice name for `say` (list them with `say -v ?`)."
+        },
+        "claude-luxure.voice.sayRate": {
+          "type": "number",
+          "default": 200,
+          "minimum": 80,
+          "maximum": 400,
+          "description": "Speech rate for the system voice, in words per minute."
+        },
+        "claude-luxure.voice.elevenlabsVoiceId": {
+          "type": "string",
+          "default": "pNInz6obpgDQGcFmaJgB",
+          "description": "ElevenLabs voice ID (default: Adam)."
+        },
+        "claude-luxure.voice.elevenlabsModel": {
+          "type": "string",
+          "enum": [
+            "eleven_flash_v2_5",
+            "eleven_turbo_v2_5",
+            "eleven_multilingual_v2"
+          ],
+          "default": "eleven_flash_v2_5",
+          "description": "ElevenLabs model."
+        },
+        "claude-luxure.voice.elevenlabsSpeed": {
+          "type": "number",
+          "default": 0.9,
+          "minimum": 0.7,
+          "maximum": 1.2,
+          "description": "ElevenLabs speaking speed."
+        },
+        "claude-luxure.voice.rephrase": {
+          "type": "boolean",
+          "default": true,
+          "description": "Rewrite long replies into natural spoken form with Claude Haiku before reading them (uses your Claude login, no API key)."
+        },
+        "claude-luxure.voice.rephraseThreshold": {
+          "type": "number",
+          "default": 180,
+          "minimum": 0,
+          "description": "Replies shorter than this many characters are read as-is, without rephrasing."
+        },
+        "claude-luxure.voice.brevity": {
+          "type": "string",
+          "enum": [
+            "detailed",
+            "balanced",
+            "brief",
+            "minimal"
+          ],
+          "default": "balanced",
+          "description": "How much the rephrase condenses long replies."
+        },
+        "claude-luxure.voice.orbStyle": {
+          "type": "string",
+          "enum": [
+            "glass",
+            "plasma",
+            "iridescent",
+            "energy"
+          ],
+          "default": "plasma",
+          "description": "Look of the voice orb above the composer."
+        },
+        "claude-luxure.fontSize": {
+          "type": "number",
+          "default": 14,
+          "minimum": 11,
+          "maximum": 24,
+          "markdownDescription": "Text size (px) for the conversation and the message box, independent of the editor's own zoom. Adjust it from the **Aa** control in the composer bar."
         }
       }
     }
