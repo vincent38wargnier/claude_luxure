@@ -349,6 +349,9 @@ export type WebviewMessage =
   | { type: "openFile"; filePath: string }
   | { type: "openDiff"; filePath: string }
   | { type: "openExternal"; url: string }
+  /** A chat link to a local file ("/abs/path", "rel/a.ts:42", file://…) —
+   * VS Code's webview drops these itself, so the host opens them. */
+  | { type: "openFileLink"; href: string }
   /** Lightbox "open in editor tab": the host writes the data URL to a temp
    * file and opens VS Code's native image preview (full-window, zoomable). */
   | { type: "openImageInEditor"; dataUrl: string; label?: string }

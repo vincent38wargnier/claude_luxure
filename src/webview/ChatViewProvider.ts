@@ -66,6 +66,7 @@ import {
   type FolderCandidate,
 } from "../utils/droppedFolder";
 import { extractMentions, resolveFromMention } from "../utils/path-mentions";
+import { fileLinkAction, resolveFileLink } from "../utils/fileLink";
 import { loadPromptHistory } from "../utils/promptHistory";
 import { LlmSuggester } from "../utils/llmSuggester";
 import { log } from "../utils/logger";
@@ -2600,6 +2601,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         }
         break;
       }
+
+      case "openFileLink":
+        await this.handleOpenFileLink(message.href);
+        break;
 
       case "openImageInEditor":
         await this.handleOpenImageInEditor(message.dataUrl, message.label);
@@ -6731,6 +6736,47 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   private getWorkspacePath(): string | undefined {
     return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+  }
+
+  /**
+   * Open a chat link to a local file (see utils/fileLink). Relative paths
+   * resolve against the conversation's worktree, then the workspace root. A
+   * missing file gets a visible warning — a dead click used to be silent.
+   */
+  private async handleOpenFileLink(href: string): Promise<void> {
+    const runtime = this.activeKey ? this.runtimes.get(this.activeKey) : undefined;
+    const bases = [runtime?.worktreeCwd, this.getWorkspacePath()].filter(
+      (dir): dir is string => !!dir
+    );
+    const link = resolveFileLink(href, bases);
+    if (!link.kind) {
+      log("WARN", "openFileLink: not found:", href, "→", link.filePath);
+      vscode.window.showWarningMessage(`Can't open link: ${link.filePath} doesn't exist.`);
+      return;
+    }
+    // A remote window's files live on the remote host, out of reach of this
+    // machine's default apps — open them in VS Code there.
+    const action = vscode.env.remoteName ? "editor" : fileLinkAction(link);
+    log("INFO", "openFileLink:", link.filePath, action);
+    const uri = vscode.Uri.file(link.filePath);
+    try {
+      if (action === "external") {
+        await vscode.env.openExternal(uri);
+      } else if (action === "reveal") {
+        await vscode.commands.executeCommand("revealFileInOS", uri);
+      } else {
+        const at = link.line
+          ? new vscode.Position(link.line - 1, Math.max(0, (link.column ?? 1) - 1))
+          : undefined;
+        await vscode.commands.executeCommand("vscode.open", uri, {
+          preview: true,
+          selection: at ? new vscode.Range(at, at) : undefined,
+        });
+      }
+    } catch (err) {
+      log("WARN", "openFileLink failed:", String(err));
+      vscode.window.showWarningMessage(`Couldn't open ${link.filePath}: ${String(err)}`);
+    }
   }
 
   addFileToChat(relativePath: string): void {

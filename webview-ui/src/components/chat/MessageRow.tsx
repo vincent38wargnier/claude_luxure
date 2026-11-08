@@ -1,4 +1,4 @@
-import ReactMarkdown, { type Components } from "react-markdown";
+import ReactMarkdown, { defaultUrlTransform, type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { Check, Copy, Pencil, RefreshCw } from "lucide-react";
 import { useState } from "react";
@@ -274,20 +274,34 @@ function nodeText(children: ReactNode): string {
   return "";
 }
 
-// Open http(s) links through the extension host. VS Code usually opens webview
-// link clicks externally on its own, but routing it explicitly guarantees it
-// (and preventDefault stops any double-open). Returns undefined for non-URLs so
-// the anchor behaves normally.
-function externalClick(href?: string) {
-  if (!href || !/^https?:\/\//i.test(href)) return undefined;
+// Open links through the extension host. Web links go to the browser; anything
+// else is a local file — Codex links its outputs as bare paths
+// ("/Users/…/report.html", "/repo/src/a.ts:42"), which VS Code's webview
+// resolves to vscode-webview:// URLs and silently drops, so a click did
+// nothing. Returns undefined for in-page anchors so they behave normally.
+function linkClick(href?: string) {
+  if (!href || href.startsWith("#")) return undefined;
+  const web = /^https?:\/\//i.test(href);
+  if (!web && /^[a-z][a-z\d+.-]*:/i.test(href) && !/^file:/i.test(href)) {
+    return undefined; // mailto: and friends — VS Code opens those itself
+  }
   return (e: ReactMouseEvent<HTMLAnchorElement>) => {
     e.preventDefault();
-    vscode.postMessage({ type: "openExternal", url: href });
+    vscode.postMessage(
+      web ? { type: "openExternal", url: href } : { type: "openFileLink", href }
+    );
   };
 }
 
+// react-markdown blanks any URL whose scheme isn't on its web allowlist, which
+// also empties file:// links — keep those so linkClick can open them.
+function urlTransform(url: string): string {
+  return /^file:\/\//i.test(url) ? url : defaultUrlTransform(url);
+}
+
 // Custom renderers so links the model sends are actually usable:
-//  • <a> opens in the browser and long URLs wrap so they can be selected/copied.
+//  • <a> opens in the browser (or the file, for local paths) and long URLs
+//    wrap so they can be selected/copied.
 //  • a code span/block that is *just* a URL (the model loves wrapping links in
 //    backticks) becomes a real clickable link instead of inert <code> text.
 const markdownComponents: Components = {
@@ -298,7 +312,7 @@ const markdownComponents: Components = {
         href={href}
         target="_blank"
         rel="noopener noreferrer"
-        onClick={externalClick(href)}
+        onClick={linkClick(href)}
       >
         {children}
       </a>
@@ -313,7 +327,7 @@ const markdownComponents: Components = {
           target="_blank"
           rel="noopener noreferrer"
           className="md-code-link"
-          onClick={externalClick(text)}
+          onClick={linkClick(text)}
         >
           {text}
         </a>
@@ -334,7 +348,11 @@ function TextContent({ content }: { content: string }) {
   if (!content.trim()) return null;
   return (
     <div className={MARKDOWN_CLASS}>
-      <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={markdownComponents}
+        urlTransform={urlTransform}
+      >
         {content}
       </ReactMarkdown>
     </div>

@@ -238,6 +238,23 @@ export default function ChatView({
       el.scrollHeight - el.scrollTop - el.clientHeight < 80;
   }, []);
 
+  // VS Code runs a webview's Cmd+C/V as execCommand("copy"/"paste"), and when
+  // nothing in the page has focus it first re-focuses the last focused element
+  // — the composer — which moves the selection there, so copying chat text
+  // copied nothing. The transcript is focusable (tabIndex -1) so selecting in
+  // it keeps focus here; Cmd+V from here still goes to the composer, as it did
+  // through that re-focus.
+  const handleTranscriptKeyDown = useCallback((e: React.KeyboardEvent) => {
+    if (
+      e.target === e.currentTarget &&
+      (e.metaKey || e.ctrlKey) &&
+      e.key.toLowerCase() === "v"
+    ) {
+      const root = e.currentTarget.closest("[data-pane-root]") ?? document;
+      root.querySelector<HTMLTextAreaElement>(".composer-shell textarea")?.focus();
+    }
+  }, []);
+
   useEffect(() => {
     const grew = messages.length > prevMsgCountRef.current;
     const lastMsg = messages[messages.length - 1];
@@ -354,6 +371,8 @@ export default function ChatView({
       <div
         ref={scrollContainerRef}
         onScroll={handleScroll}
+        onKeyDown={handleTranscriptKeyDown}
+        tabIndex={-1}
         className="chat-scroll h-full overflow-y-auto py-2 space-y-1"
       >
         {messages.length === 0 && !isStreaming && (
