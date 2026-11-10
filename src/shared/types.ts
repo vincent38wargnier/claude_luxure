@@ -242,7 +242,10 @@ export interface PromptHistoryEntry {
 }
 
 export const AVAILABLE_MODELS = [
-  { id: "claude-fable-5", alias: "fable", label: "Fable 5" },
+  // The CLI's `fable` alias resolves to Fable 5.2 (CLI 2.1.321 alias table),
+  // so the tag lives on that entry; Fable 5 keeps an explicit one.
+  { id: "claude-fable-5-2", alias: "fable", label: "Fable 5.2" },
+  { id: "claude-fable-5", alias: "fable-5", label: "Fable 5" },
   { id: "claude-opus-5-5", alias: "opus-5-5", label: "Opus 5.5" },
   { id: "claude-opus-5", alias: "opus-5", label: "Opus 5" },
   { id: "claude-sonnet-4-20250514", alias: "sonnet", label: "Sonnet 4" },
